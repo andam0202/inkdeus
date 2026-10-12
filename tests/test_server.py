@@ -10,7 +10,7 @@ from PIL import Image
 
 import synth
 from inkdeus.cli import build_parser
-from inkdeus.server import create_app, resolve_owner
+from inkdeus.server import create_app, read_local_config
 
 
 @pytest.fixture()
@@ -136,37 +136,50 @@ def test_static_index(client):
     assert r.status_code == 200 and b"inkdeus" in r.data
 
 
-# ---- 所有者モード ----
+# ---- 透かしは任意の機能（廃止した所有者モードの指定は受け付けるが何もしない） ----
 
-def test_config_default_is_not_owner(client, tmp_path):
-    assert client.get("/api/config").get_json() == {"owner": False, "project": None}
-    assert resolve_owner(False, {}, tmp_path / "missing.toml") is False
+def test_config_has_no_owner_mode(client):
+    assert client.get("/api/config").get_json() == {"project": None}
 
 
-def test_owner_by_flag(dirs, tmp_path):
+def test_owner_flag_is_accepted_but_ignored(dirs, capsys):
     _, images, _ = dirs
-    args = build_parser().parse_args(["run", str(images), "--owner"])
-    owner = resolve_owner(args.owner, {}, tmp_path / "missing.toml")
-    assert create_app(images, owner=owner).test_client().get("/api/config").get_json()["owner"] is True
+    plain = build_parser().parse_args(["run", str(images)])
+    flagged = build_parser().parse_args(["run", str(images), "--owner"])
+    assert flagged.owner is True and plain.owner is False        # 引数としては今も通る
+    assert build_parser().parse_args(["open", "demo", "--owner"]).project == "demo"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["run", "--help"])
+    assert "廃止" in capsys.readouterr().out
 
 
-def test_owner_by_env(dirs, tmp_path):
+def test_owner_settings_do_not_change_anything(dirs, tmp_path, monkeypatch):
+    """INKDEUS_OWNER や inkdeus.local.toml の owner があっても、既定値も応答も変わらない"""
     _, images, _ = dirs
-    owner = resolve_owner(False, {"INKDEUS_OWNER": "1"}, tmp_path / "missing.toml")
-    assert create_app(images, owner=owner).test_client().get("/api/config").get_json()["owner"] is True
-    assert resolve_owner(False, {"INKDEUS_OWNER": "0"}, tmp_path / "missing.toml") is False
-
-
-def test_owner_by_local_toml(dirs, tmp_path):
-    _, images, _ = dirs
+    before = create_app(images, watch=False).test_client()
+    expected = (before.get("/api/config").get_json(), before.get("/api/params/scene.png?resolve=1").get_json())
+    assert expected[1]["params"]["watermark"]["enabled"] is False
     cfg = tmp_path / "inkdeus.local.toml"
-    cfg.write_text("owner = true\n", encoding="utf-8")
-    owner = resolve_owner(False, {}, cfg)
-    assert create_app(images, owner=owner).test_client().get("/api/config").get_json()["owner"] is True
-    cfg.write_text("owner = false\n", encoding="utf-8")
-    assert resolve_owner(False, {}, cfg) is False
+    cfg.write_text('owner = true\nprojects_root = "somewhere"\n', encoding="utf-8")
+    assert read_local_config(cfg) == {"owner": True, "projects_root": "somewhere"}   # 読めはする（エラーにしない）
+    monkeypatch.setenv("INKDEUS_OWNER", "1")
+    monkeypatch.setattr("inkdeus.server.default_local_config", lambda: cfg)
+    after = create_app(images, watch=False).test_client()
+    assert (after.get("/api/config").get_json(), after.get("/api/params/scene.png?resolve=1").get_json()) == expected
     cfg.write_text("this is not toml = = =", encoding="utf-8")
-    assert resolve_owner(False, {}, cfg) is False
+    assert read_local_config(cfg) == {}
+
+
+def test_watermark_enabled_is_respected_by_the_api(client):
+    """watermark.enabled は素直に効く。enabled の無い設定ファイルを読んでも壊れない"""
+    r = client.patch("/api/params/scene.png", data=json.dumps({"watermark": {"enabled": True}}))
+    assert r.status_code == 200 and r.get_json()["params"]["watermark"]["enabled"] is True
+    r = client.post("/api/set/scene.png", data=json.dumps({"key": "watermark.enabled", "value": False}))
+    assert r.status_code == 200 and r.get_json()["params"]["watermark"]["enabled"] is False
+    client.put("/api/params/scene.png", data=json.dumps({"version": 2, "watermark": {"text": "x"}}))
+    got = client.get("/api/params/scene.png?resolve=1").get_json()
+    assert got["warnings"] == [] and got["params"]["watermark"] == {
+        "enabled": False, "text": "x", "position": "br", "size": 14, "opacity": 0.35}
 
 
 # ---- 外部からの操作: 設定の部分更新・状態・統計・監視 ----
@@ -216,7 +229,7 @@ def test_set_and_style_endpoints(client):
 def test_state_roundtrip(client, dirs):
     _, images, masks = dirs
     s = client.get("/api/state").get_json()
-    assert s["current"] is None and s["images"] == 2 and s["owner"] is False and s["clients"] == 0
+    assert s["current"] is None and s["images"] == 2 and "owner" not in s and s["clients"] == 0
     assert s["source"] == str(images) and s["masks"] == str(masks) and s["out"] == str(images / "inkdeus_out")
     assert s["project"] is None
     assert client.post("/api/state", data=json.dumps({"current": "scene.png"})).get_json()["current"] == "scene.png"

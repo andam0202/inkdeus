@@ -15,8 +15,7 @@ def test_defaults():
     assert [(l["threshold"], l["angle"]) for l in person["layers"]] == [(0.72, 45), (0.52, 135), (0.38, 0), (0.27, 90)]
     assert person["levels"] == {"brightness": 0, "contrast": 1, "gamma": 1}
     assert p["regions"]["background"]["linked"] is True
-    assert p["watermark"]["enabled"] is True
-    assert schema.default_params(owner=True)["watermark"]["enabled"] is False
+    assert p["watermark"]["enabled"] is False            # 透かしは既定でオフ
     # 整えた物をもう一度整えても変わらない
     assert schema.normalize(p, strict=True)[0] == p
 

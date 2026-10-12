@@ -108,8 +108,8 @@ function textRow(ctx, f, obj, key, fallback) {
   return el('div', { class: 'row', 'data-key': key }, el('label', {}, f.label), input);
 }
 
-function fieldRow(ctx, f, obj, key, owner) {
-  const def = owner && 'ownerDef' in f ? f.ownerDef : f.def;
+function fieldRow(ctx, f, obj, key) {
+  const def = f.def;
   if (f.type === 'range') return rangeRow(ctx, f, obj, key, def);
   if (f.type === 'bool') return boolRow(ctx, f, obj, key);
   if (f.type === 'select') return selectRow(ctx, f, obj, key);
@@ -286,19 +286,11 @@ function toneSection(ctx) {
 }
 
 function watermarkSection(ctx) {
-  const { params, owner } = ctx.state;
+  const { params } = ctx.state;
   const w = params.watermark;
   const f = SECTIONS.watermark;
   const rows = [];
-  if (owner) {
-    rows.push(boolRow(ctx, f.enabled, w, 'enabled', () => ctx.rebuild()));
-  } else {
-    rows.push(el('div', { class: 'note', id: 'wmForcedNote' }, '透かしは常に入ります（所有者モードでのみ外せます）。'));
-    if (w.enabled === false) {
-      rows.push(el('div', { class: 'note warn', id: 'wmIgnoredNote' },
-        '設定では透かしがオフですが、所有者モードではないため無視しています。'));
-    }
-  }
+  rows.push(boolRow(ctx, f.enabled, w, 'enabled', () => ctx.rebuild()));
   rows.push(textRow(ctx, f.text, w, 'text', WATERMARK_FALLBACK_TEXT));
   rows.push(selectRow(ctx, f.position, w, 'position'));
   rows.push(rangeRow(ctx, f.size, w, 'size', f.size.def));

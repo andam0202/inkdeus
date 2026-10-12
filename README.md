@@ -27,11 +27,11 @@ so the preview and the exported PNG are the same pixels.
 
 ```bash
 uv run inkdeus new <名前> --images <画像フォルダ> [--masks <マスクフォルダ>] [--copy] [--note "メモ"]
-uv run inkdeus open <名前 or プロジェクトのパス> [--port 8770] [--owner]
+uv run inkdeus open <名前 or プロジェクトのパス> [--port 8770]
 uv run inkdeus projects [--json]        # 一覧（画像・マスク・設定済み・書き出し済みの枚数）
 ```
 
-- 置き場は既定で `~/inkdeus-projects`。環境変数 `INKDEUS_PROJECTS` か `inkdeus.local.toml` の `projects_root` で変えられます。
+- 置き場は既定で `~/inkdeus-projects`。環境変数 `INKDEUS_PROJECTS` か、リポジトリ直下の `inkdeus.local.toml`（`inkdeus.local.toml.example` をコピー）の `projects_root` で変えられます。
 - プロジェクトの中身は `inkdeus.project.toml`（name / created / source / masks / out / note）と `out/`（設定JSON と書き出した PNG）。
 - 既にあるプロジェクトの参照先を変えるときは `inkdeus new <名前> --images <dir> --force`。
 
@@ -109,11 +109,11 @@ Claude Code 用のスキル（`.claude/skills/inkdeus/SKILL.md`）に、起動�
 
 ## 透かし
 
-書き出し画像とプレビューには文字の透かしが入ります（文字列・位置・大きさ・濃さは変更可。空の文字列や、下限より小さく・薄くはできません）。
+透かしは任意の機能で、既定ではオフです。「透かし」の「透かしを入れる」スイッチ（設定JSON の `watermark.enabled`）をオンにすると、
+プレビューと書き出し画像に文字の透かしが入ります。文字列・位置・大きさ・濃さを変えられます
+（文字列が空のときは `inkdeus` になり、大きさ・濃さには描画が壊れないための最小値があります）。
 
-サーバを所有者モードで起動すると「透かしを入れる」スイッチが出ます（既定はオフ）。
-次のいずれかで所有者モードになります: 起動引数 `--owner` / 環境変数 `INKDEUS_OWNER=1` /
-リポジトリ直下の `inkdeus.local.toml`（`inkdeus.local.toml.example` をコピー。`owner = true`）。
+以前の版にあった起動引数 `--owner`、環境変数 `INKDEUS_OWNER`、`inkdeus.local.toml` の `owner` は廃止しました。指定してあってもエラーにはならず、無視されます。
 
 ## 設定JSON
 
@@ -148,9 +148,9 @@ Claude Code 用のスキル（`.claude/skills/inkdeus/SKILL.md`）に、起動�
 | `regions.background.grow` | `3.0` | マスクの広げ（正）/ 縮め（負）（基準px） |
 | `regions.background.silhouetteWidth` | `1.5` | `white` のときのシルエット線の太さ（基準px） |
 | `regions.background.lineStrength` | `0.6` | `lines` のときの背景の線の濃さ |
-| `watermark.enabled` | `true` | 透かし（所有者モード以外では常にオン。所有者モードの既定は `false`） |
+| `watermark.enabled` | `false` | 透かしを入れる |
 | `watermark.text` / `position` | `"inkdeus"` / `"br"` | 文字列 / 位置（`br` `bl` `tr` `tl` `center` `tile`） |
-| `watermark.size` / `opacity` | `14` / `0.35` | 大きさ（基準px、下限 8）/ 濃さ（下限 0.15） |
+| `watermark.size` / `opacity` | `14` / `0.35` | 大きさ（基準px、最小 4）/ 濃さ（最小 0.05） |
 | `output.binary` | `false` | 純2値（0 と 255 だけ） |
 
 `<領域>` は `person`（人物。マスクの内側。マスクが無ければ全体）と `background`（背景）。層は領域ごとに最大 8。

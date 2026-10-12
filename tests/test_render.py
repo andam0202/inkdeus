@@ -35,7 +35,7 @@ def lab_l(srgb: np.ndarray) -> np.ndarray:
 def test_flat_white_has_no_ink(page):
     open_image(page, "white.png")
     defaults = page.evaluate("() => window.inkdeus.defaults()")
-    assert defaults["watermark"]["enabled"] is False      # 所有者モードの既定
+    assert defaults["watermark"]["enabled"] is False      # 透かしは既定でオフ
     img = render(page, deep_merge(defaults, {"unit": 1}))
     assert img.shape == (256, 256)
     assert (img == 255).all()
@@ -280,8 +280,8 @@ def test_same_settings_give_identical_output(page):
     assert (a1 == a2).all() and (a2 == a3).all()
 
 
-def test_params_save_and_reload_give_same_output(browser, owner_site):
-    page = open_page(browser, owner_site.url)
+def test_params_save_and_reload_give_same_output(browser, main_site):
+    page = open_page(browser, main_site.url)
     open_image(page, "halves.png")
     params = deep_merge(page.evaluate("() => window.inkdeus.defaults()"), {
         "unit": 1.5,
@@ -292,12 +292,12 @@ def test_params_save_and_reload_give_same_output(browser, owner_site):
     })
     before = render(page, params)
     page.evaluate("() => window.inkdeus.save()")
-    saved = json.loads((owner_site.out / "halves.inkdeus.json").read_text(encoding="utf-8"))
+    saved = json.loads((main_site.out / "halves.inkdeus.json").read_text(encoding="utf-8"))
     assert saved == page.evaluate("() => window.inkdeus.getParams()")
     assert saved["regions"]["person"]["layers"][0]["angle"] == 30 and saved["version"] == 2
     page.close()
 
-    page = open_page(browser, owner_site.url)       # 開き直して保存済みの設定を読む
+    page = open_page(browser, main_site.url)       # 開き直して保存済みの設定を読む
     open_image(page, "halves.png")
     assert page.evaluate("() => window.inkdeus.getParams()") == saved
     assert (pixels(page) == before).all()
@@ -376,19 +376,19 @@ def test_default_preset_values(page):
     assert page.evaluate("() => window.inkdeus.info().unit") == pytest.approx(640 / 1280)
 
 
-def test_export_saves_grayscale_png_identical_to_preview(page, owner_site):
+def test_export_saves_grayscale_png_identical_to_preview(page, main_site):
     open_image(page, "scene.png")
     base = deep_merge(page.evaluate("() => window.inkdeus.defaults()"), {"unit": 1})
     preview = render(page, base)
     result = page.evaluate("() => window.inkdeus.exportPNG()")
-    path = owner_site.out / "scene.png"
+    path = main_site.out / "scene.png"
     assert result["path"] == str(path)
     with Image.open(path) as im:
         assert im.mode == "L" and im.size == (640, 480)
         assert (np.asarray(im) == preview).all()
     assert str(path) in page.locator("#exportInfo").inner_text()
     # 入力画像は書き換わっていない
-    with Image.open(owner_site.images / "scene.png") as im:
+    with Image.open(main_site.images / "scene.png") as im:
         assert im.mode == "RGB"
 
 
@@ -420,8 +420,9 @@ def test_watermark_changes_only_its_area(page):
     assert all((a != b).any() for a, b in quads)   # タイル状なら画面全体に繰り返す
 
 
-def test_owner_mode_default_is_no_watermark_and_switch_adds_it(page):
-    assert page.evaluate("() => window.inkdeus.info().owner") is True
+def test_watermark_is_off_by_default_and_switch_adds_it(page):
+    assert "owner" not in page.evaluate("() => window.inkdeus.info()")
+    assert page.evaluate("() => window.inkdeus.defaults().watermark.enabled") is False
     open_image(page, "white.png")
     page.evaluate("() => window.inkdeus.setParams({ unit: 1 })")     # 既定値（watermark.enabled は補われる）
     assert page.evaluate("() => window.inkdeus.getParams().watermark.enabled") is False
@@ -436,54 +437,66 @@ def test_owner_mode_default_is_no_watermark_and_switch_adds_it(page):
     rect = page.evaluate("() => window.inkdeus.watermark().rect")
     area = rect_mask(img.shape, rect)
     assert (img[area] < 255).any() and (img[~area] == 255).all()
+    switch.uncheck()                                                 # スイッチで外せる
+    page.evaluate("() => window.inkdeus.render()")
+    assert page.evaluate("() => window.inkdeus.getParams().watermark.enabled") is False
+    assert (pixels(page) == 255).all()
 
 
-def test_watermark_is_forced_when_not_owner(plain_page):
+def test_watermark_enabled_setting_is_respected(plain_page, site):
+    """設定の watermark.enabled がそのまま効く（強制しない）。プレビューにも書き出しにも"""
     page = plain_page
-    assert page.evaluate("() => window.inkdeus.info().owner") is False
-    assert page.evaluate("() => window.inkdeus.defaults().watermark.enabled") is True
     open_image(page, "white.png")
-    img = render(page, deep_merge(BLANK, {"watermark": {"enabled": False}}))   # enabled=false を読ませる
+    img = render(page, deep_merge(BLANK, {"watermark": {"enabled": False}}))
+    wm = page.evaluate("() => window.inkdeus.watermark()")
+    assert wm["enabled"] is False and wm["rect"] is None
+    assert (img == 255).all()
+    page.locator("summary", has_text="透かし").click()
+    assert page.get_by_label("透かしを入れる").count() == 1       # スイッチは常に出る
+    assert page.locator("#wmForcedNote").count() == 0
+    page.evaluate("() => window.inkdeus.exportPNG()")
+    with Image.open(site.out / "white.png") as im:
+        assert (np.asarray(im) == 255).all()                      # 書き出しにも入らない
+
+    img = render(page, deep_merge(BLANK, {"watermark": {"enabled": True}}))
     wm = page.evaluate("() => window.inkdeus.watermark()")
     assert wm["enabled"] is True
     area = rect_mask(img.shape, wm["rect"])
-    assert (img[area] < 255).sum() > 50             # それでも透かしが入る
-    assert (img[~area] == 255).all()
-    page.locator("summary", has_text="透かし").click()
-    assert page.get_by_label("透かしを入れる").count() == 0       # オフにするスイッチは無い
-    assert page.locator("#wmForcedNote").count() == 1
-    assert page.locator("#wmIgnoredNote").count() == 1            # 無視している旨を小さく表示
-    # 書き出した PNG にも入る
+    assert (img[area] < 255).sum() > 50 and (img[~area] == 255).all()
     page.evaluate("() => window.inkdeus.exportPNG()")
+    with Image.open(site.out / "white.png") as im:
+        assert (np.asarray(im) == img).all()                      # 書き出しにも入る
+
+    # enabled が無い設定（古い設定ファイルなど）は既定のオフとして読める
+    result = page.evaluate("(p) => window.inkdeus.setParams(p)", deep_merge(BLANK, {"watermark": {"text": "x"}}))
+    assert page.evaluate("() => window.inkdeus.getParams().watermark.enabled") is False
+    assert result["warnings"] == [] and (pixels(page) == 255).all()
 
 
-def test_watermark_lower_limits(plain_page, site):
+def test_watermark_minimums_keep_rendering_intact(plain_page, site):
+    """極端な値（空の文字列・小さすぎる大きさ・薄すぎる濃さ）でも描画が壊れない"""
     page = plain_page
     open_image(page, "white.png")
     result = page.evaluate("(p) => window.inkdeus.setParams(p)",
-                           deep_merge(BLANK, {"watermark": {"enabled": False, "text": "   ", "size": 1, "opacity": 0}}))
+                           deep_merge(BLANK, {"watermark": {"enabled": True, "text": "   ", "size": 0, "opacity": 0}}))
     assert any("watermark.size" in w for w in result["warnings"])
     assert any("watermark.opacity" in w for w in result["warnings"])
     fields = page.evaluate("() => window.inkdeus.schema().sections.watermark")
     wm = page.evaluate("() => window.inkdeus.watermark()")
-    assert fields["size"]["min"] >= 8 and fields["opacity"]["min"] >= 0.15
-    assert wm["size"] >= fields["size"]["min"] and wm["opacity"] >= fields["opacity"]["min"]
-    assert wm["text"] == "inkdeus"                  # 空の文字列にはできない
+    assert 0 < fields["size"]["min"] <= 8 and 0 < fields["opacity"]["min"] <= 0.15
+    assert wm["size"] == fields["size"]["min"] and wm["opacity"] == fields["opacity"]["min"]
+    assert wm["text"] == "inkdeus"                  # 空の文字列なら既定の文字列
     img = pixels(page)
     area = rect_mask(img.shape, wm["rect"])
-    assert wm["rect"]["h"] >= 8
-    assert img[area].min() <= 235                   # 下限の濃さ・大きさでも見える
-    assert (img[area] < 250).sum() > 30
-    # UI のスライダーも下限より下げられない
+    assert wm["rect"]["w"] > 0 and wm["rect"]["h"] >= fields["size"]["min"]
+    assert (img[area] < 255).any() and (img[~area] == 255).all()
+    assert page.errors == []
+    # UI の数値欄も最小値より下げられない
     page.locator("summary", has_text="透かし").click()
     number = page.locator('#panel .row[data-key="opacity"] input[type="number"]').last
     number.fill("0")
     number.dispatch_event("change")
     assert page.evaluate("() => window.inkdeus.getParams().watermark.opacity") == fields["opacity"]["min"]
-    # サーバに保存された書き出しにも透かしが入っている
-    page.evaluate("() => window.inkdeus.exportPNG()")
-    with Image.open(site.out / "white.png") as im:
-        assert (np.asarray(im)[area] < 250).sum() > 30
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +591,7 @@ def test_standalone_mode_without_api(browser, site, tmp_path):
     try:
         page = open_page(browser, f"http://127.0.0.1:{httpd.server_port}/")
         info = page.evaluate("() => window.inkdeus.info()")
-        assert info["server"] is False and info["owner"] is False
+        assert info["server"] is False and "owner" not in info
         page.set_input_files("#fileImage", str(site.images / "scene.png"))
         page.wait_for_function("() => window.inkdeus.info().width === 640")
         page.set_input_files("#fileMask", str(site.masks / "scene.png"))
@@ -592,11 +605,9 @@ def test_standalone_mode_without_api(browser, site, tmp_path):
         page.evaluate("() => window.inkdeus.render()")
         img = pixels(page)
         wm = page.evaluate("() => window.inkdeus.watermark()")
-        assert wm["enabled"] is True                 # サーバなしでは透かしは外せない
-        area = rect_mask(img.shape, wm["rect"])
+        assert wm["enabled"] is False and wm["rect"] is None    # サーバなしでも設定どおり（透かし無し）
         out = outside_mask(4)
-        assert (img[out & ~area] == 255).all()
-        assert (img[area] < 255).any()
+        assert (img[out] == 255).all()
         with page.expect_download() as dl:           # 書き出しはダウンロードになる
             page.locator("summary", has_text="出力").scroll_into_view_if_needed()
             page.locator("#btnExport").click()
@@ -618,13 +629,13 @@ def test_standalone_mode_without_api(browser, site, tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(os.environ.get("INKDEUS_SKIP_BIG") == "1", reason="INKDEUS_SKIP_BIG=1")
-def test_large_image_end_to_end(browser, owner_site, capsys):
+def test_large_image_end_to_end(browser, main_site, capsys):
     w, h = 5120, 3840
     img, mask = synth.scene(w, h)
-    synth.save(owner_site.images / "big.png", img, fast=True)
-    synth.save(owner_site.masks / "big.png", mask, fast=True)
+    synth.save(main_site.images / "big.png", img, fast=True)
+    synth.save(main_site.masks / "big.png", mask, fast=True)
     del img
-    page = open_page(browser, owner_site.url)
+    page = open_page(browser, main_site.url)
     try:
         max_size = page.evaluate("() => window.inkdeus.info().maxTextureSize")
         assert max_size >= max(w, h), f"この環境の最大テクスチャサイズは {max_size}"
@@ -659,7 +670,7 @@ def test_large_image_end_to_end(browser, owner_site, capsys):
         t0 = time.time()
         result = page.evaluate("() => window.inkdeus.exportPNG()")
         t_export = time.time() - t0
-        path = owner_site.out / "big.png"
+        path = main_site.out / "big.png"
         assert result["path"] == str(path)
         Image.MAX_IMAGE_PIXELS = None
         with Image.open(path) as im:
@@ -680,5 +691,5 @@ def test_large_image_end_to_end(browser, owner_site, capsys):
                   f"\n  書き出し（PNG 化＋保存）: {t_export:.1f}s / {path.stat().st_size / 1e6:.1f} MB")
     finally:
         page.close()
-        (owner_site.images / "big.png").unlink(missing_ok=True)
-        (owner_site.masks / "big.png").unlink(missing_ok=True)
+        (main_site.images / "big.png").unlink(missing_ok=True)
+        (main_site.masks / "big.png").unlink(missing_ok=True)

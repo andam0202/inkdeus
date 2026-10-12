@@ -19,12 +19,8 @@ export const REGIONS = ['person', 'background'];
 const isObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
 const clone = (v) => JSON.parse(JSON.stringify(v));
 
-export function fieldDefault(f, owner) {
-  return owner && 'ownerDef' in f ? f.ownerDef : f.def;
-}
-
-function normValue(v, f, path, problems, owner) {
-  const def = fieldDefault(f, owner);
+function normValue(v, f, path, problems) {
+  const def = f.def;
   if (v === undefined) return def;
   switch (f.type) {
     case 'bool':
@@ -49,7 +45,7 @@ function normValue(v, f, path, problems, owner) {
 }
 
 /** raw（オブジェクト）を fields に従って整える。extra は fields 以外に許すキー */
-function normFields(raw, fields, path, problems, owner, extra = []) {
+function normFields(raw, fields, path, problems, extra = []) {
   if (raw !== undefined && !isObject(raw)) {
     problems.push(`${path}: オブジェクトではないため既定値にしました`);
     raw = undefined;
@@ -60,7 +56,7 @@ function normFields(raw, fields, path, problems, owner, extra = []) {
   }
   const out = {};
   for (const [key, f] of Object.entries(fields)) {
-    out[key] = normValue(src[key], f, `${path}.${key}`, problems, owner);
+    out[key] = normValue(src[key], f, `${path}.${key}`, problems);
   }
   return out;
 }
@@ -75,14 +71,14 @@ function normLayers(raw, path, problems, fallback) {
     problems.push(`${path}: ${layers.length} 層あります。先頭の ${MAX_LAYERS} 層だけ使います`);
     layers = layers.slice(0, MAX_LAYERS);
   }
-  return layers.map((l, i) => normFields(l, LAYER_FIELDS, `${path}[${i}]`, problems, false));
+  return layers.map((l, i) => normFields(l, LAYER_FIELDS, `${path}[${i}]`, problems));
 }
 
 /** 領域（人物 / 背景）に共通の levels・solid・layers を out に足す */
 function normRegionTone(src, out, path, problems) {
   const style = STYLES[SCHEMA.defaultStyle];
-  out.levels = normFields(src.levels, LEVEL_FIELDS, `${path}.levels`, problems, false);
-  out.solid = normFields(src.solid === undefined ? style.solid : src.solid, SOLID_FIELDS, `${path}.solid`, problems, false);
+  out.levels = normFields(src.levels, LEVEL_FIELDS, `${path}.levels`, problems);
+  out.solid = normFields(src.solid === undefined ? style.solid : src.solid, SOLID_FIELDS, `${path}.solid`, problems);
   out.layers = normLayers(src.layers, `${path}.layers`, problems, style.layers);
 }
 
@@ -102,7 +98,7 @@ export function migrate(raw) {
  * 任意の JSON を設定オブジェクトに整える。欠けたキーは既定値で補い、
  * 未知のキー・使えない値は warnings に積む（黙って無視しない）。
  */
-export function normalize(input, { owner = false } = {}) {
+export function normalize(input) {
   const warnings = [];
   let raw = input;
   if (!isObject(raw)) {
@@ -126,8 +122,8 @@ export function normalize(input, { owner = false } = {}) {
       warnings.push(`unit: 値 ${JSON.stringify(raw.unit)} は使えないため自動にしました`);
     }
   }
-  params.input = normFields(raw.input, SECTIONS.input, 'input', warnings, owner);
-  params.lines = normFields(raw.lines, SECTIONS.lines, 'lines', warnings, owner);
+  params.input = normFields(raw.input, SECTIONS.input, 'input', warnings);
+  params.lines = normFields(raw.lines, SECTIONS.lines, 'lines', warnings);
 
   let regions = raw.regions;
   if (regions !== undefined && !isObject(regions)) {
@@ -139,23 +135,23 @@ export function normalize(input, { owner = false } = {}) {
     if (!REGIONS.includes(key)) warnings.push(`未知のキー: regions.${key}`);
   }
   const tone = ['levels', 'solid', 'layers'];
-  const personSrc = normFields(regions.person, {}, 'regions.person', warnings, owner, tone);
+  const personSrc = normFields(regions.person, {}, 'regions.person', warnings, tone);
   normRegionTone(isObject(regions.person) ? regions.person : {}, personSrc, 'regions.person', warnings);
-  const bg = normFields(regions.background, BACKGROUND_FIELDS, 'regions.background', warnings, owner, tone);
+  const bg = normFields(regions.background, BACKGROUND_FIELDS, 'regions.background', warnings, tone);
   normRegionTone(isObject(regions.background) ? regions.background : {}, bg, 'regions.background', warnings);
   params.regions = { person: personSrc, background: bg };
 
-  params.watermark = normFields(raw.watermark, SECTIONS.watermark, 'watermark', warnings, owner);
-  params.output = normFields(raw.output, SECTIONS.output, 'output', warnings, owner);
+  params.watermark = normFields(raw.watermark, SECTIONS.watermark, 'watermark', warnings);
+  params.output = normFields(raw.output, SECTIONS.output, 'output', warnings);
   return { params, warnings };
 }
 
-export function defaultParams(opts) {
-  return normalize({}, opts).params;
+export function defaultParams() {
+  return normalize({}).params;
 }
 
 export function newLayer(overrides = {}) {
-  return normFields(overrides, LAYER_FIELDS, 'layer', [], false);
+  return normFields(overrides, LAYER_FIELDS, 'layer', []);
 }
 
 const styleKeyOf = (s) => String(s).normalize('NFKC').toLowerCase().replace(/[\s_]/g, '');
@@ -216,15 +212,15 @@ export function effectiveRegions(params, hasMask) {
 }
 
 /**
- * 実際に描く透かしの設定。所有者モードでなければ enabled の値に関係なく必ず入れる。
- * 文字列は空にできず、大きさ・濃さは下限未満にならない。
+ * 実際に描く透かしの設定（入れるかどうかは enabled のとおり）。
+ * 描画が壊れないよう、文字列が空なら既定の文字列を使い、大きさ・濃さは最小値未満にしない。
  */
-export function effectiveWatermark(params, owner) {
+export function effectiveWatermark(params) {
   const f = SECTIONS.watermark;
   const w = params.watermark;
   const txt = (w.text || '').trim();
   return {
-    enabled: owner ? w.enabled : true,
+    enabled: w.enabled === true,
     text: txt || WATERMARK_FALLBACK_TEXT,
     position: w.position,
     size: Math.max(f.size.min, w.size),

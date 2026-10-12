@@ -55,21 +55,6 @@ def read_local_config(path: Path | None = None) -> dict:
         return {}
 
 
-def _truthy(value: str | None) -> bool:
-    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def resolve_owner(flag: bool = False, environ: dict | None = None,
-                  local_config: Path | None = None) -> bool:
-    """所有者モードかどうか。起動引数・環境変数・ローカル設定ファイルのどれかで有効になる"""
-    if flag:
-        return True
-    env = os.environ if environ is None else environ
-    if _truthy(env.get("INKDEUS_OWNER")):
-        return True
-    return read_local_config(local_config).get("owner") is True
-
-
 def is_image(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
 
@@ -195,9 +180,8 @@ class Hub:
 class Session:
     """稼働中の状態: いま開いている画像、設定ファイルの版、統計、書き出しの記録"""
 
-    def __init__(self, lib: Library, owner: bool):
+    def __init__(self, lib: Library):
         self.lib = lib
-        self.owner = owner
         self.hub = Hub()
         self.lock = threading.RLock()
         self.current: str | None = None
@@ -227,7 +211,7 @@ class Session:
                 raw = json.loads(data.decode("utf-8"))
             except (UnicodeDecodeError, ValueError):
                 problems.append("設定ファイルが JSON として読めないため既定値を使いました")
-        params, warns = schema.normalize(raw, owner=self.owner)
+        params, warns = schema.normalize(raw)
         return {"name": entry.name, "rev": rev, "exists": data is not None,
                 "params": params, "warnings": problems + warns}
 
@@ -302,13 +286,13 @@ class Session:
 
 
 def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
-               out_dir: Path | str | None = None, owner: bool = False,
+               out_dir: Path | str | None = None,
                project: dict | None = None, watch: bool = True) -> Flask:
-    """アプリを作る。owner は resolve_owner() で決めた値、project はプロジェクトの情報（任意）"""
+    """アプリを作る。project はプロジェクトの情報（任意）"""
     lib = Library(Path(input_path), Path(mask_dir) if mask_dir else None,
                   Path(out_dir) if out_dir else None)
     web = find_web_dir()
-    session = Session(lib, bool(owner))
+    session = Session(lib)
     app = Flask(__name__, static_folder=str(web), static_url_path="")
     app.config["MAX_CONTENT_LENGTH"] = MAX_EXPORT_BYTES
     app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
@@ -336,7 +320,6 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         return {
             "current": session.current,
             "images": len(lib.entries()),
-            "owner": session.owner,
             "clients": session.hub.count(),
             "project": project,
             "source": str(lib.folder),
@@ -368,7 +351,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
 
     @app.get("/api/config")
     def api_config():
-        return jsonify({"owner": session.owner, "project": project})
+        return jsonify({"project": project})
 
     # ---- 画像・マスク ----
 
@@ -418,7 +401,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         # PATCH: 外部からの部分更新（JSON Merge Patch）。検証に通らなければ何も書かない
         base = session.resolved(entry)["params"]
         try:
-            params, _ = schema.normalize(schema.merge_patch(base, body), owner=session.owner, strict=True)
+            params, _ = schema.normalize(schema.merge_patch(base, body), strict=True)
         except schema.ValidationError as e:
             return fail(e.problems)
         rev = session.write_params(entry, params, None)
@@ -433,7 +416,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         base = session.resolved(entry)["params"]
         try:
             params, _ = schema.normalize(schema.set_path(base, body["key"], body["value"]),
-                                         owner=session.owner, strict=True)
+                                         strict=True)
         except schema.ValidationError as e:
             return fail(e.problems)
         rev = session.write_params(entry, params, None)
@@ -447,7 +430,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         try:
             style = schema.resolve_style(str(body.get("style", "")))
             params = schema.apply_style(base, str(body.get("style", "")), str(body.get("region", "person")))
-            params, _ = schema.normalize(params, owner=session.owner, strict=True)
+            params, _ = schema.normalize(params, strict=True)
         except schema.ValidationError as e:
             return fail(e.problems)
         rev = session.write_params(entry, params, None)

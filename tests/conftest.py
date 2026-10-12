@@ -60,24 +60,26 @@ def serve(app):
     return server, f"http://127.0.0.1:{server.server_port}/"
 
 
-def _site(tmp_path_factory, owner: bool):
-    root = tmp_path_factory.mktemp("owner" if owner else "site")
+def _site(tmp_path_factory, label: str):
+    root = tmp_path_factory.mktemp(label)
     images, masks = make_images(root)
     out = root / "out"
-    server, url = serve(create_app(images, mask_dir=masks, out_dir=out, owner=owner))
+    server, url = serve(create_app(images, mask_dir=masks, out_dir=out))
     return server, Site(url, images, masks, out)
 
 
 @pytest.fixture(scope="session")
 def site(tmp_path_factory):
-    server, s = _site(tmp_path_factory, owner=False)
+    """透かしまわりの検証用のサーバ（main_site とは出力先を分ける）"""
+    server, s = _site(tmp_path_factory, "site")
     yield s
     server.shutdown()
 
 
 @pytest.fixture(scope="session")
-def owner_site(tmp_path_factory):
-    server, s = _site(tmp_path_factory, owner=True)
+def main_site(tmp_path_factory):
+    """描画の検証用のサーバ"""
+    server, s = _site(tmp_path_factory, "main")
     yield s
     server.shutdown()
 
@@ -108,16 +110,16 @@ def open_page(browser, url: str):
 
 
 @pytest.fixture()
-def page(browser, owner_site):
-    """描画の検証用。透かしを切れるよう所有者モードのサーバにつなぐ"""
-    p = open_page(browser, owner_site.url)
+def page(browser, main_site):
+    """描画の検証用のページ"""
+    p = open_page(browser, main_site.url)
     yield p
     p.close()
 
 
 @pytest.fixture()
 def plain_page(browser, site):
-    """既定（所有者モードではない）サーバにつないだページ"""
+    """site（透かしまわりの検証用）のサーバにつないだページ"""
     p = open_page(browser, site.url)
     yield p
     p.close()

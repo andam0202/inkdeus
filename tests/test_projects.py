@@ -155,7 +155,7 @@ def test_direct_run_shorthand(env, capsys, monkeypatch):
     """inkdeus <path> は、path が実在するときだけ run の省略形"""
     started = {}
 
-    def fake_serve(app, host, port, owner, project=None):
+    def fake_serve(app, host, port, project=None):
         started.update(lib=app.config["INKDEUS_LIBRARY"], port=port, project=project)
         return 0
 

@@ -329,9 +329,9 @@ export class Renderer {
 
   /**
    * 設定から合成パスのユニフォーム一式を作り、必要な前段のパスを用意する。
-   * opts.solo: { region, index } でそのトーン層だけを表示（ベタ・線画も隠す）。opts.owner: 所有者モード
+   * opts.solo: { region, index } でそのトーン層だけを表示（ベタ・線画も隠す）
    */
-  prepare(params, { solo = null, owner = false } = {}) {
+  prepare(params, { solo = null } = {}) {
     const { W, H } = this;
     const unit = effectiveUnit(params, W);
     const regions = effectiveRegions(params, this.hasMask);
@@ -367,7 +367,7 @@ export class Renderer {
       : this.tex.lum;
     const blur = needLines ? this.ensureBlur(lumKey, params.lines.sigma * unit) : null;
 
-    const wm = effectiveWatermark(params, owner);
+    const wm = effectiveWatermark(params);
     let wmMode = 0;
     let wmTex = null;
     let rect = [0, 0, 1, 1];

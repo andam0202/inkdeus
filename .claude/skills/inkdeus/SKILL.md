@@ -24,18 +24,18 @@ inkdeus はブラウザで動くエディタで、設定ファイルを書き換
 uv run inkdeus projects
 ```
 
-- 利用者が既存のプロジェクト名を言った → `uv run inkdeus open <名前> --owner`
+- 利用者が既存のプロジェクト名を言った → `uv run inkdeus open <名前>`
 - 画像フォルダを示された → プロジェクトを作ってから開く
 
 ```bash
 uv run inkdeus new <名前> --images <画像フォルダ> [--masks <マスクフォルダ>]
-uv run inkdeus open <名前> --owner
+uv run inkdeus open <名前>
 ```
 
-- プロジェクトを作らず一時的に開くだけなら `uv run inkdeus run <画像 or フォルダ> [--mask-dir DIR] --owner`
+- プロジェクトを作らず一時的に開くだけなら `uv run inkdeus run <画像 or フォルダ> [--mask-dir DIR]`
 
 サーバは終了しないので**バックグラウンドで起動**し、表示された URL（既定 `http://127.0.0.1:8770/`）を利用者に伝えてブラウザで開いてもらう。
-`--owner` は透かしを外せる所有者モード。別のポートで起動したときは、以下の `ctl` すべてに `--port <番号>` を付ける。
+別のポートで起動したときは、以下の `ctl` すべてに `--port <番号>` を付ける（サブコマンドの前でも後ろでもよい: `ctl --port 8771 state` / `ctl state --port 8771`）。
 
 起動できたかは `uv run inkdeus ctl state` で確かめる（`clients` が 1 以上ならブラウザが開いている。`current` がいま開いている画像）。
 
@@ -105,6 +105,7 @@ uv run inkdeus ctl export                      # ブラウザに PNG 書き出�
 | 人物の縁に背景がはみ出す | `regions.background.grow` | 正で人物の範囲を広げる |
 | ざらつき・細かい斑点 | `input.smoothRadius`、`input.smoothStrength` | 上げるとトーン分けが滑らかになる |
 | 白と黒だけにしたい | `output.binary` | `true` |
+| 透かしを入れる/外す | `watermark.enabled` | `true` / `false`（既定は `false`）。`watermark.text` / `position` / `size` / `opacity` で調整 |
 
 ### 定石: 「背景の黒が多すぎる」
 

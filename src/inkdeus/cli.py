@@ -16,7 +16,7 @@ from pathlib import Path
 
 from . import ctl
 from .projects import ProjectError, create_project, list_projects, load_project, projects_root
-from .server import create_app, resolve_owner
+from .server import create_app
 
 COMMANDS = ("run", "new", "open", "projects", "ctl")
 
@@ -24,7 +24,7 @@ COMMANDS = ("run", "new", "open", "projects", "ctl")
 def _server_options(p: argparse.ArgumentParser) -> None:
     p.add_argument("--port", type=int, default=8770)
     p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--owner", action="store_true", help="所有者モード（透かしのオン/オフスイッチを出す）")
+    p.add_argument("--owner", action="store_true", help="廃止（無視されます）。透かしは画面のスイッチで切り替えます")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def serve(app, host: str, port: int, owner: bool, project=None) -> int:
+def serve(app, host: str, port: int, project=None) -> int:
     lib = app.config["INKDEUS_LIBRARY"]
     print(f"inkdeus: http://{host}:{port}/")
     if project is not None:
@@ -68,8 +68,6 @@ def serve(app, host: str, port: int, owner: bool, project=None) -> int:
     print(f"  出力: {lib.out_dir}")
     if lib.mask_dir:
         print(f"  マスク: {lib.mask_dir}")
-    if owner:
-        print("  所有者モード")
     if host not in ("127.0.0.1", "localhost", "::1"):
         print("  注意: ループバック以外で待ち受けます（同じネットワークから読み書きできます）")
     sys.stdout.flush()
@@ -78,13 +76,12 @@ def serve(app, host: str, port: int, owner: bool, project=None) -> int:
 
 
 def cmd_run(args) -> int:
-    owner = resolve_owner(flag=args.owner)
     try:
-        app = create_app(Path(args.input), args.mask_dir, args.out_dir, owner=owner)
+        app = create_app(Path(args.input), args.mask_dir, args.out_dir)
     except (FileNotFoundError, ValueError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
-    return serve(app, args.host, args.port, owner)
+    return serve(app, args.host, args.port)
 
 
 def cmd_new(args) -> int:
@@ -102,13 +99,12 @@ def cmd_new(args) -> int:
 
 def cmd_open(args) -> int:
     project = load_project(args.project)
-    owner = resolve_owner(flag=args.owner)
     try:
-        app = create_app(project.source, project.masks, project.out, owner=owner, project=project.info())
+        app = create_app(project.source, project.masks, project.out, project=project.info())
     except (FileNotFoundError, ValueError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
-    return serve(app, args.host, args.port, owner, project)
+    return serve(app, args.host, args.port, project)
 
 
 def cmd_projects(args) -> int:

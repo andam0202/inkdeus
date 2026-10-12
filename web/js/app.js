@@ -19,7 +19,6 @@ const ZOOM_MAX = 32;
 
 const state = {
   server: false,        // サーバの API が使えるか
-  owner: false,         // 所有者モード（透かしを外せる）
   images: [],           // サーバの画像一覧
   index: -1,
   name: null,           // 表示中の画像名
@@ -123,7 +122,7 @@ function renderNow() {
   if (!renderer) return null;
   let result = null;
   try {
-    result = renderer.render(state.params, { solo: state.solo, owner: state.owner });
+    result = renderer.render(state.params, { solo: state.solo });
     lastRenderMs = result.ms;
     if (renderer.W) $('timing').textContent = `再描画 ${result.ms.toFixed(1)} ms`;
   } catch (e) {
@@ -336,7 +335,7 @@ const redo = () => stepHistory(1);
 
 /** 任意の JSON を設定として読み込む（警告があれば表示する） */
 function loadParams(raw, { fresh = false, save = true } = {}) {
-  const { params, warnings } = normalize(raw, { owner: state.owner });
+  const { params, warnings } = normalize(raw);
   state.params = params;
   state.solo = null;
   if (warnings.length) showMessage(`設定の読み込みで気になる点がありました:\n・${warnings.join('\n・')}`, 'info', 20000);
@@ -398,7 +397,7 @@ function scheduleStats() {
 
 function computeStats() {
   if (!renderer || !renderer.W) return null;
-  const stats = renderer.stats(state.params, { solo: state.solo, owner: state.owner });
+  const stats = renderer.stats(state.params, { solo: state.solo });
   return { name: state.name, rev: state.rev, renderMs: Math.round(lastRenderMs * 10) / 10, ...stats };
 }
 
@@ -556,7 +555,7 @@ async function openIndex(i) {
       resetHistory();
       rebuild();
       // 既定値と違う設定を引き継いだときは、サーバ（と外部の操作）にも分かるようすぐ保存する
-      if (JSON.stringify(state.params) !== JSON.stringify(defaultParams({ owner: state.owner }))) await saveNow();
+      if (JSON.stringify(state.params) !== JSON.stringify(defaultParams())) await saveNow();
     }
     postState();
     renderNow();
@@ -695,7 +694,6 @@ async function init() {
   }
   const [config, list] = await Promise.all([getJSON('api/config'), getJSON('api/images')]);
   state.server = !!(list && Array.isArray(list.images));
-  state.owner = !!(state.server && config && config.owner === true);
   state.images = state.server ? list.images : [];
   state.project = state.server && config && config.project ? config.project : null;
   if (state.project) {
@@ -703,9 +701,9 @@ async function init() {
     $('projectName').title = `プロジェクト: ${state.project.path}`;
     $('projectName').hidden = false;
   }
-  state.params = defaultParams({ owner: state.owner });
+  state.params = defaultParams();
   resetHistory();
-  $('modeBadge').textContent = state.server ? (state.owner ? 'サーバ・所有者モード' : 'サーバ') : 'サーバなし';
+  $('modeBadge').textContent = state.server ? 'サーバ' : 'サーバなし';
 
   wireViewer();
   wireFiles();
@@ -726,7 +724,7 @@ const hooks = {
   ready: null,
   state,
   info: () => ({
-    server: state.server, owner: state.owner, name: state.name, width: renderer.W, height: renderer.H,
+    server: state.server, name: state.name, width: renderer.W, height: renderer.H,
     hasMask: state.hasMask, maxTextureSize: renderer.maxTextureSize,
     unit: effectiveUnit(state.params, renderer.W),
     renderer: (() => {
@@ -742,7 +740,7 @@ const hooks = {
   /** 描画結果の統計をその場で計算して返す（サーバへ送る物と同じ形） */
   stats: () => computeStats(),
   lastPostedStats: () => lastStats,
-  defaults: () => defaultParams({ owner: state.owner }),
+  defaults: () => defaultParams(),
   getParams: () => JSON.parse(JSON.stringify(state.params)),
   /** 設定を差し替えてその場で描画する。戻り値は { ms, passes, warnings } */
   setParams: (raw) => {
@@ -760,7 +758,7 @@ const hooks = {
     for (let i = 0; i < px.length; i += 0x8000) s += String.fromCharCode.apply(null, px.subarray(i, i + 0x8000));
     return btoa(s);
   },
-  watermark: () => ({ ...effectiveWatermark(state.params, state.owner), rect: renderer.wmRect }),
+  watermark: () => ({ ...effectiveWatermark(state.params), rect: renderer.wmRect }),
   exportPNG: () => exportNow(),
   undo, redo,
 };

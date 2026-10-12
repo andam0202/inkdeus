@@ -1,3 +1,8 @@
-# Copy to "inkdeus.local.toml" (git-ignored) to run the server in owner mode.
-# 所有者モード: 透かしのオン/オフスイッチが UI に出る（既定はオフ）。
-owner = true
+# Copy to "inkdeus.local.toml" (git-ignored) for settings local to this machine.
+# このPCだけの設定を書くファイル（git 管理外）。
+
+# プロジェクトの置き場（既定は ~/inkdeus-projects。環境変数 INKDEUS_PROJECTS でも変えられる）
+# projects_root = "~/inkdeus-projects"
+
+# 以前の版にあった `owner = true`（所有者モード）は廃止しました。書いてあっても無視されます。
+# 透かしは画面の「透かしを入れる」スイッチ（設定JSON の watermark.enabled）で切り替えます。

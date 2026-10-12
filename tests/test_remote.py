@@ -17,11 +17,11 @@ from inkdeus.server import create_app
 
 @pytest.fixture()
 def live(tmp_path, browser):
-    """このテスト専用のサーバ（所有者モード・プロジェクトあり）と、そこへつないだページ"""
+    """このテスト専用のサーバ（プロジェクトあり）と、そこへつないだページ"""
     images, masks = make_images(tmp_path)
     out = tmp_path / "out"
     project = {"name": "テスト本", "path": str(tmp_path)}
-    server, url = serve(create_app(images, mask_dir=masks, out_dir=out, owner=True, project=project))
+    server, url = serve(create_app(images, mask_dir=masks, out_dir=out, project=project))
     page = open_page(browser, url)
     yield {"page": page, "url": url, "port": server.server_port, "out": out}
     page.close()
@@ -64,7 +64,7 @@ def test_browser_reports_current_image_and_project(live, capsys):
     assert page.locator("#projectName").inner_text() == "テスト本"
     open_image(page, "scene.png")
     state = ctl(live, capsys, "state")
-    assert state["current"] == "scene.png" and state["clients"] == 1 and state["owner"] is True
+    assert state["current"] == "scene.png" and state["clients"] == 1 and "owner" not in state
     assert state["project"]["name"] == "テスト本" and state["images"] == 6
     assert ctl(live, capsys, "open", "gradient.png", "--timeout", "30")["current"] == "gradient.png"
     assert page.evaluate("() => window.inkdeus.info().name") == "gradient.png"

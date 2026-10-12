@@ -45,12 +45,8 @@ def _is_number(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
-def _field_default(f: dict, owner: bool) -> Any:
-    return f["ownerDef"] if owner and "ownerDef" in f else f["def"]
-
-
-def _norm_value(v: Any, f: dict, path: str, problems: list[str], owner: bool, present: bool) -> Any:
-    default = _field_default(f, owner)
+def _norm_value(v: Any, f: dict, path: str, problems: list[str], present: bool) -> Any:
+    default = f["def"]
     if not present:
         return default
     kind = f["type"]
@@ -70,7 +66,7 @@ def _norm_value(v: Any, f: dict, path: str, problems: list[str], owner: bool, pr
     return default
 
 
-def _norm_fields(raw: Any, fields: dict, path: str, problems: list[str], owner: bool,
+def _norm_fields(raw: Any, fields: dict, path: str, problems: list[str],
                  extra: tuple[str, ...] = ()) -> dict:
     if raw is not None and not isinstance(raw, dict):
         problems.append(f"{path}: オブジェクトではありません")
@@ -79,7 +75,7 @@ def _norm_fields(raw: Any, fields: dict, path: str, problems: list[str], owner: 
     for key in src:
         if key not in fields and key not in extra:
             problems.append(f"未知のキー: {path}.{key}")
-    return {key: _norm_value(src.get(key), f, f"{path}.{key}", problems, owner, key in src)
+    return {key: _norm_value(src.get(key), f, f"{path}.{key}", problems, key in src)
             for key, f in fields.items()}
 
 
@@ -92,15 +88,15 @@ def _norm_layers(raw: Any, path: str, problems: list[str], fallback: list, prese
     if len(layers) > s["maxLayers"]:
         problems.append(f"{path}: {len(layers)} 層あります（最大 {s['maxLayers']} 層）")
         layers = layers[: s["maxLayers"]]
-    return [_norm_fields(layer, s["layer"], f"{path}[{i}]", problems, False) for i, layer in enumerate(layers)]
+    return [_norm_fields(layer, s["layer"], f"{path}[{i}]", problems) for i, layer in enumerate(layers)]
 
 
 def _norm_region_tone(src: dict, out: dict, path: str, problems: list[str]) -> None:
     s = load()
     style = s["styles"][s["defaultStyle"]]
-    out["levels"] = _norm_fields(src.get("levels"), s["levels"], f"{path}.levels", problems, False)
+    out["levels"] = _norm_fields(src.get("levels"), s["levels"], f"{path}.levels", problems)
     out["solid"] = _norm_fields(src["solid"] if "solid" in src else style["solid"], s["solid"],
-                                f"{path}.solid", problems, False)
+                                f"{path}.solid", problems)
     out["layers"] = _norm_layers(src.get("layers"), f"{path}.layers", problems, style["layers"], "layers" in src)
 
 
@@ -118,7 +114,7 @@ def migrate(raw: Any) -> Any:
     return rest
 
 
-def normalize(raw: Any, owner: bool = False, strict: bool = False) -> tuple[dict, list[str]]:
+def normalize(raw: Any, strict: bool = False) -> tuple[dict, list[str]]:
     """設定を整えて (params, problems) を返す。strict=True で問題があれば ValidationError"""
     s = load()
     problems: list[str] = []
@@ -144,8 +140,8 @@ def normalize(raw: Any, owner: bool = False, strict: bool = False) -> tuple[dict
                 problems.append(f"unit: {unit} は範囲外です（{s['unitRange']['min']}〜{s['unitRange']['max']}）")
         else:
             problems.append(f"unit: 値 {json.dumps(unit, ensure_ascii=False)} は使えません")
-    params["input"] = _norm_fields(raw.get("input"), sections["input"], "input", problems, owner)
-    params["lines"] = _norm_fields(raw.get("lines"), sections["lines"], "lines", problems, owner)
+    params["input"] = _norm_fields(raw.get("input"), sections["input"], "input", problems)
+    params["lines"] = _norm_fields(raw.get("lines"), sections["lines"], "lines", problems)
 
     regions = raw.get("regions")
     if regions is not None and not isinstance(regions, dict):
@@ -155,24 +151,24 @@ def normalize(raw: Any, owner: bool = False, strict: bool = False) -> tuple[dict
     for key in regions:
         if key not in REGIONS:
             problems.append(f"未知のキー: regions.{key}")
-    person = _norm_fields(regions.get("person"), {}, "regions.person", problems, owner, TONE_KEYS)
+    person = _norm_fields(regions.get("person"), {}, "regions.person", problems, TONE_KEYS)
     _norm_region_tone(regions["person"] if isinstance(regions.get("person"), dict) else {},
                       person, "regions.person", problems)
     background = _norm_fields(regions.get("background"), s["background"], "regions.background",
-                              problems, owner, TONE_KEYS)
+                              problems, TONE_KEYS)
     _norm_region_tone(regions["background"] if isinstance(regions.get("background"), dict) else {},
                       background, "regions.background", problems)
     params["regions"] = {"person": person, "background": background}
 
-    params["watermark"] = _norm_fields(raw.get("watermark"), sections["watermark"], "watermark", problems, owner)
-    params["output"] = _norm_fields(raw.get("output"), sections["output"], "output", problems, owner)
+    params["watermark"] = _norm_fields(raw.get("watermark"), sections["watermark"], "watermark", problems)
+    params["output"] = _norm_fields(raw.get("output"), sections["output"], "output", problems)
     if strict and problems:
         raise ValidationError(problems)
     return params, problems
 
 
-def default_params(owner: bool = False) -> dict:
-    return normalize({}, owner)[0]
+def default_params() -> dict:
+    return normalize({})[0]
 
 
 def merge_patch(target: Any, patch: Any) -> Any:
