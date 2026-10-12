@@ -50,7 +50,7 @@ def test_migrate_old_format():
     params, problems = schema.normalize(old, strict=True)
     assert problems == [] and params["version"] == 2 and params["unit"] == 2
     assert "layers" not in params and "solid" not in params and "background" not in params
-    assert params["regions"]["person"]["solid"] == {"enabled": False, "threshold": 0.3, "soft": 0.0}
+    assert params["regions"]["person"]["solid"] == {"enabled": False, "threshold": 0.3, "soft": 0.0, "lineKnockout": 0.0}
     assert [l["angle"] for l in params["regions"]["person"]["layers"]] == [10]
     bg = params["regions"]["background"]
     assert (bg["mode"], bg["grow"], bg["lineStrength"], bg["linked"]) == ("lines", 5, 0.3, True)

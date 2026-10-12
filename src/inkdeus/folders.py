@@ -5,6 +5,7 @@
     name = "<名前>"      # 1〜32 文字の英数・かな漢字・_ -。"default" は予約
     images = "<dir>"
     masks = "<dir>"       # 任意
+    parts = "<dir>"       # 任意。部分マスク（髪・肌・服など）の置き場（<dir>/<部分名>/<画像と同じ名前>.png）
     note = "…"            # 任意
 で、保存先は <out>/@<名前>/ 以下（既定のフォルダは従来どおり <out>/ 直下）。
 """
@@ -31,6 +32,7 @@ class FolderDef:
     images: Path
     masks: Path | None = None
     note: str = ""
+    parts: Path | None = None        # 部分マスクの置き場
 
 
 def validate_name(name) -> str:
@@ -78,28 +80,41 @@ def parse_entries(raw, base: Path) -> tuple[list[FolderDef], list[str]]:
             continue
         seen.add(name)
         masks = entry.get("masks")
+        parts = entry.get("parts")
         found.append(FolderDef(name, _resolve(base, entry["images"]),
                                _resolve(base, masks) if isinstance(masks, str) and masks else None,
-                               str(entry.get("note", ""))))
+                               str(entry.get("note", "")),
+                               _resolve(base, parts) if isinstance(parts, str) and parts else None))
     return found, problems
 
 
 def read_toml(path: Path | None) -> tuple[list[FolderDef], list[str]]:
+    return read_config(path)[:2]
+
+
+def read_config(path: Path | None) -> tuple[list[FolderDef], list[str], Path | None]:
+    """設定ファイルから ([[folders]] の並び, 注意, 既定のフォルダの部分マスクの置き場（parts = "<dir>"）) を読む"""
     if path is None:
-        return [], []
+        return [], [], None
     try:
         with open(path, "rb") as f:
             data = tomllib.load(f)
     except (OSError, tomllib.TOMLDecodeError):
-        return [], []
-    return parse_entries(data.get("folders"), Path(path).parent)
+        return [], [], None
+    base = Path(path).parent
+    parts = data.get("parts")
+    found, problems = parse_entries(data.get("folders"), base)
+    return found, problems, _resolve(base, parts) if isinstance(parts, str) and parts else None
 
 
 def parse_add(spec: str) -> FolderDef:
-    """起動引数 --add <名前>=<画像dir>[,<マスクdir>]"""
+    """起動引数 --add <名前>=<画像dir>[,<マスクdir>[,<部分マスクdir>]]"""
     name, sep, rest = spec.partition("=")
     if not sep or not rest:
-        raise FolderError(f"--add は <名前>=<画像フォルダ>[,<マスクフォルダ>] の形で指定してください: {spec!r}")
-    images, _, masks = rest.partition(",")
+        raise FolderError("--add は <名前>=<画像フォルダ>[,<マスクフォルダ>[,<部分マスクの置き場>]] の形で"
+                          f"指定してください: {spec!r}")
+    images, _, more = rest.partition(",")
+    masks, _, parts = more.partition(",")
     return FolderDef(validate_name(name), Path(images).expanduser().resolve(),
-                     Path(masks).expanduser().resolve() if masks else None)
+                     Path(masks).expanduser().resolve() if masks else None, "",
+                     Path(parts).expanduser().resolve() if parts else None)

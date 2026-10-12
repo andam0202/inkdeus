@@ -27,6 +27,7 @@ from . import assets as assets_mod
 from . import folders as folders_mod
 from . import fonts as fonts_mod
 from . import manga as manga_mod
+from . import parts as parts_mod
 from . import schema
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
@@ -46,10 +47,11 @@ VERSION_RE = re.compile(r"[\w\-]{1,32}")               # バージョン名（�
 PAINT_SUFFIX = ".paint"
 PAINT_INDEX = "index.json"
 PAINT_FORMAT = 1
-PAINT_TARGET_RE = re.compile(r"layer-[a-z0-9]{4,16}|solid-person|solid-background|lines|all|pen")
+# solid-<領域> の領域は person / background / 部分名（部分のベタ）
+PAINT_TARGET_RE = re.compile(r"layer-[a-z0-9]{4,16}|solid-[\w\-]{1,32}|lines|all|pen")
 PAINT_ALL = "all-targets"                              # 削除でだけ使える「全部の対象」
 MAX_PAINT_BYTES = 1 << 28
-FEATURES = ["layerIds", "paint"]                       # 画面が、サーバにある機能を確かめるための名前
+FEATURES = ["layerIds", "paint", "parts"]              # 画面が、サーバにある機能を確かめるための名前
 
 
 class VersionError(ValueError):
@@ -93,7 +95,8 @@ class Entry:
 class Library:
     """入力（1ファイルまたはフォルダ）と、マスク・出力先の対応を管理する"""
 
-    def __init__(self, input_path: Path, mask_dir: Path | None, out_dir: Path | None):
+    def __init__(self, input_path: Path, mask_dir: Path | None, out_dir: Path | None,
+                 parts_dir: Path | None = None):
         input_path = Path(input_path).resolve()
         if input_path.is_dir():
             self.folder, self.single = input_path, None
@@ -104,6 +107,8 @@ class Library:
         else:
             raise FileNotFoundError(f"入力が見つかりません: {input_path}")
         self.mask_dir = Path(mask_dir).resolve() if mask_dir else None
+        # 部分マスク（髪・肌・服など）の置き場。稼働中に登録が変わったら差し替えられる
+        self.parts_dir = Path(parts_dir).resolve() if parts_dir else None
         self.out_dir = Path(out_dir).resolve() if out_dir else self.folder / "inkdeus_out"
         if self.out_dir == self.folder:
             raise ValueError("--out-dir に入力フォルダそのものは指定できません（入力画像を上書きしないため）")
@@ -148,6 +153,33 @@ class Library:
             return None
         p = self.mask_dir / f"{entry.path.stem}.png"
         return p if p.is_file() else None
+
+    # ---- 部分マスク（<置き場>/<部分名>/<画像と同じ stem>.png）----
+
+    def parts(self) -> tuple[list[str], list[str]]:
+        """(部分名の並び, 注意の一覧)。置き場の直下のサブフォルダ名から拾う"""
+        return parts_mod.scan(self.parts_dir)
+
+    def part_names(self) -> list[str]:
+        return self.parts()[0]
+
+    def part_path(self, entry: Entry, part: str) -> Path | None:
+        return parts_mod.mask_path(self.parts_dir, part, entry.path.stem)
+
+    def parts_of(self, entry: Entry, names: list[str] | None = None) -> list[str]:
+        """その画像にマスクのある部分"""
+        names = self.part_names() if names is None else names
+        return [n for n in names if self.part_path(entry, n) is not None]
+
+    def _part_stamps(self, entry: Entry, names: list[str] | None = None) -> list[int]:
+        """その画像の部分マスクの更新時刻（部分マスクが変わったら、書き出し済みの白黒版は「古い」）"""
+        stamps = []
+        for name in self.parts_of(entry, names):
+            try:
+                stamps.append(self.part_path(entry, name).stat().st_mtime_ns)
+            except (OSError, AttributeError):
+                pass
+        return stamps
 
     # ---- バージョン（同じ元画像から作る、設定の違う白黒版）----
     # 既定のバージョン（名前 ""）は <stem>.inkdeus.json / <stem>.png、
@@ -265,7 +297,7 @@ class Library:
             index[found[0].name].setdefault(found[1], {})[kind] = st
         return index
 
-    def versions(self, entry: Entry, index: dict | None = None) -> list[dict]:
+    def versions(self, entry: Entry, index: dict | None = None, part_names: list[str] | None = None) -> list[dict]:
         """その画像のバージョンの一覧（既定が先頭。名前付きは名前順）"""
         found = (self.version_index() if index is None else index).get(entry.name, {})
         try:
@@ -275,6 +307,8 @@ class Library:
         mask = self.mask_path(entry)
         if mask is not None:
             inputs.append(mask.stat().st_mtime_ns)
+        if inputs:
+            inputs += self._part_stamps(entry, part_names)
         rows = []
         for name in ["", *sorted(v for v in found if v)]:
             rec = found.get(name, {})
@@ -311,6 +345,7 @@ class Library:
         mask = self.mask_path(entry)
         if mask is not None:
             inputs.append(mask.stat().st_mtime_ns)
+        inputs += self._part_stamps(entry)
         paint = self.paint_stamp(entry, version)
         if paint is not None:
             inputs.append(paint)
@@ -561,7 +596,11 @@ class Registry:
 
     def defs(self) -> list:
         found, seen = [], {folders_mod.DEFAULT}
-        for d in [*self.static, *folders_mod.read_toml(self.project_file)[0]]:
+        listed, _problems, default_parts = folders_mod.read_config(self.project_file)
+        if self.project_file is not None and self.project_file.is_file():
+            # 既定のフォルダの部分マスクの置き場も、設定ファイルのとおりにする（稼働中の parts set / unset を取り込む）
+            self.lib.parts_dir = default_parts
+        for d in [*self.static, *listed]:
             if d.name not in seen:
                 seen.add(d.name)
                 found.append(d)
@@ -576,11 +615,13 @@ class Registry:
                 built = self._built.get(d.name)
                 if built is None or built[0] != key or built[1] is None:
                     try:
-                        lib = Library(d.images, d.masks, folders_mod.out_dir(self.lib.out_dir, d.name))
+                        lib = Library(d.images, d.masks, folders_mod.out_dir(self.lib.out_dir, d.name), d.parts)
                         built = (key, lib, Session(lib, self.session.hub, d.name), d.note)
                     except (OSError, ValueError):
                         built = (key, None, None, d.note)
                     self._built[d.name] = built
+                if built[1] is not None:
+                    built[1].parts_dir = d.parts          # 部分マスクの置き場だけが変わっても、状態（Session）は作り直さない
                 out.append((d.name, built[1], built[2], d.note))
         return out
 
@@ -616,13 +657,15 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
                project: dict | None = None, watch: bool = True,
                local_config: Path | str | None = None,
                cache_root: Path | str | None = None,
-               folders: list | None = None) -> Flask:
+               folders: list | None = None,
+               parts_dir: Path | str | None = None,
+               config_dir: Path | str | None = None) -> Flask:
     """アプリを作る。project はプロジェクトの情報（任意）。
     folders は追加の画像フォルダ（folders.FolderDef の並び。プロジェクトの設定ファイルの [[folders]] とは別に足す分）。
     local_config は共通設定ファイル（省略時はリポジトリ直下の inkdeus.local.toml）、
     cache_root は漫画エディタのキャッシュ置き場（省略時は INKDEUS_CACHE か既定の場所）"""
     lib = Library(Path(input_path), Path(mask_dir) if mask_dir else None,
-                  Path(out_dir) if out_dir else None)
+                  Path(out_dir) if out_dir else None, Path(parts_dir) if parts_dir else None)
     web = find_web_dir()
     session = Session(lib)
     project_dir = Path(project["path"]) if project and project.get("path") else None
@@ -685,6 +728,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
             "project": project,
             "source": str(lib.folder),
             "masks": str(lib.mask_dir) if lib.mask_dir else None,
+            "parts": str(lib.parts_dir) if lib.parts_dir else None,
             "out": str(lib.out_dir),
             "manga": str(manga_dir),
             "batch": session.batch,
@@ -935,12 +979,14 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         for name, flib, _sess, note in registry.rows():
             row = {"name": name, "label": "既定" if name == folders_mod.DEFAULT else name, "note": note,
                    "missing": flib is None, "images": None, "masks": None, "out": None,
+                   "parts": None, "partNames": [],
                    "counts": {"images": 0, "masks": 0, "configured": 0, "exported": 0}}
             if flib is not None:
                 entries = flib.entries()
                 index = flib.version_index(entries)
                 row.update(images=str(flib.folder), masks=str(flib.mask_dir) if flib.mask_dir else None,
-                           out=str(flib.out_dir))
+                           out=str(flib.out_dir), parts=str(flib.parts_dir) if flib.parts_dir else None,
+                           partNames=flib.part_names())
                 row["counts"] = {
                     "images": len(entries),
                     "masks": sum(1 for e in entries.values() if flib.mask_path(e) is not None),
@@ -955,21 +1001,25 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         items = []
         entries = lib.entries()
         index = lib.version_index(entries)
+        part_names, part_warnings = lib.parts()
         for e in entries.values():
             w, h = lib.size(e)
-            versions = lib.versions(e, index)
+            versions = lib.versions(e, index, part_names)
             default = versions[0]
             items.append({
                 # 画像単位の項目は既定のバージョンの物（名前付きは versions に並ぶ）
                 "exportFile": default["exportFile"], "exportVersion": default["exportVersion"],
                 "name": e.name, "width": w, "height": h,
                 "hasMask": lib.mask_path(e) is not None,
+                "parts": lib.parts_of(e, part_names),       # その画像にマスクのある部分（髪・肌・服など）
                 "hasParams": default["hasParams"],
                 "hasExport": default["hasExport"], "exportFresh": default["exportFresh"],
                 "versions": versions,
             })
         return jsonify({"folder": folder, "images": items, "outDir": str(lib.out_dir),
-                        "maskDir": str(lib.mask_dir) if lib.mask_dir else None})
+                        "maskDir": str(lib.mask_dir) if lib.mask_dir else None,
+                        "partsDir": str(lib.parts_dir) if lib.parts_dir else None,
+                        "parts": part_names, "partWarnings": part_warnings})
 
     @app.get("/api/image/<path:name>")
     def api_image(name: str):
@@ -984,7 +1034,21 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
             abort(404)
         return send_file(p, mimetype="image/png")
 
+    @app.get("/api/part/<path:name>/<part>")
+    def api_part(name: str, part: str):
+        """部分マスク本体（8bit、255 = その部分）。一覧にある部分名だけを受け付ける"""
+        _folder, lib, _fs = pick()
+        entry = lib.get(name)
+        p = lib.part_path(entry, part) if part in lib.part_names() else None
+        if p is None:
+            abort(404)
+        return send_file(p, mimetype="image/png")
+
     # ---- 設定 ----
+
+    def known_parts(lib: Library, base: dict) -> set[str]:
+        """設定に書ける部分名: 部分マスクの置き場にある部分と、既に設定に入っている部分"""
+        return {*lib.part_names(), *schema.part_keys(base)}
 
     @app.route("/api/params/<path:name>", methods=["GET", "PUT", "PATCH"])
     def api_params(name: str):
@@ -1009,7 +1073,9 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         # PATCH: 外部からの部分更新（JSON Merge Patch）。検証に通らなければ何も書かない
         base = fs.resolved(entry, version, persist=False)["params"]
         try:
-            params, _ = schema.normalize(schema.inherit_layer_ids(schema.merge_patch(base, body), base), strict=True)
+            merged = schema.seed_parts(schema.merge_patch(base, body), base)
+            params, _ = schema.normalize(schema.inherit_layer_ids(merged, base), strict=True,
+                                         parts=known_parts(lib, base))
         except schema.ValidationError as e:
             return fail(e.problems)
         rev = fs.write_params(entry, params, None, version)
@@ -1026,7 +1092,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         base = fs.resolved(entry, version, persist=False)["params"]
         try:
             params, _ = schema.normalize(schema.set_path(base, body["key"], body["value"]),
-                                         strict=True)
+                                         strict=True, parts=known_parts(lib, base))
         except schema.ValidationError as e:
             return fail(e.problems)
         rev = fs.write_params(entry, params, None, version)
@@ -1039,15 +1105,18 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         version = ver_arg(lib, entry)
         body = json_body()
         base = fs.resolved(entry, version, persist=False)["params"]
+        region = str(body.get("region", "person"))
         try:
-            style = schema.resolve_style(str(body.get("style", "")))
-            params = schema.apply_style(base, str(body.get("style", "")), str(body.get("region", "person")))
-            params, _ = schema.normalize(params, strict=True)
+            parts = known_parts(lib, base)
+            schema.check_region(region, parts)
+            style, definition = schema.style_data(str(body.get("style", "")), region)
+            params = schema.apply_style(base, style, region, parts, definition)
+            params, _ = schema.normalize(params, strict=True, parts=parts)
         except schema.ValidationError as e:
             return fail(e.problems)
         rev = fs.write_params(entry, params, None, version)
         return jsonify({"name": entry.name, "version": version, "rev": rev, "style": style,
-                        "region": body.get("region", "person"), "params": params})
+                        "region": region, "params": params})
 
     @app.get("/api/styles")
     def api_styles():
@@ -1108,8 +1177,12 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         entry = lib.get(name)
         version = ver_arg(lib, entry)
         everything = request.method == "DELETE" and target == PAINT_ALL
-        if not everything and PAINT_TARGET_RE.fullmatch(target) is None:
-            abort(400, description="対象は layer-<層の id> / solid-person / solid-background / lines / all / pen のどれかです")
+        ok = PAINT_TARGET_RE.fullmatch(target) is not None
+        if ok and target.startswith("solid-") and target[6:] not in schema.REGIONS:
+            ok = target[6:] in lib.part_names()         # 部分のベタは、部分マスクの置き場にある部分だけ
+        if not everything and not ok:
+            abort(400, description="対象は layer-<層の id> / solid-person / solid-background / solid-<部分名> / "
+                                   "lines / all / pen のどれかです")
         path = lib.paint_dir(entry, version) / f"{target}.png"
         if request.method == "GET":
             if not path.is_file():

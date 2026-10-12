@@ -22,6 +22,8 @@ TONE_KEYS = ("levels", "solid", "layers")
 # 層の id（消しゴムのマスクがどの層の物かを決める名前）。短い乱数文字列で、並べ替えても変わらない。
 # 形は web/schema.json の layerId と同じ
 LAYER_ID_RE = re.compile(r"[a-z0-9]{4,16}")
+# 部分（髪・肌・服など。部分マスクのサブフォルダ名）の名前。regions.<部分名> として設定を持てる
+PART_NAME_RE = re.compile(r"[\w\-]{1,32}")
 _ID_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789"
 
 
@@ -52,6 +54,28 @@ def schema_path() -> Path:
 def load() -> dict:
     with open(schema_path(), encoding="utf-8") as f:
         return json.load(f)
+
+
+def reserved_parts() -> tuple[str, ...]:
+    return tuple(load()["parts"]["reserved"])
+
+
+def is_part_name(name: Any) -> bool:
+    """部分の名前として使えるか（1〜32 文字の英数・かな漢字・_ -。person / background / all は予約）"""
+    return isinstance(name, str) and PART_NAME_RE.fullmatch(name) is not None and name not in reserved_parts()
+
+
+def part_keys(raw: Any) -> list[str]:
+    """設定（整える前でもよい）の regions にある、部分の項目の名前"""
+    regions = raw.get("regions") if isinstance(raw, dict) else None
+    if not isinstance(regions, dict):
+        return []
+    return [k for k, v in regions.items() if k not in REGIONS and is_part_name(k) and isinstance(v, dict)]
+
+
+def region_names(raw: Any) -> list[str]:
+    """層を持つ領域の名前（人物・背景・部分）"""
+    return [*REGIONS, *part_keys(raw)]
 
 
 def _is_number(v: Any) -> bool:
@@ -143,8 +167,11 @@ def migrate(raw: Any) -> Any:
     return rest
 
 
-def normalize(raw: Any, strict: bool = False) -> tuple[dict, list[str]]:
-    """設定を整えて (params, problems) を返す。strict=True で問題があれば ValidationError"""
+def normalize(raw: Any, strict: bool = False, parts: Any = None) -> tuple[dict, list[str]]:
+    """設定を整えて (params, problems) を返す。strict=True で問題があれば ValidationError。
+    parts は「知っている部分名」（部分マスクの置き場にある部分）。regions.<部分名> の項目は、
+    知っている名前か、部分の項目の形（linked を持つ）をしていれば残す（その画像に無い部分の設定も、
+    別の画像へ引き継いだときのために残す）。strict で parts を渡したときは、知っている名前だけを通す"""
     s = load()
     problems: list[str] = []
     if not isinstance(raw, dict):
@@ -177,10 +204,20 @@ def normalize(raw: Any, strict: bool = False) -> tuple[dict, list[str]]:
         problems.append("regions: オブジェクトではありません")
         regions = None
     regions = regions or {}
-    for key in regions:
-        if key not in REGIONS:
+    known = set(parts or ())
+    kept: list[str] = []
+    for key, value in regions.items():
+        if key in REGIONS:
+            continue
+        shaped = isinstance(value, dict) and "linked" in value
+        ok = is_part_name(key) and (key in known or (shaped and not (strict and parts is not None)))
+        if ok:
+            kept.append(key)
+        elif is_part_name(key) and parts is not None:
+            problems.append(f"未知のキー: regions.{key}（部分マスクのある部分: {', '.join(sorted(known)) or 'なし'}）")
+        else:
             problems.append(f"未知のキー: regions.{key}")
-    taken: set[str] = set()                        # 層の id は、人物・背景を通して重複させない
+    taken: set[str] = set()                        # 層の id は、人物・背景・部分を通して重複させない
     person = _norm_fields(regions.get("person"), {}, "regions.person", problems, TONE_KEYS)
     _norm_region_tone(regions["person"] if isinstance(regions.get("person"), dict) else {},
                       person, "regions.person", problems, taken)
@@ -189,6 +226,12 @@ def normalize(raw: Any, strict: bool = False) -> tuple[dict, list[str]]:
     _norm_region_tone(regions["background"] if isinstance(regions.get("background"), dict) else {},
                       background, "regions.background", problems, taken)
     params["regions"] = {"person": person, "background": background}
+    for key in kept:
+        # 部分: linked が true の間は人物と同じ設定で描く（false で、この項目の levels / solid / layers が有効）
+        src = regions[key] if isinstance(regions[key], dict) else {}
+        part = _norm_fields(regions[key], s["part"], f"regions.{key}", problems, TONE_KEYS)
+        _norm_region_tone(src, part, f"regions.{key}", problems, taken)
+        params["regions"][key] = part
 
     params["watermark"] = _norm_fields(raw.get("watermark"), sections["watermark"], "watermark", problems)
     params["output"] = _norm_fields(raw.get("output"), sections["output"], "output", problems)
@@ -202,9 +245,9 @@ def default_params() -> dict:
 
 
 def _layer_lists(raw: Any):
-    """設定（整える前でもよい）の中の、層の並び（人物・背景）を順に返す"""
+    """設定（整える前でもよい）の中の、層の並び（人物・背景・部分）を順に返す"""
     regions = raw.get("regions") if isinstance(raw, dict) else None
-    for name in REGIONS:
+    for name in region_names(raw):
         region = regions.get(name) if isinstance(regions, dict) else None
         layers = region.get("layers") if isinstance(region, dict) else None
         if isinstance(layers, list):
@@ -212,7 +255,7 @@ def _layer_lists(raw: Any):
 
 
 def layer_ids(raw: Any) -> set[str]:
-    """設定に含まれる層の id（人物・背景の両方）"""
+    """設定に含まれる層の id（人物・背景・部分のすべて）"""
     return {layer["id"] for _, layers in _layer_lists(raw) for layer in layers
             if isinstance(layer, dict) and isinstance(layer.get("id"), str) and layer["id"]}
 
@@ -220,7 +263,7 @@ def layer_ids(raw: Any) -> set[str]:
 def lacks_layer_ids(raw: Any) -> bool:
     """id の無い層（層の id が入る前に保存された設定）があるか。層の並びが無い設定も「無い」に数える"""
     lists = list(_layer_lists(migrate(raw) if isinstance(raw, dict) else raw))
-    if len(lists) < len(REGIONS):
+    if len([name for name, _ in lists if name in REGIONS]) < len(REGIONS):
         return True
     return any(not (isinstance(layer, dict) and layer.get("id")) for _, layers in lists for layer in layers)
 
@@ -256,6 +299,42 @@ def merge_patch(target: Any, patch: Any) -> Any:
     return out
 
 
+def new_part(params: dict, linked: bool = True) -> dict:
+    """部分の項目を新しく作る。人物の levels / solid / layers を写す（切り離した瞬間に見た目が変わらないように）。
+    層には新しい id を振る"""
+    person = params["regions"]["person"]
+    taken = layer_ids(params)
+    layers = []
+    for layer in person.get("layers", []):
+        made = {**layer, "id": new_layer_id(taken)}
+        taken.add(made["id"])
+        layers.append(made)
+    return {"linked": linked, "levels": copy.deepcopy(person.get("levels", {})),
+            "solid": copy.deepcopy(person.get("solid", {})), "layers": layers}
+
+
+def seed_parts(raw: Any, base: dict) -> Any:
+    """変更（JSON Merge Patch など）で新しく現れた部分の項目に、書かれていない levels / solid / layers を
+    人物の設定から補う（既定値ではなく「いまの人物と同じ」から始まるように）"""
+    if not isinstance(raw, dict) or not isinstance(raw.get("regions"), dict):
+        return raw
+    before = set(part_keys(base))
+    fresh = [k for k in part_keys(raw) if k not in before]
+    if not fresh:
+        return raw
+    out = copy.deepcopy(raw)
+    for key in fresh:
+        seed = new_part({"regions": {**base["regions"], **{k: out["regions"][k] for k in part_keys(out)
+                                                           if k != key}}})
+        given = out["regions"][key]
+        merged = {**{k: v for k, v in seed.items() if k != "linked"}, **given}
+        for k in ("levels", "solid"):                       # 一部だけ書かれた levels / solid は、人物の値に重ねる
+            if isinstance(given.get(k), dict) and isinstance(seed.get(k), dict):
+                merged[k] = {**seed[k], **given[k]}
+        out["regions"][key] = merged
+    return out
+
+
 def set_path(params: dict, dotted: str, value: Any) -> dict:
     """ドット区切りのキー（配列は番号。例 regions.person.layers.0.angle）で1項目だけ差し替える"""
     out = copy.deepcopy(params)
@@ -277,6 +356,11 @@ def set_path(params: dict, dotted: str, value: Any) -> dict:
             if last:
                 node[key] = value
             elif key not in node:
+                if i == 1 and keys[0] == "regions" and is_part_name(key):
+                    # まだ設定の無い部分。人物の設定を写した項目を作る（検証は normalize が行う）
+                    node[key] = new_part(out)
+                    node = node[key]
+                    continue
                 raise ValidationError([f"未知のキー: {where}"])
             else:
                 node = node[key]
@@ -290,9 +374,14 @@ def _style_key(name: str) -> str:
     return "".join(ch for ch in text if not ch.isspace() and ch != "_")
 
 
-def resolve_style(name: str) -> str | None:
-    """スタイル名（キー・表示名・別名）からキーを引く"""
+def resolve_style(name: str, region: str | None = None) -> str | None:
+    """スタイル名（キー・表示名・別名）からキーを引く。
+    region が人物・部分のときは、その向きの別名（aliasesNonBackground。「白」「白抜き」→ blank）を先に見る"""
     want = _style_key(name)
+    if region is not None and region not in ("background", "both"):
+        for key, style in load()["styles"].items():
+            if any(_style_key(n) == want for n in style.get("aliasesNonBackground", [])):
+                return key
     for key, style in load()["styles"].items():
         names = [key, style["label"], *style.get("aliases", [])]
         if any(_style_key(n) == want for n in names):
@@ -300,16 +389,35 @@ def resolve_style(name: str) -> str | None:
     return None
 
 
-def apply_style(params: dict, name: str, region: str = "person") -> dict:
-    """名前付きスタイルを領域（person / background / both）に適用した新しい設定を返す"""
-    key = resolve_style(name)
+def check_region(region: Any, parts: Any = None, both: bool = True) -> str:
+    """スタイルの適用先（person / background / both / 部分名）を確かめる。
+    parts を渡したときは、部分名はその中にある物だけを通す"""
+    if region in REGIONS or (both and region == "both"):
+        return region
+    if is_part_name(region) and (parts is None or region in set(parts)):
+        return region
+    names = " / ".join(["person", "background", *(["both"] if both else []), *sorted(set(parts or ()))])
+    raise ValidationError([f"region は {names}{'' if parts is not None else ' / 部分名'} のどれかです: {region}"])
+
+
+def style_data(name: str, region: str = "person") -> tuple[str, dict]:
+    """スタイル名から (キー, 定義) を引く。無ければ ValidationError"""
+    key = resolve_style(name, region)
     if key is None:
         known = ", ".join(load()["styles"])
         raise ValidationError([f"スタイルが見つかりません: {name}（{known}）"])
-    if region not in (*REGIONS, "both"):
-        raise ValidationError([f"region は person / background / both のどれかです: {region}"])
-    s = load()
-    style = s["styles"][key]
+    return key, load()["styles"][key]
+
+
+def apply_style(params: dict, name: str, region: str = "person", parts: Any = None,
+                style: dict | None = None) -> dict:
+    """名前付きスタイルを領域（person / background / both / 部分名）に適用した新しい設定を返す。
+    部分に当てると、その部分は人物との連動（linked）が切れる。
+    parts は適用先にできる部分名（省略時は、既に設定に入っている部分だけ）。
+    style を渡すと、名前から引く代わりにその定義（solid / layers / backgroundMode / levels）を使う"""
+    check_region(region, part_keys(params) if parts is None else parts)
+    if style is None:
+        _, style = style_data(name, region)
     out = copy.deepcopy(params)
 
     taken = layer_ids(out)
@@ -318,6 +426,8 @@ def apply_style(params: dict, name: str, region: str = "person") -> dict:
         # 層は入れ替わるので、新しい id を振る（前の層の消しゴムのマスクは引き継がない）
         target["solid"] = {**target["solid"], **copy.deepcopy(style["solid"])}
         target["layers"] = _norm_layers(style["layers"], "layer", [], [], True, taken)
+        if isinstance(style.get("levels"), dict):          # 自分用スタイルは、明るさ補正を含められる
+            target["levels"] = {**target["levels"], **copy.deepcopy(style["levels"])}
 
     if region in ("person", "both"):
         fill(out["regions"]["person"])
@@ -326,13 +436,22 @@ def apply_style(params: dict, name: str, region: str = "person") -> dict:
         if bg["linked"]:
             bg["levels"] = copy.deepcopy(out["regions"]["person"]["levels"])
         bg["linked"] = False
-        bg["mode"] = style["backgroundMode"]
+        bg["mode"] = style.get("backgroundMode", "keep")
         fill(bg)
+    if region not in (*REGIONS, "both"):
+        part = out["regions"].get(region)
+        if not isinstance(part, dict):
+            part = out["regions"][region] = new_part(out)
+        elif part.get("linked", True):
+            part["levels"] = copy.deepcopy(out["regions"]["person"]["levels"])
+        part["linked"] = False
+        fill(part)
     return out
 
 
 def list_styles() -> list[dict]:
     return [{"name": key, "label": st["label"], "aliases": st.get("aliases", []),
+             "aliasesNonBackground": st.get("aliasesNonBackground", []),
              "description": st.get("description", ""), "backgroundMode": st["backgroundMode"],
-             "layers": len(st["layers"]), "solid": st["solid"]["enabled"]}
+             "layers": len(st["layers"]), "solid": st["solid"]["enabled"], "origin": "builtin"}
             for key, st in load()["styles"].items()]

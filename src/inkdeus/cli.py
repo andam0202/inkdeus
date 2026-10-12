@@ -8,6 +8,7 @@
     inkdeus manga install | status                      漫画の構成に使う漫画エディタを取得する（inkdeus manga --help）
     inkdeus assets add | list | remove <プロジェクト>   漫画の構成で使う素材ソース（画像フォルダ）を登録する
     inkdeus folders add | list | remove <プロジェクト>  プロジェクトの画像フォルダ（画像セット）を足す・外す
+    inkdeus parts set | list | unset <プロジェクト>     部分マスク（髪・肌・服など）の置き場を登録する
 """
 
 from __future__ import annotations
@@ -24,11 +25,13 @@ from . import fonts as fonts_mod
 from .assets import BUILTIN as BUILTIN_ASSETS
 from .assets import MODES as ASSET_MODES
 from .assets import Catalog, read_toml_assets
+from . import parts as parts_mod
 from .projects import (ProjectError, add_asset_source, add_folder, create_project, folder_rows, list_projects,
-                       load_project, projects_root, remove_asset_source, remove_folder)
+                       load_project, parts_summary, projects_root, remove_asset_source, remove_folder, set_parts)
 from .server import create_app, default_local_config
 
-COMMANDS = ("run", "new", "open", "projects", "ctl", "manga", "assets", "fonts", "folders")
+COMMANDS = ("run", "new", "open", "projects", "ctl", "manga", "assets", "fonts", "folders", "parts")
+PARTS_HELP = "部分マスク（髪・肌・服など）の置き場（<dir>/<部分名>/<画像と同名>.png。inkdeus の外で作った物）"
 
 
 def _server_options(p: argparse.ArgumentParser) -> None:
@@ -48,7 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("input", help="画像ファイル、または画像の入ったフォルダ")
     p.add_argument("--mask-dir", help="人物マスクのフォルダ（<画像と同名>.png、白=人物）")
     p.add_argument("--out-dir", help="書き出しと設定JSONの保存先（既定: <入力フォルダ>/inkdeus_out）")
-    p.add_argument("--add", action="append", default=[], metavar="<名前>=<画像dir>[,<マスクdir>]",
+    p.add_argument("--parts-dir", help=PARTS_HELP)
+    p.add_argument("--add", action="append", default=[], metavar="<名前>=<画像dir>[,<マスクdir>[,<部分マスクdir>]]",
                    help="追加の画像フォルダ（複数可）。保存先は <出力先>/@<名前>/")
     _server_options(p)
 
@@ -56,6 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", help="プロジェクト名（プロジェクト置き場の下のフォルダ名になる）")
     p.add_argument("--images", required=True, help="元画像のフォルダ")
     p.add_argument("--masks", help="人物マスクのフォルダ（<画像と同名>.png、白=人物）")
+    p.add_argument("--parts", help=PARTS_HELP + "。参照するだけで、--copy でもコピーしない")
     p.add_argument("--copy", action="store_true", help="画像とマスクをプロジェクト内にコピーする")
     p.add_argument("--note", default="", help="メモ")
     p.add_argument("--force", action="store_true", help="既にあるプロジェクトの設定を更新する")
@@ -89,6 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--name", required=True, help="フォルダ名（英数字・かな漢字・_ - で 32 文字まで。default は使えない）")
     a.add_argument("--images", required=True, help="元画像のフォルダ")
     a.add_argument("--masks", help="人物マスクのフォルダ")
+    a.add_argument("--parts", help=PARTS_HELP)
     a.add_argument("--note", default="", help="メモ")
     a = dsub.add_parser("list", help="画像フォルダの一覧と枚数")
     a.add_argument("project")
@@ -97,6 +103,20 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("project")
     a.add_argument("--name", required=True)
     a.add_argument("--delete-out", action="store_true", help="<out>/@<名前>/（設定と書き出した PNG）も消す")
+
+    p = sub.add_parser("parts", help="部分マスク（髪・肌・服など）の置き場を、プロジェクトの画像フォルダに登録する")
+    psub = p.add_subparsers(dest="parts_command", required=True, metavar="<set|list|unset>")
+    a = psub.add_parser("set", help="部分マスクの置き場を登録する（稼働中のサーバにも、画面を読み込み直すと反映される）")
+    a.add_argument("project", help="プロジェクト名、またはプロジェクトのフォルダ")
+    a.add_argument("--folder", help="画像フォルダ名（省略時は既定のフォルダ）")
+    a.add_argument("--path", required=True, help=PARTS_HELP)
+    a = psub.add_parser("list", help="部分名と、画像ごとのマスクの有無の集計")
+    a.add_argument("project")
+    a.add_argument("--folder", help="画像フォルダ名（省略時は既定のフォルダ）")
+    a.add_argument("--json", action="store_true")
+    a = psub.add_parser("unset", help="部分マスクの置き場の登録を外す（置き場の中身には触らない）")
+    a.add_argument("project")
+    a.add_argument("--folder", help="画像フォルダ名（省略時は既定のフォルダ）")
 
     p = sub.add_parser("fonts", help="漫画の構成で使うローカルフォント（設定の [fonts]）を確かめる")
     fsub = p.add_subparsers(dest="fonts_command", required=True, metavar="<command>")
@@ -119,6 +139,11 @@ def serve(app, host: str, port: int, project=None) -> int:
     print(f"  出力: {lib.out_dir}")
     if lib.mask_dir:
         print(f"  マスク: {lib.mask_dir}")
+    if lib.parts_dir:
+        names, warnings = lib.parts()
+        print(f"  部分マスク: {lib.parts_dir}（{', '.join(names) or '部分なし'}）")
+        for msg in warnings:
+            print(f"    注意: {msg}")
     for name, flib in extra:
         print(f"  フォルダ「{name}」: " + ("参照先が見つかりません" if flib is None
                                          else f"{flib.folder}（{len(flib.entries())} 枚）→ {flib.out_dir}"))
@@ -148,7 +173,8 @@ def cmd_run(args) -> int:
                 raise FileNotFoundError(f"画像フォルダが見つかりません: {d.images}")
             seen.add(d.name)
             extra.append(d)
-        app = create_app(Path(args.input), args.mask_dir, args.out_dir, folders=extra)
+        parts_dir = parts_mod.check_dir(args.parts_dir) if args.parts_dir else None
+        app = create_app(Path(args.input), args.mask_dir, args.out_dir, folders=extra, parts_dir=parts_dir)
     except (FileNotFoundError, ValueError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
@@ -157,12 +183,14 @@ def cmd_run(args) -> int:
 
 def cmd_new(args) -> int:
     project, summary = create_project(args.name, args.images, args.masks, copy=args.copy,
-                                      note=args.note, force=args.force)
+                                      note=args.note, force=args.force, parts=args.parts)
     print(f"プロジェクトを作りました: {project.name}")
     print(f"  場所: {project.path}")
     print(f"  元画像: {project.source}（{summary['images']} 枚{'・コピー済み' if args.copy else '・参照'}）")
     if project.masks is not None:
         print(f"  マスク: {project.masks}（同名マスクあり {summary['masks']} / {summary['images']} 枚）")
+    if project.parts is not None:
+        _print_parts(parts_summary(project))
     print(f"  出力: {project.out}")
     print(f"開くには: inkdeus open {project.name}")
     return 0
@@ -171,7 +199,8 @@ def cmd_new(args) -> int:
 def cmd_open(args) -> int:
     project = load_project(args.project)
     try:
-        app = create_app(project.source, project.masks, project.out, project=project.info())
+        app = create_app(project.source, project.masks, project.out, project=project.info(),
+                         parts_dir=project.parts)
     except (FileNotFoundError, ValueError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
@@ -250,9 +279,10 @@ def cmd_assets(args) -> int:
 def cmd_folders(args) -> int:
     project = load_project(args.project, check=False)
     if args.folders_command == "add":
-        entry = add_folder(project, args.name, args.images, args.masks, args.note)
+        entry = add_folder(project, args.name, args.images, args.masks, args.note, args.parts)
         print(f"画像フォルダを足しました: {entry['name']}（{project.name}）")
-        print(f"  元画像: {entry['images']}" + (f" / マスク: {entry['masks']}" if "masks" in entry else ""))
+        print(f"  元画像: {entry['images']}" + (f" / マスク: {entry['masks']}" if "masks" in entry else "")
+              + (f" / 部分マスク: {entry['parts']}" if "parts" in entry else ""))
         print(f"  保存先: {folders_mod.out_dir(project.out, entry['name'])}")
         return 0
     if args.folders_command == "remove":
@@ -272,6 +302,40 @@ def cmd_folders(args) -> int:
         print(f"  {label}: " + ("フォルダが見つかりません" if r["missing"] else
                                f"画像 {r['images']} / マスク {r['masks']} / 設定済み {r['configured']} / "
                                f"書き出し済み {r['exported']}") + f"  {r['images_dir']}")
+    return 0
+
+
+def _print_parts(info: dict) -> None:
+    if not info["dir"]:
+        print("  部分マスク: 登録されていません（inkdeus parts set <プロジェクト> --path <dir>）")
+        return
+    print(f"  部分マスク: {info['dir']}")
+    if not info["parts"]:
+        print("    部分がありません（置き場の直下に <部分名>/ のフォルダを作り、<画像と同じ名前>.png を入れます）")
+    for row in info["parts"]:
+        print(f"    {row['name']}: マスクあり {row['masks']} / {info['images']} 枚")
+    for msg in info["warnings"]:
+        print(f"    注意: {msg}")
+
+
+def cmd_parts(args) -> int:
+    project = load_project(args.project, check=False)
+    if args.parts_command == "set":
+        folder = set_parts(project, args.path, args.folder)
+        print(f"部分マスクの置き場を登録しました（{project.name} / {args.folder or '既定のフォルダ'}）: {folder}")
+        _print_parts(parts_summary(load_project(str(project.path), check=False), args.folder))
+        return 0
+    if args.parts_command == "unset":
+        parts_summary(project, args.folder)                 # フォルダ名の確認を兼ねる
+        set_parts(project, None, args.folder)
+        print(f"部分マスクの置き場の登録を外しました（{project.name} / {args.folder or '既定のフォルダ'}）")
+        return 0
+    info = parts_summary(project, args.folder)
+    if args.json:
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+        return 0
+    print(f"部分マスク（{project.name} / {'既定のフォルダ' if info['folder'] == folders_mod.DEFAULT else info['folder']}）:")
+    _print_parts(info)
     return 0
 
 
@@ -305,8 +369,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return {"run": cmd_run, "new": cmd_new, "open": cmd_open, "projects": cmd_projects,
-                "assets": cmd_assets, "fonts": cmd_fonts, "folders": cmd_folders}[args.command](args)
-    except ProjectError as e:
+                "assets": cmd_assets, "fonts": cmd_fonts, "folders": cmd_folders,
+                "parts": cmd_parts}[args.command](args)
+    except (ProjectError, parts_mod.PartsError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
 

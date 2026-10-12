@@ -17,6 +17,7 @@ from .assets import MODES as ASSET_MODES
 from .assets import AssetError
 from .assets import validate_name as validate_asset_name
 from . import folders as folders_mod
+from . import parts as parts_mod
 from .server import PARAMS_SUFFIX, is_image, read_local_config
 
 PROJECT_FILE = "inkdeus.project.toml"
@@ -37,6 +38,7 @@ class Project:
     created: str
     note: str
     folders: tuple = ()          # 追加の画像フォルダ（folders.FolderDef）。既定のフォルダは source / masks
+    parts: Path | None = None    # 既定のフォルダの、部分マスク（髪・肌・服など）の置き場
 
     @property
     def config(self) -> Path:
@@ -75,7 +77,7 @@ def _toml_string(value: str) -> str:
 
 def _write_config(path: Path, name: str, created: str, source: Path | str, masks: Path | str | None,
                   out: str, note: str, assets: list[dict] | None = None, fonts: dict | None = None,
-                  folders: list[dict] | None = None) -> None:
+                  folders: list[dict] | None = None, parts: Path | str | None = None) -> None:
     lines = [
         f"name = {_toml_string(name)}",
         f"created = {_toml_string(created)}",
@@ -83,6 +85,8 @@ def _write_config(path: Path, name: str, created: str, source: Path | str, masks
     ]
     if masks is not None:
         lines.append(f"masks = {_toml_string(str(masks))}")
+    if parts is not None:                                  # 既定のフォルダの部分マスクの置き場
+        lines.append(f"parts = {_toml_string(str(parts))}")
     lines.append(f"out = {_toml_string(out)}")
     if note:
         lines.append(f"note = {_toml_string(note)}")
@@ -96,7 +100,7 @@ def _write_config(path: Path, name: str, created: str, source: Path | str, masks
             lines += [f"{_toml_string(str(k))} = {_toml_string(str(v))}" for k, v in fonts["names"].items()]
     for entry in folders or []:                            # 追加の画像フォルダ（書かれている値のまま残す）
         lines += ["", "[[folders]]"]
-        for key in ("name", "images", "masks", "note"):
+        for key in ("name", "images", "masks", "parts", "note"):
             if isinstance(entry.get(key), str) and (entry[key] or key in ("name", "images")):
                 lines.append(f"{key} = {_toml_string(entry[key])}")
     for entry in assets or []:                             # 漫画の構成で使う追加の素材ソース
@@ -119,9 +123,20 @@ def _copy_images(src: Path, dst: Path, only_png_masks: bool = False) -> None:
         shutil.copy2(p, dst / p.name)
 
 
+def _parts_dir(path: Path | str | None) -> Path | None:
+    if not path:
+        return None
+    try:
+        return parts_mod.check_dir(path)
+    except parts_mod.PartsError as e:
+        raise ProjectError(str(e)) from e
+
+
 def create_project(name: str, images: Path | str, masks: Path | str | None = None, copy: bool = False,
-                   note: str = "", force: bool = False, root: Path | None = None) -> tuple[Project, dict]:
-    """プロジェクトを作る。戻り値は (Project, 枚数などの要約)"""
+                   note: str = "", force: bool = False, root: Path | None = None,
+                   parts: Path | str | None = None) -> tuple[Project, dict]:
+    """プロジェクトを作る。戻り値は (Project, 枚数などの要約)。
+    parts は部分マスクの置き場（参照するだけ。--copy でもコピーしない）"""
     validate_name(name)
     root = projects_root() if root is None else Path(root)
     images = Path(images).expanduser().resolve()
@@ -135,6 +150,7 @@ def create_project(name: str, images: Path | str, masks: Path | str | None = Non
         masks_dir = Path(masks).expanduser().resolve()
         if not masks_dir.is_dir():
             raise ProjectError(f"マスクフォルダが見つかりません: {masks_dir}")
+    parts_ref: Path | str | None = _parts_dir(parts)
 
     path = root / name
     config = path / PROJECT_FILE
@@ -152,6 +168,8 @@ def create_project(name: str, images: Path | str, masks: Path | str | None = Non
             assets = _raw_assets(old)                                      # 追加の素材ソースも引き継ぐ
             extra = _raw_folders(old)                                      # 追加の画像フォルダも引き継ぐ
             fonts = old.get("fonts") if isinstance(old.get("fonts"), dict) else None
+            if parts_ref is None and isinstance(old.get("parts"), str) and old["parts"]:
+                parts_ref = old["parts"]                                   # 部分マスクの置き場も引き継ぐ
         except (OSError, tomllib.TOMLDecodeError):
             pass
     path.mkdir(parents=True, exist_ok=True)
@@ -165,7 +183,7 @@ def create_project(name: str, images: Path | str, masks: Path | str | None = Non
             _copy_images(masks_dir, path / "masks", only_png_masks=True)
             mask_ref = Path("masks")
     (path / "out").mkdir(exist_ok=True)
-    _write_config(config, name, created, source, mask_ref, "out", note, assets, fonts, extra)
+    _write_config(config, name, created, source, mask_ref, "out", note, assets, fonts, extra, parts_ref)
 
     with_mask = sum(1 for p in files if masks_dir is not None and (masks_dir / f"{p.stem}.png").is_file())
     summary = {"name": name, "path": str(path), "images": len(files),
@@ -191,17 +209,24 @@ def _raw_folders(data: dict) -> list[dict]:
     return [dict(e) for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
 
 
-def _rewrite_assets(project: Project, data: dict, assets: list[dict], folders: list[dict] | None = None) -> None:
-    """設定ファイルを、素材ソース（と画像フォルダ）だけ差し替えて書き直す（他の項目は書かれている値のまま）"""
+_KEEP = object()
+
+
+def _rewrite_assets(project: Project, data: dict, assets: list[dict], folders: list[dict] | None = None,
+                    parts=_KEEP) -> None:
+    """設定ファイルを、素材ソース（と画像フォルダ・部分マスクの置き場）だけ差し替えて書き直す
+    （他の項目は書かれている値のまま）"""
+    if parts is _KEEP:
+        parts = data.get("parts") if isinstance(data.get("parts"), str) and data["parts"] else None
     _write_config(project.config, str(data.get("name") or project.name), str(data.get("created", "")),
                   data["source"], data.get("masks") if isinstance(data.get("masks"), str) else None,
                   str(data.get("out") or "out"), str(data.get("note", "")), assets,
                   data.get("fonts") if isinstance(data.get("fonts"), dict) else None,
-                  _raw_folders(data) if folders is None else folders)
+                  _raw_folders(data) if folders is None else folders, parts)
 
 
 def add_folder(project: Project, name: str, images: Path | str, masks: Path | str | None = None,
-               note: str = "") -> dict:
+               note: str = "", parts: Path | str | None = None) -> dict:
     """プロジェクトに画像フォルダを足す（同じ名前があればエラー）"""
     try:
         folders_mod.validate_name(name)
@@ -224,10 +249,52 @@ def add_folder(project: Project, name: str, images: Path | str, masks: Path | st
     entry = {"name": name, "images": str(images_dir)}
     if masks_dir is not None:
         entry["masks"] = str(masks_dir)
+    parts_dir = _parts_dir(parts)
+    if parts_dir is not None:
+        entry["parts"] = str(parts_dir)
     if note:
         entry["note"] = note
     _rewrite_assets(project, data, _raw_assets(data), existing + [entry])
     return entry
+
+
+def set_parts(project: Project, path: Path | str | None, folder: str | None = None) -> Path | None:
+    """画像フォルダ（省略・"default" = 既定のフォルダ）の部分マスクの置き場を登録する。path が None なら登録を外す。
+    戻り値は登録した置き場（外したときは None）"""
+    parts_dir = _parts_dir(path)
+    data = _read_raw(project)
+    if folder in (None, "", folders_mod.DEFAULT):
+        _rewrite_assets(project, data, _raw_assets(data), parts=str(parts_dir) if parts_dir else None)
+        return parts_dir
+    existing = _raw_folders(data)
+    entry = next((e for e in existing if e.get("name") == folder), None)
+    if entry is None:
+        known = ", ".join(str(e.get("name")) for e in existing) or "なし"
+        raise ProjectError(f"その名前の画像フォルダはありません: {folder}（登録済み: {known}）")
+    if parts_dir is None:
+        entry.pop("parts", None)
+    else:
+        entry["parts"] = str(parts_dir)
+    _rewrite_assets(project, data, _raw_assets(data), existing)
+    return parts_dir
+
+
+def folder_def(project: Project, folder: str | None = None) -> folders_mod.FolderDef:
+    """画像フォルダの定義（省略・"default" = 既定のフォルダ）"""
+    if folder in (None, "", folders_mod.DEFAULT):
+        return folders_mod.FolderDef(folders_mod.DEFAULT, project.source, project.masks, "", project.parts)
+    found = next((d for d in project.folders if d.name == folder), None)
+    if found is None:
+        known = ", ".join(d.name for d in project.folders) or "なし"
+        raise ProjectError(f"その名前の画像フォルダはありません: {folder}（登録済み: {known}）")
+    return found
+
+
+def parts_summary(project: Project, folder: str | None = None) -> dict:
+    """部分マスクの集計（部分名と、画像ごとのマスクの有無の数）"""
+    d = folder_def(project, folder)
+    stems = [p.stem for p in list_images(d.images)] if d.images.is_dir() else []
+    return {"project": project.name, "folder": d.name, **parts_mod.summary(d.parts, stems)}
 
 
 def remove_folder(project: Project, name: str, delete_out: bool = False) -> Path | None:
@@ -264,11 +331,13 @@ def _count(images: Path, masks: Path | None, out: Path) -> dict:
 
 def folder_rows(project: Project) -> list[dict]:
     """画像フォルダごとの枚数（既定が先頭）"""
-    defs = [folders_mod.FolderDef(folders_mod.DEFAULT, project.source, project.masks, ""), *project.folders]
+    defs = [folders_mod.FolderDef(folders_mod.DEFAULT, project.source, project.masks, "", project.parts),
+            *project.folders]
     rows = []
     for d in defs:
         out = folders_mod.out_dir(project.out, d.name)
         rows.append({"name": d.name, "images_dir": str(d.images), "masks_dir": str(d.masks) if d.masks else None,
+                     "parts_dir": str(d.parts) if d.parts else None,
                      "out": str(out), "note": d.note, **_count(d.images, d.masks, out)})
     return rows
 
@@ -339,6 +408,7 @@ def load_project(name_or_path: str, root: Path | None = None, check: bool = True
         created=str(data.get("created", "")),
         note=str(data.get("note", "")),
         folders=tuple(folders_mod.parse_entries(data.get("folders"), path)[0]),
+        parts=_resolve_dir(path, data["parts"]) if isinstance(data.get("parts"), str) and data["parts"] else None,
     )
     if check:
         if not project.source.is_dir():

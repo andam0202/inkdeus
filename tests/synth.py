@@ -38,6 +38,24 @@ def figure_mask(w: int, h: int) -> np.ndarray:
     return head | body
 
 
+def part_masks(w: int, h: int) -> dict[str, np.ndarray]:
+    """人物のシルエット（figure_mask）を 髪・肌・服 に分けた部分マスク。True=その部分。
+    互いに重ならず、どの部分にも属さない人物の領域（あご・胴の下の方）も残る"""
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    mask = figure_mask(w, h)
+    head = (xx - w * 0.5) ** 2 + (yy - h * 0.30) ** 2 <= (h * 0.14) ** 2
+    hair = mask & (yy < h * 0.24)
+    skin = head & ~hair & (yy < h * 0.40)
+    clothes = mask & ~head & (yy >= h * 0.50) & (yy < h * 0.90)
+    return {"hair": hair, "skin": skin, "clothes": clothes}
+
+
+def save_parts(root: Path, stem: str, parts: dict[str, np.ndarray]) -> None:
+    """部分マスクを <root>/<部分名>/<stem>.png に書く（8bit、255 = その部分）"""
+    for name, arr in parts.items():
+        save(root / name / f"{stem}.png", arr)
+
+
 def scene(w: int, h: int) -> tuple[np.ndarray, np.ndarray]:
     """背景（グラデーション＋矩形）の前に人物っぽいシルエットを置いたカラー画像とそのマスク"""
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)

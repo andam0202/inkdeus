@@ -100,7 +100,7 @@ def test_ids_are_filled_into_existing_files_and_saved(env):
     r = client.patch("/api/params/scene.png", data=json.dumps(
         {"regions": {"person": {"layers": [{"type": "hatch", "angle": 5}]}}})).get_json()
     assert [l["id"] for l in r["params"]["regions"]["person"]["layers"]] == ids[:1]
-    assert client.get("/api/config").get_json()["features"] == ["layerIds", "paint"]
+    assert client.get("/api/config").get_json()["features"][:2] == ["layerIds", "paint"]
 
 
 # ---- 保存 API ----

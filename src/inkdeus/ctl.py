@@ -317,7 +317,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("value", help="JSON として読める値（数値・true/false・\"文字列\"）。読めなければ文字列")
     p = with_name(add("preset", cmd_preset, "名前付きスタイルを領域に適用する（名前は別名でも可）"))
     p.add_argument("style", help="スタイル名（一覧は presets）")
-    p.add_argument("--region", choices=["person", "background", "both"], default="person")
+    p.add_argument("--region", default="person", metavar="<person|background|both|部分名>",
+                   help="適用先。部分名（hair など。部分マスクのある部分）を指すと、その部分だけ別の設定になる")
     add("presets", cmd_presets, "名前付きスタイルの一覧と説明")
     p = with_name(add("stats", cmd_stats, "描画結果の統計（黒率・濃度・ベタ・層ごとの面積率・輝度の分布）"))
     p.add_argument("--wait", action="store_true", help="いまの設定(rev)に対する統計が届くまで待つ")
