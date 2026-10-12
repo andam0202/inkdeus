@@ -210,3 +210,27 @@ html.ikb-resizing, html.ikb-resizing * { cursor: ew-resize !important; user-sele
 .ikb-pdf-progress > span, .ikb-pdf-result > span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ikb-pdf-progress > button { flex: none; }
 .ikb-pdf-result > a { flex: none; }
+
+/* ---- コマ割り ---- */
+.ikl { flex: none; border-top: 1px solid var(--ikb-line); padding-top: 6px; }
+.ikl > summary { cursor: pointer; color: var(--ikb-dim); user-select: none; }
+.ikl[open] { max-height: 46vh; overflow-y: auto; }
+/* 欄が増えて高さが足りないときは、素材の一覧を潰さずにパネル全体を縦に送れるようにする */
+.ikb.ikb-open .ikb-body { overflow-y: auto; }
+.ikb-assets { min-height: 270px; overflow: hidden; }
+.ikl-body { display: flex; flex-direction: column; gap: 6px; padding-top: 2px; }
+.ikl-presets { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 4px; }
+.ikl .ikl-preset { padding: 2px 4px; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ikl-slider { display: grid; grid-template-columns: 6.5em 1fr 3.2em; gap: 6px; align-items: center; margin: 0; }
+.ikl-slider > input { min-width: 0; width: 100%; }
+.ikl-value { text-align: right; }
+.ikl-margin-each { flex-wrap: wrap; }
+.ikl-margin-each > label, .ikl-bleed > label { display: flex; gap: 3px; align-items: center; margin: 0; }
+.ikl input[type="number"] {
+  width: 4.2em; height: 24px; padding: 1px 4px; border: 1px solid var(--ikb-line); border-radius: 4px;
+  background: #15161a; color: var(--ikb-text); font: inherit;
+}
+.ikl-cell { display: flex; flex-direction: column; gap: 6px; padding: 6px; border: 1px solid var(--ikb-accent); border-radius: 4px; }
+.ikl-follow > select { flex: 1; min-width: 0; }
+.ikl-overlay { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; }
+.ikl-overlay[hidden] { display: none; }

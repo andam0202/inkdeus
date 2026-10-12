@@ -1721,7 +1721,7 @@
   // ---- 追加の部品（同じフォルダの別ファイル。この連携スクリプトが読み込む） ----
   // 部品は window.inkdeusBridge.x（下の内部の入口）を使い、公開する関数を window.inkdeusBridge に足す
 
-  const MODULES = ['pdf.js'];
+  const MODULES = ['pdf.js', 'layout-core.js', 'layout.js'];
   function loadScript(src) {
     return new Promise((resolve, reject) => {
       const node = el('script', { src });
