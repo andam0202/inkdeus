@@ -234,3 +234,5 @@ html.ikb-resizing, html.ikb-resizing * { cursor: ew-resize !important; user-sele
 .ikl-follow > select { flex: 1; min-width: 0; }
 .ikl-overlay { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; }
 .ikl-overlay[hidden] { display: none; }
+.ikl-option { display: grid; grid-template-columns: auto 1fr; gap: 6px; align-items: center; margin: 0; }
+.ikl-option > select { min-width: 0; width: 100%; }

@@ -1,0 +1,29 @@
+diff --git a/js/sidebar/speechBubble/speech-bubble-effect.js b/js/sidebar/speechBubble/speech-bubble-effect.js
+index 3d7e9af..3c6c3af 100644
+--- a/js/sidebar/speechBubble/speech-bubble-effect.js
++++ b/js/sidebar/speechBubble/speech-bubble-effect.js
+@@ -222,6 +222,7 @@ document.head.appendChild(script);
+ });
+ }
+ 
++window.__inkdeusPatches=(window.__inkdeusPatches||[]).concat(['0002-template-to-current-page']);
+ function populateVerticalPanels(){
+ previewAreaVertical.innerHTML="";
+ MangaPanelsImage_Vertical.forEach((item)=>{
+@@ -231,6 +232,8 @@ img.classList.add("svg-preview");
+ img.alt=item.name;
+ img.addEventListener("click",async function(){
+ panelLogger.info("[verticalTemplate] stateStack.length="+stateStack.length+" btmProjectsMap.size="+btmProjectsMap.size+" canvasGUID="+getCanvasGUID()+" objectCount="+getObjectCount());
++// inkdeus: ひな形を「いまのページ」へ適用する入口。フックが true を返したら、新しいページは作らない
++if(typeof window.inkdeusTemplateHook==='function'&&await window.inkdeusTemplateHook(item,false))return;
+ const loading=OP_showLoading({
+ icon:'process',step:'Step1',substep:'New Page',progress:0
+ });
+@@ -267,6 +270,7 @@ img.classList.add("svg-preview");
+ img.alt=item.name;
+ img.addEventListener("click",async function(){
+ panelLogger.info("[landscapeTemplate] stateStack.length="+stateStack.length+" btmProjectsMap.size="+btmProjectsMap.size+" canvasGUID="+getCanvasGUID()+" objectCount="+getObjectCount());
++if(typeof window.inkdeusTemplateHook==='function'&&await window.inkdeusTemplateHook(item,true))return;
+ const loading=OP_showLoading({
+ icon:'process',step:'Step1',substep:'New Page',progress:0
+ });

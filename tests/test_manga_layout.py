@@ -920,3 +920,119 @@ def test_ctl_manga_layout(lay, env):
     assert len(wide) == 1 and wide[0]["number"] == 3                 # 左の縦長のコマは、右綴じでは最後に読む
     assert "dir" in run_ctl(lay, env, "manga", "layout", "set", '{"root": {"dir": "x", "children": [{}]}}')["error"]
     assert "JSON" in run_ctl(lay, env, "manga", "layout", "set", "{broken")["error"]
+
+
+# ---- 上流への差分（inkdeus manga install が当てる）と、その効果 ----
+
+PATCHES = ["0001-get-object-by-guid", "0002-template-to-current-page", "0003-knife-keeps-image-place"]
+
+
+def test_patches_are_reported_to_the_bridge(lay, env):
+    status = lay.evaluate("() => window.inkdeusBridge.status().patches")
+    options = L(lay, "options")
+    open_section(lay)
+    assert lay.is_hidden(".ikb-patch-notice")                       # 自分で外した（--no-patches）ときも案内は出さない
+    if env.variant == "patched":
+        assert env.patches["applied"] == PATCHES and env.patches["failed"] is None
+        assert status == {"applied": PATCHES, "pending": [], "active": PATCHES}      # サーバの記録と、実際に読み込まれた物が一致
+        assert options["patches"] == {"template": True, "knife": True}
+        assert lay.is_visible("#ikl-template-target") and lay.is_visible("#ikl-knife")
+    else:
+        assert env.patches["applied"] == [] and env.patches["disabled"] is True
+        assert status == {"applied": [], "pending": PATCHES, "active": []}
+        assert options["patches"] == {"template": False, "knife": False}
+        assert lay.is_hidden("#ikl-template-target") and lay.is_hidden("#ikl-knife")     # 差分が無ければ、設定も出さない
+    assert options["templateTarget"] == "new" and options["knifeRefit"] is False
+
+
+def test_patch_get_object_by_guid_compares_with_its_argument(lay, env):
+    made = grid(lay, "1,1")
+    first = place(lay, made["cells"][0]["guid"])
+    second = place(lay, made["cells"][1]["guid"])
+    found = lay.evaluate("([a, b]) => [getObjectByGUID(a), getObjectByGUID(b)].map(o => (o ? o.guid : null))",
+                         [first["guid"], second["guid"]])
+    if env.variant == "patched":
+        assert found == [first["guid"], second["guid"]]
+    else:
+        # 差分なしでは、引数ではなく最後に setGUID() が書いた値と比べるので、どちらを引いても最後の画像が返る
+        assert found == [second["guid"], second["guid"]]
+
+
+def test_patch_template_can_replace_the_panels_of_the_current_page(lay, env):
+    made = grid(lay, "1,1,1")
+    image = place(lay, made["cells"][0]["guid"])
+    page_guid = lay.evaluate("() => getCanvasGUID()")
+    pages = lay.evaluate("() => btmGetGuidsSize()")
+    lay.wait_for_function("() => document.querySelectorAll('#svg-preview-area-vertical img.svg-preview').length > 5")
+    names = lay.evaluate("() => MangaPanelsImage_Vertical.map(t => t.name)")
+    click = "(i) => document.querySelectorAll('#svg-preview-area-vertical img.svg-preview')[i].click()"
+    if env.variant == "plain":
+        with pytest.raises(Exception, match="."):
+            lay.select_option("#ikl-template-target", "current", timeout=500)        # 設定が出ていない
+        L(lay, "setTemplateTarget", "current")                      # 設定だけ変えても、差分が無ければ上流の既定のまま
+        lay.evaluate(click, 5)
+        lay.wait_for_function("(g) => !isProjectBusy() && getCanvasGUID() !== g && window.inkdeusBridge.panels().length >= 1", arg=page_guid)
+        # 新しいページになっている（元のページはページ一覧に残り、新しいページに画像は無い）
+        assert page_guid in lay.evaluate("() => btmGetGuids()") and images_on_canvas(lay) == []
+        L(lay, "setTemplateTarget", "new")
+        return
+    open_section(lay)
+    lay.select_option("#ikl-template-target", "current")
+    lay.evaluate(click, 5)                                          # 行と列に分けられる、コマ 2 つのひな形
+    lay.wait_for_selector(".confirm-dialog")                        # いまのコマを置き換える前に確かめる
+    lay.click(".confirm-dialog-ok")
+    lay.wait_for_function("() => canvas.getObjects().filter(o => o.isPanel).length === 2")
+    assert lay.evaluate("() => [getCanvasGUID(), btmGetGuidsSize()]") == [page_guid, pages]      # 新しいページは作られない
+    got = info(lay)
+    assert len(got["cells"]) == 2 and got["unmanaged"] == 0 and matches_layout(lay)             # レイアウトとして入る
+    assert picture(lay, image["guid"])["panel"] == got["cells"][0]["guid"]                      # 画像は読む順に引き継ぐ
+    undo(lay)
+    assert len(panels(lay)) == 3 and picture(lay, image["guid"])["panel"] == made["cells"][0]["guid"]
+    # 斜めのコマを含むひな形は、形のまま置く（レイアウトには入らない）
+    slanted = next(i for i, n in enumerate(names) if i > 0 and lay.evaluate(
+        "async (i) => { const r = await window.inkdeusBridge.layout.applyTemplate(MangaPanelsImage_Vertical[i].svg, {force: true});"
+        " undo(); return !r.layout; }", i))
+    lay.wait_for_function("() => !isHistoryRestoreInProgress() && canvas.getObjects().filter(o => o.isPanel).length === 3")
+    result = lay.evaluate("(i) => window.inkdeusBridge.layout.applyTemplate(MangaPanelsImage_Vertical[i].svg, {force: true})", slanted)
+    assert result["layout"] is None and result["unmanaged"] == len(panels(lay)) >= 2
+    assert picture(lay, image["guid"])["panel"] in [p["guid"] for p in panels(lay)]
+    assert lay.evaluate("() => getCanvasGUID()") == page_guid
+    # 既定（新しいページを作る）に戻すと、上流の元の動き
+    lay.select_option("#ikl-template-target", "new")
+    lay.evaluate(click, 5)
+    lay.wait_for_function("(g) => !isProjectBusy() && getCanvasGUID() !== g && window.inkdeusBridge.panels().length === 2", arg=page_guid)
+    assert page_guid in lay.evaluate("() => btmGetGuids()") and info(lay)["layout"] is None and images_on_canvas(lay) == []
+
+
+def test_patch_knife_keeps_the_image_where_it_is(lay, env):
+    made = grid(lay, "1")
+    panel_guid = made["cells"][0]["guid"]
+    image = place(lay, panel_guid)
+    # 絵を下へずらしておく（中心がコマの下半分にある）
+    lay.evaluate("""(g) => { const o = canvas.getObjects().find(x => x.guid === g); o.top += canvas.getHeight() * 0.15;
+        o.setCoords(); saveInitialState(o); flushHistory(); }""", image["guid"])
+    before = picture(lay, image["guid"])
+    cut = """(g) => { document.getElementById('tiltRandom').value = 0; document.getElementById('cutChangeRate').value = 0;
+        const ok = blindSplitPanel(canvas.getObjects().find(o => o.guid === g), false); canvas.requestRenderAll();
+        saveStateByManual(); flushHistory(); return ok; }"""
+    assert lay.evaluate(cut, panel_guid) is True                    # 上流のナイフ（横に切る）
+    lay.wait_for_function("() => canvas.getObjects().filter(o => o.isPanel).length === 2")
+    after = picture(lay, image["guid"])
+    same = near((after["left"], after["top"], after["scaleX"]), (before["left"], before["top"], before["scaleX"]), tol=1e-6)
+    lower = max(panels(lay), key=lambda p: min(q[1] for q in p["pts"]))
+    if env.variant == "plain":
+        assert not same                                             # 上流の元の挙動: 大きいほうのコマの中央に入れ直す
+        return
+    assert same and after["panel"] == lower["guid"]                 # 位置と大きさを保ち、中心のある側（下）のコマに入る
+    assert after["clip"][1] >= min(q[1] for q in lower["pts"]) - 0.5
+    # 設定で元の挙動にも戻せる
+    undo(lay)
+    lay.wait_for_function("() => canvas.getObjects().filter(o => o.isPanel).length === 1")
+    open_section(lay)
+    lay.select_option("#ikl-knife", "refit")
+    assert lay.evaluate("() => window.inkdeusKnifeRefit") is True
+    assert lay.evaluate(cut, lay.evaluate("() => canvas.getObjects().find(o => o.isPanel).guid")) is True
+    refit = picture(lay, image["guid"])
+    assert not near((refit["left"], refit["top"], refit["scaleX"]), (before["left"], before["top"], before["scaleX"]), tol=1e-6)
+    lay.select_option("#ikl-knife", "keep")
+    assert lay.evaluate("() => window.inkdeusKnifeRefit") is False

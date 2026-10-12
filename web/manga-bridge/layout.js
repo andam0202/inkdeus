@@ -424,6 +424,91 @@
     return Object.assign(info(), { imported: rects.length, skipped });
   }
 
+  // ---- 上流への差分（inkdeus manga install が当てる）と組になる機能。差分が当たっていなければ使えない ----
+
+  const PATCH = { template: '0002-template-to-current-page', knife: '0003-knife-keeps-image-place' };
+  function patched(name) { return (window.__inkdeusPatches || []).indexOf(name) !== -1; }
+
+  // ひな形（SVG）の中のコマの形を、ページの画素の頂点にして返す
+  function templateShapes(svg) {
+    return new Promise((resolve, reject) => {
+      fabric.loadSVGFromString(svg, (objects, options) => {
+        const { W, H } = size();
+        const sw = options && options.width;
+        const sh = options && options.height;
+        if (!objects || !objects.length || !sw || !sh) { reject(new Error('ひな形を読めません')); return; }
+        resolve(objects.map((obj) => {
+          let pts;
+          if (obj.type === 'polygon' && obj.points && obj.points.length >= 3) {
+            pts = getAbsolutePolygonPoints(obj).map((q) => [q.x, q.y]);
+          } else {
+            const r = obj.getBoundingRect(true, true);
+            pts = [[r.left, r.top], [r.left + r.width, r.top], [r.left + r.width, r.top + r.height], [r.left, r.top + r.height]];
+          }
+          return pts.map((q) => [q[0] / sw * W, q[1] / sh * H]);
+        }));
+      });
+    });
+  }
+
+  // ひな形を、新しいページを作らずに、いまのページのコマと置き換える（中の画像は読む順に引き継ぐ）。
+  // 行と列に分けられる長方形のひな形はレイアウトとして取り込み、そうでない物は形のまま置く
+  async function applyTemplate(svg, opts) {
+    const o = opts || {};
+    const shapes = await templateShapes(svg);
+    const { W, H } = size();
+    const tol = Math.min(W, H) * 0.015;
+    const rects = shapes.map((pts, i) => {
+      const box = core.bbox(pts);
+      const corners = [[box.l, box.t], [box.r, box.t], [box.r, box.b], [box.l, box.b]];
+      const ok = pts.length === 4 && corners.every((c) => pts.some((q) => Math.abs(q[0] - c[0]) <= tol && Math.abs(q[1] - c[1]) <= tol));
+      return ok ? Object.assign({ guid: 't' + i }, box) : null;
+    });
+    const old = current();
+    const inferred = rects.every(Boolean) ? core.infer(rects, W, H, { rtl: !old || old.rtl !== false }) : null;
+    if (inferred) {
+      let L = inferred;
+      core.leaves(inferred).forEach((leaf) => { L = core.assign(L, leaf.id, null); });
+      return rebuild(L, o);
+    }
+    await waitIdle();
+    const existing = allPanels();
+    if (existing.length && !o.force && !(await confirmReplace(existing.length))) return null;
+    transact(() => {
+      const groups = orderedPanels().map((p) => childrenOf(p));
+      const objects = canvas.getObjects();
+      const baseIndex = existing.length ? Math.min.apply(null, existing.map((p) => objects.indexOf(p))) : 0;
+      existing.forEach((p) => { childrenOf(p).forEach((child) => releasePanelLink(child)); canvas.remove(p); });
+      const names = collectUsedObjectNames();
+      const made = shapes.map((pts, i) => createPanel(pts, baseIndex + i, names));
+      // 読む順（上から、右から）に並べて、画像を引き継ぐ
+      const sorted = made.map((p, i) => ({ p, box: core.bbox(shapes[i]) }))
+        .sort((a, b) => (Math.abs(a.box.t - b.box.t) > H * 0.05 ? a.box.t - b.box.t : b.box.l - a.box.l));
+      groups.forEach((group, i) => {
+        const target = sorted[Math.min(i, sorted.length - 1)];
+        group.forEach((child) => { attach(child, target.p); cover(child, target.box); reclip(child, target.p); });
+      });
+      return { layout: null };
+    });
+    return info();
+  }
+
+  function setTemplateTarget(target) {
+    if (target !== 'new' && target !== 'current') throw new Error('new / current のどちらかです');
+    st.templateTarget = target;
+    store.set('templateTarget', target);
+    if (view.template) view.template.value = target;
+    return target;
+  }
+  // true = 上流の元の挙動（大きいほうのコマの中央に入れ直す）、false = 位置と大きさを保つ
+  function setKnifeRefit(on) {
+    st.knifeRefit = !!on;
+    window.inkdeusKnifeRefit = st.knifeRefit;
+    store.set('knifeRefit', st.knifeRefit);
+    if (view.knife) view.knife.value = st.knifeRefit ? 'refit' : 'keep';
+    return st.knifeRefit;
+  }
+
   function clearLayout() {
     transact(() => { allPanels().forEach((panel) => { delete panel[CELL_KEY]; }); return { layout: null }; });
     return info();
@@ -814,6 +899,19 @@
     v.importBtn = el('button', { type: 'button', id: 'ikl-import', text: 'いまのコマを取り込む',
       title: 'ひな形やナイフで作った長方形のコマから、行と列の構成を推定して取り込む', onclick: () => run(() => importPanels()) });
     v.info = el('div', { class: 'ikb-dim ikl-info' });
+    // 上流への差分と組になる設定（差分が当たっているときだけ出す）
+    v.template = el('select', { id: 'ikl-template-target', 'aria-label': '漫画エディタのコマのひな形の適用先',
+      onchange: () => run(() => setTemplateTarget(v.template.value)) },
+    [el('option', { value: 'new', text: '新しいページを作る' }), el('option', { value: 'current', text: 'いまのページのコマを置き換える' })]);
+    v.template.value = st.templateTarget;
+    v.templateRow = el('label', { class: 'ikl-option', hidden: !patched(PATCH.template),
+      title: '漫画エディタのサイドバーにあるコマのひな形を押したときの動き' }, [el('span', { class: 'ikb-dim', text: 'ひな形を押したら:' }), v.template]);
+    v.knife = el('select', { id: 'ikl-knife', 'aria-label': 'ナイフで切ったときの中の画像',
+      onchange: () => run(() => setKnifeRefit(v.knife.value === 'refit')) },
+    [el('option', { value: 'keep', text: '位置と大きさを保つ' }), el('option', { value: 'refit', text: '中央に入れ直す（元の挙動）' })]);
+    v.knife.value = st.knifeRefit ? 'refit' : 'keep';
+    v.knifeRow = el('label', { class: 'ikl-option', hidden: !patched(PATCH.knife),
+      title: '漫画エディタのナイフでコマを切ったときの、中の画像の扱い' }, [el('span', { class: 'ikb-dim', text: 'ナイフで切ったら:' }), v.knife]);
     v.section = el('details', { class: 'ikb-section ikl', id: 'ikl' }, [
       el('summary', { text: 'コマ割り' }),
       el('div', { class: 'ikl-body' }, [
@@ -823,6 +921,7 @@
         v.cell,
         v.gv.row, v.gh.row, v.mv.row, v.mh.row, v.marginEach,
         el('label', { class: 'ikb-row ikl-follow' }, [el('span', { class: 'ikb-dim', text: '中の画像:' }), v.follow]),
+        v.templateRow, v.knifeRow,
         v.info,
       ]),
     ]);
@@ -964,6 +1063,15 @@
     return;
   }
 
+  st.templateTarget = store.get('templateTarget', 'new') === 'current' ? 'current' : 'new';
+  st.knifeRefit = store.get('knifeRefit', false) === true;
+  window.inkdeusKnifeRefit = st.knifeRefit;
+  // ひな形の差分（0002）が呼ぶ入口: true を返すと、漫画エディタは新しいページを作らない
+  window.inkdeusTemplateHook = async (item) => {
+    if (st.templateTarget !== 'current' || !item || !item.svg) return false;
+    await run(() => applyTemplate(item.svg));
+    return true;
+  };
   hook();
   buildPanel();
   render();
@@ -976,6 +1084,9 @@
     gutter: setGutter, margin: setMargin, bleed: setBleed, rtl: setRtl,
     moveBoundary, tilt: setTilt, resetTilt, free: setFree, unfree: clearFree,
     split, merge, remove,
+    applyTemplate, setTemplateTarget, setKnifeRefit,
+    options: () => ({ templateTarget: st.templateTarget, knifeRefit: st.knifeRefit,
+      patches: { template: patched(PATCH.template), knife: patched(PATCH.knife) } }),
     enter, exit, isActive: () => st.mode,
     select(refs) { st.sel = (Array.isArray(refs) ? refs : [refs]).filter((r) => r != null).map(cellId).slice(0, 2); render(); return st.sel.slice(); },
     setFollow(mode) { if (!FOLLOW[mode]) throw new Error('keep / none / cover のどれかです'); st.follow = mode; view.follow.value = mode; store.set('layoutFollow', mode); return mode; },

@@ -1,0 +1,17 @@
+diff --git a/js/core/util/fabric-util.js b/js/core/util/fabric-util.js
+index 0954a26..c6108f6 100644
+--- a/js/core/util/fabric-util.js
++++ b/js/core/util/fabric-util.js
+@@ -379,9 +379,11 @@ return;
+ }
+ 
+ var layers=canvas.getObjects();
+-var matchingObject=layers.find(layer=>layer.guid===guid);
++// inkdeus: 引数ではなく、setGUID() が最後に書いた暗黙のグローバル guid と比べていた
++var matchingObject=layers.find(layer=>layer.guid===searchGuid);
+ return matchingObject;
+ }
++window.__inkdeusPatches=(window.__inkdeusPatches||[]).concat(['0001-get-object-by-guid']);
+ 
+ 
+ 

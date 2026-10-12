@@ -66,7 +66,23 @@ uv run inkdeus assets remove <名前> --name <ソース名>
 ```
 
 `--mode panel`（既定）はコマにはめ込む画像、`--mode free` はコマにはめずページ上へ自由に置く素材。`--recursive` はサブフォルダも含める。
-`/manga/` の画面の操作（コマ割り・画像の配置・吹き出し）は、いまは利用者が画面で行う（`ctl` からの操作には未対応）。
+`/manga/` の画面の操作のうち、画像の配置・吹き出し・文字は利用者が画面で行う。コマ割り（行と列の構成・間隔・余白）と PDF は `ctl` からもできる
+（どちらも `/manga/` を開いているブラウザが実行する。開いていなければ exit 2）。
+
+```bash
+uv run inkdeus ctl manga layout get                 # いまのページのレイアウト（木と設定）と、コマの一覧（番号・guid・ページ比の外接矩形）
+uv run inkdeus ctl manga layout grid 2,1,3          # 格子を作る（上の行から 2・1・3 コマ。いまのコマは置き換え、画像は読む順に引き継ぐ）
+uv run inkdeus ctl manga layout gutter 3% 1.5%      # コマの間隔（縦 = 行と行、横 = 列と列。ページの短辺に対する割合）
+uv run inkdeus ctl manga layout margin 5% 5% 5% 5%  # 外周の余白（上 右 下 左）
+uv run inkdeus ctl manga layout set '<JSON>'        # 木と設定をまとめて置き換える（layout get の "layout" と同じ形。- で標準入力）
+```
+
+レイアウトの木は、節 `{"dir": "v"|"h", "ratios": [...], "children": [...]}`（`v` = 子を上から下へ並べる行、`h` = 左から右へ並べる列）と、
+葉 `{"guid": "<コマの guid>"}`。`set` は、葉がいまのコマをそのまま指していれば形だけを変え（比率を変えるならこれ）、木の形を変えると作り直す。
+境界線のドラッグ・分割・結合・断ち切り・自由変形は、利用者が画面の「コマ割り」の欄とコマ割りモードで行う。吹き出しと文字はコマに追従しない。
+
+`uv run inkdeus manga status` に「未適用の差分」が出ていたら、`uv run inkdeus manga install` のやり直しを勧める（上流への小さな修正 3 点が当たる。
+当たっていなくてもコマ割りツール・PDF は動く）。
 
 全ページを印刷向けの PDF 1つにまとめるのは `ctl` からもできる（`/manga/` を開いているブラウザが実行する。開いていなければ exit 2）:
 

@@ -1,0 +1,29 @@
+diff --git a/js/sidebar/panel/knife/knife-split-engine.js b/js/sidebar/panel/knife/knife-split-engine.js
+index 5566b26..7a1abd1 100644
+--- a/js/sidebar/panel/knife/knife-split-engine.js
++++ b/js/sidebar/panel/knife/knife-split-engine.js
+@@ -79,6 +79,7 @@ return false;
+  * 行番号は増減のたびに詰め直されるため、生まれ方によっては既にある名前と同じになる
+  * @returns {Object} 名前をキーにした一覧（重複判定用）
+  */
++window.__inkdeusPatches=(window.__inkdeusPatches||[]).concat(['0003-knife-keeps-image-place']);
+ function collectUsedObjectNames() {
+ var used={};
+ canvas.getObjects().forEach(function (obj) {
+@@ -356,7 +357,15 @@ childImages.forEach(function(img){
+ img.clipPath=null;
+ var imgCenterX=img.left+(img.width*img.scaleX)/2;
+ var imgCenterY=img.top+(img.height*img.scaleY)/2;
+-putImageInFrame(img,imgCenterX,imgCenterY,false,true,true,largerPolygon);
++// inkdeus: 中央に入れ直さず、位置と大きさを保ったまま、絵の中心がある側のコマへ入れる。
++// window.inkdeusKnifeRefit=true で元の挙動（大きいほうのコマの中央に入れ直す）
++var keepPlace=window.inkdeusKnifeRefit!==true;
++var targetPolygon=largerPolygon;
++if(keepPlace){
++if(isPointInShape(polygon1,imgCenterX,imgCenterY)){targetPolygon=polygon1;}
++else if(isPointInShape(polygon2,imgCenterX,imgCenterY)){targetPolygon=polygon2;}
++}
++putImageInFrame(img,imgCenterX,imgCenterY,false,true,!keepPlace,targetPolygon);
+ });
+ }
+ 
