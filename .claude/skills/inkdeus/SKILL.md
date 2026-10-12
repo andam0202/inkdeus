@@ -71,6 +71,13 @@ uv run inkdeus assets remove <名前> --name <ソース名>
 `ctl set` / `ctl patch` / `ctl preset` で設定を変えると、白黒化の画面が PNG を自動で書き出し（「変更を自動で書き出す」がオンのとき）、
 `/manga/` で使っている白黒版が新しい画像に替わる。対象の画像を白黒化の画面で開くには `ctl open <画像名>`（または `/?image=<画像名>`）。
 
+### 漫画の文字にローカルフォントを足す
+
+`inkdeus.local.toml`（共通）かプロジェクトの `inkdeus.project.toml` に `[fonts]`（`dirs` = フォルダの並び、`include` = ファイル名の glob、
+`[fonts.names]` = ファイル名 → 表示名）を書く。`uv run inkdeus fonts list [--project <名前>]` で結果を確かめ、利用者に `/manga/` の素材パネルの
+「フォント」の「↻」を押してもらう（フォント選択の先頭の「inkdeus」に並ぶ）。
+フォントファイルはリポジトリに含まれず、利用者が自分で用意した物を自分のPCで使うだけ。ファイルをリポジトリへコピーしないこと。各フォントのライセンスは利用者が確かめる。
+
 ### 全画像をまとめて書き出す
 
 ```bash

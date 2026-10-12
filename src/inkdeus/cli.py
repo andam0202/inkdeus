@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 from . import ctl, manga
+from . import fonts as fonts_mod
 from .assets import BUILTIN as BUILTIN_ASSETS
 from .assets import MODES as ASSET_MODES
 from .assets import Catalog, read_toml_assets
@@ -25,7 +26,7 @@ from .projects import (ProjectError, add_asset_source, create_project, list_proj
                        projects_root, remove_asset_source)
 from .server import create_app, default_local_config
 
-COMMANDS = ("run", "new", "open", "projects", "ctl", "manga", "assets")
+COMMANDS = ("run", "new", "open", "projects", "ctl", "manga", "assets", "fonts")
 
 
 def _server_options(p: argparse.ArgumentParser) -> None:
@@ -77,6 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
     a = asub.add_parser("list", help="素材ソースの一覧")
     a.add_argument("project", help="プロジェクト名、またはプロジェクトのフォルダ")
     a.add_argument("--json", action="store_true", help="JSON で出力")
+    p = sub.add_parser("fonts", help="漫画の構成で使うローカルフォント（設定の [fonts]）を確かめる")
+    fsub = p.add_subparsers(dest="fonts_command", required=True, metavar="<command>")
+    f = fsub.add_parser("list", help="設定から見つかったフォントの一覧（表示名とファイル）")
+    f.add_argument("--project", help="プロジェクト名（そのプロジェクトの [fonts] も合わせて見る）")
+    f.add_argument("--json", action="store_true", help="JSON で出力")
     a = asub.add_parser("remove", help="素材ソースの登録を外す（フォルダの中身には触らない）")
     a.add_argument("project", help="プロジェクト名、またはプロジェクトのフォルダ")
     a.add_argument("--name", required=True, help="ソース名")
@@ -203,6 +209,24 @@ def cmd_assets(args) -> int:
     return 0
 
 
+def cmd_fonts(args) -> int:
+    configs = [default_local_config()]
+    if args.project:
+        configs.append(load_project(args.project, check=False).config)
+    fonts, problems = fonts_mod.resolve(configs)
+    if args.json:
+        print(json.dumps({"fonts": [f.info() | {"path": str(f.path)} for f in fonts], "problems": problems},
+                         ensure_ascii=False, indent=2))
+        return 0
+    if not fonts:
+        print("フォントは登録されていません（inkdeus.local.toml かプロジェクトの設定に [fonts] を書きます）")
+    for f in fonts:
+        print(f"  {f.name}  —  {f.path}")
+    for msg in problems:
+        print(f"  注意: {msg}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "ctl":
@@ -215,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return {"run": cmd_run, "new": cmd_new, "open": cmd_open, "projects": cmd_projects,
-                "assets": cmd_assets}[args.command](args)
+                "assets": cmd_assets, "fonts": cmd_fonts}[args.command](args)
     except ProjectError as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1

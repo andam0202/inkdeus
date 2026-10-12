@@ -12,5 +12,13 @@
 # mode = "free"
 # recursive = true
 
+# 漫画の構成（/manga/）の文字で使うフォントを、このPCにあるフォントファイルから足す。
+# フォントファイルは inkdeus には含まれません。自分で用意した物を指定し、各フォントのライセンスは自分で確かめてください。
+# [fonts]
+# dirs = ["~/fonts", "C:/Users/<ユーザー名>/AppData/Local/Microsoft/Windows/Fonts"]   # 複数可
+# include = ["Example-Mincho.ttf", "ExampleSerif-*.otf"]    # ファイル名の glob。省略すると dirs 内の全フォント
+# [fonts.names]                                             # 任意: ファイル名 → 表示名
+# "Example-Mincho.ttf" = "例の明朝"
+
 # 以前の版にあった `owner = true`（所有者モード）は廃止しました。書いてあっても無視されます。
 # 透かしは画面の「透かしを入れる」スイッチ（設定JSON の watermark.enabled）で切り替えます。

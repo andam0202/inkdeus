@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,7 @@ class MangaEnv:
     url: str
     project: Path
     requests: list
+    font: str | None = None        # 合成したローカルフォントの表示名（fontTools が無ければ None）
 
 
 @pytest.fixture(scope="module")
@@ -70,8 +72,18 @@ def manga_env(tmp_path_factory):
     add_asset_source(project, "sfx", root / "sfx", mode="free", recursive=True)
     app = create_app(project.source, project.masks, project.out, project=project.info(),
                      local_config=root / "none.toml", cache_root=root / "cache", watch=False)
+    font = None
+    try:
+        from synth_font import make_font
+
+        # 全部の文字が塗りつぶしの四角になるフォント（画素で見分けられる）。共通設定の [fonts] で登録する
+        make_font(root / "fonts" / "InkBox.ttf", "Ink Box", japanese="インク箱")
+        (root / "none.toml").write_text(f"[fonts]\ndirs = [{json.dumps(str(root / 'fonts'))}]\n", encoding="utf-8")
+        font = "インク箱"
+    except ImportError:
+        pass
     server, url = serve(app)
-    yield MangaEnv(url, project.path, [])
+    yield MangaEnv(url, project.path, [], font)
     server.shutdown()
 
 
@@ -566,3 +578,81 @@ def test_prefer_inked_when_placing_from_the_source_tab(hot):
     page.select_option(".ikb-prefer", "1")
     page.click(".ikb-tab:has-text('白黒')")
     page.wait_for_function("() => document.querySelector('.ikb-prefer-row').hidden === true")
+
+
+# ---- ローカルフォント ----
+
+DARK = """() => { const c = canvas.toCanvasElement(1); const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+    let n = 0; for (let i = 0; i < d.length; i += 4) if (d[i] < 60 && d[i + 3] > 200) n += 1; return n; }"""
+
+
+def test_local_font_is_listed_applied_saved_and_exported(ctx, manga_env):
+    if manga_env.font is None:
+        pytest.skip("fontTools がありません（テスト用のフォントを合成できません）")
+    name = manga_env.font
+    page, status = open_manga(ctx, manga_env)
+    try:
+        assert status["ok"]
+        page.evaluate("() => window.inkdeusBridge.setAutosave({enabled: false})")
+        fonts = page.evaluate("() => window.inkdeusBridge.status().fonts")
+        assert fonts["names"] == [name] and fonts["loaded"] == [] and fonts["supported"] is True
+        assert "フォント: 1 個" in page.evaluate("() => document.querySelector('.ikb-font-info').textContent")
+        # フォント選択に「inkdeus」の見出しでまとまって出る
+        titles = page.evaluate("""() => Array.from(document.querySelectorAll('#fm-fontDropdown-fontSelector .fm-category-title'))
+            .map(t => t.textContent)""")
+        assert titles[0] == "inkdeus"
+        option = f"#fm-fontDropdown-fontSelector .fm-font-option[data-font='{name}']"
+        assert page.evaluate("(s) => document.querySelectorAll(s).length", option) == 1
+        # 一覧を開いただけでは本体を読みに行かない（名前だけが並ぶ）
+        page.evaluate("() => document.querySelector('#fontSelector .fm-dropdown-trigger').click()")
+        assert page.evaluate("() => document.getElementById('fm-fontDropdown-fontSelector').classList.contains('fm-show')")
+        page.wait_for_timeout(500)
+        assert not any("/api/fonts/file/" in u for u in manga_env.requests)
+        page.evaluate("() => FontSelectorManager.closeAllDropdowns()")
+
+        page.evaluate("() => createTextbox()")                         # 横書きの文字（既定の書体）
+        page.evaluate("""() => { const o = canvas.getActiveObject();
+            o.set({text: 'AAAA', fontSize: 60, fill: '#000000', backgroundColor: '', strokeWidth: 0});
+            canvas.renderAll(); }""")
+        before = page.evaluate(DARK)
+        page.evaluate("(s) => document.querySelector(s).click()", option)   # フォント選択から適用する
+        page.wait_for_function("(n) => window.inkdeusBridge.status().fonts.loaded.includes(n)", arg=name)
+        assert page.evaluate("() => canvas.getActiveObject().fontFamily") == name
+        assert any("/api/fonts/file/" in u for u in manga_env.requests)   # 使ったときに初めて本体を取得する
+        page.wait_for_function(f"(b) => ({DARK})() > b * 2", arg=before)  # 画素が変わる（四角で塗りつぶされる）
+        applied = page.evaluate(DARK)
+        # 縦書きにも適用できる
+        page.evaluate("() => document.getElementById('verticalText').click()")
+        vertical = page.evaluate("() => ({type: canvas.getActiveObject().type, font: canvas.getActiveObject().fontFamily})")
+        assert vertical["font"] == name
+        page.evaluate("() => { canvas.getActiveObject().set({text: 'あい', fontSize: 60, fill: '#000000', strokeWidth: 0}); canvas.renderAll(); }")
+        page.wait_for_function(f"(b) => ({DARK})() > b * 1.2", arg=applied)
+        both = page.evaluate(DARK)
+        # 漫画データには「どこから取れるか」が相対 URL で記録される
+        recorded = page.evaluate("() => buildProjectFontData()")
+        assert {"name": name, "type": "web", "url": f"/api/fonts/css?family={name}"} in recorded
+        page_guid = page.evaluate("() => getCanvasGUID()")
+        page.evaluate("() => { canvas.discardActiveObject(); canvas.renderAll(); }")
+        page.evaluate("() => window.inkdeusBridge.save('fonts')")
+    finally:
+        page.close()
+
+    fresh, status = open_manga(ctx, manga_env)                         # 開き直しても、そのフォントで表示される
+    try:
+        fresh.evaluate("() => window.inkdeusBridge.setAutosave({enabled: false})")
+        fresh.evaluate("() => window.inkdeusBridge.open('fonts', {force: true})")
+        fresh.evaluate("async (g) => { if (getCanvasGUID() !== g) { await chengeCanvasByGuid(g); await btmWaitForPageReady(); } }",
+                       page_guid)
+        fresh.wait_for_function("(n) => window.inkdeusBridge.status().fonts.loaded.includes(n)", arg=name)
+        fresh.wait_for_function(f"([lo, hi]) => {{ const n = ({DARK})(); return n > lo && n < hi; }}",
+                                arg=[both * 0.85, both * 1.15])
+        assert sorted(o["type"] for o in objects(fresh)) == sorted(["textbox", vertical["type"]])
+        # ページの書き出しにも、そのフォントで描かれる
+        fresh.evaluate("() => { document.getElementById('outputDpi').value = 72; }")
+        out = fresh.evaluate("() => window.inkdeusBridge.exportPage({name: 'fonts'})")
+        im = np.asarray(Image.open(out["path"]).convert("L"))
+        scale = out["width"] / fresh.evaluate("() => canvas.getWidth()")
+        dark = int((im < 60).sum())
+        assert dark == pytest.approx(both * scale * scale, rel=0.2)
+    finally:
+        fresh.close()

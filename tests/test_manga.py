@@ -375,7 +375,7 @@ def test_bridge_reports_unsupported_version(tmp_path, images, upstream, browser)
         for call in ("placeAsset('source', 'a.png')", "save('x')", "exportPage()", "open('x', {force: true})"):
             with pytest.raises(Exception, match="対応していない版"):
                 page.evaluate(f"() => window.inkdeusBridge.{call}")
-        disabled = page.evaluate("""() => Array.from(document.querySelectorAll('.ikb-file button'))
+        disabled = page.evaluate("""() => Array.from(document.querySelectorAll('.ikb-file button:not(.ikb-icon)'))
             .map(b => b.disabled)""")
         assert disabled and all(disabled)
         page.click(".ikb-item[data-path='a.png']")                # 押しても例外を外へ漏らさず、パネル内に表示する

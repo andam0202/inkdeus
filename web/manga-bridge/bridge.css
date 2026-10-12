@@ -162,3 +162,7 @@ html.ikb-resizing, html.ikb-resizing * { cursor: ew-resize !important; user-sele
 .ikb-prefer-row { margin: 0; color: var(--ikb-dim); }
 .ikb-prefer-row > span { flex: none; }
 .ikb-prefer-row > select { flex: 1; }
+
+/* ローカルフォントの状態 */
+.ikb-font-row > .ikb-font-info { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ikb-font-info[data-kind="error"] { color: #ffb4ac; }

@@ -72,7 +72,7 @@ def _toml_string(value: str) -> str:
 
 
 def _write_config(path: Path, name: str, created: str, source: Path | str, masks: Path | str | None,
-                  out: str, note: str, assets: list[dict] | None = None) -> None:
+                  out: str, note: str, assets: list[dict] | None = None, fonts: dict | None = None) -> None:
     lines = [
         f"name = {_toml_string(name)}",
         f"created = {_toml_string(created)}",
@@ -83,6 +83,14 @@ def _write_config(path: Path, name: str, created: str, source: Path | str, masks
     lines.append(f"out = {_toml_string(out)}")
     if note:
         lines.append(f"note = {_toml_string(note)}")
+    if isinstance(fonts, dict):                            # 漫画の構成で使うローカルフォント（手で書いた物をそのまま残す）
+        lines += ["", "[fonts]"]
+        for key in ("dirs", "include"):
+            if isinstance(fonts.get(key), list):
+                lines.append(f"{key} = [{', '.join(_toml_string(str(v)) for v in fonts[key])}]")
+        if isinstance(fonts.get("names"), dict) and fonts["names"]:
+            lines += ["", "[fonts.names]"]
+            lines += [f"{_toml_string(str(k))} = {_toml_string(str(v))}" for k, v in fonts["names"].items()]
     for entry in assets or []:                             # 漫画の構成で使う追加の素材ソース
         lines += ["", "[[assets]]"]
         for key in ("name", "path", "mode"):
@@ -124,6 +132,7 @@ def create_project(name: str, images: Path | str, masks: Path | str | None = Non
     config = path / PROJECT_FILE
     created = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     assets: list[dict] = []
+    fonts: dict | None = None
     if config.exists():
         if not force:
             raise ProjectError(f"プロジェクトは既にあります: {name}（設定だけ更新するなら --force）")
@@ -132,6 +141,7 @@ def create_project(name: str, images: Path | str, masks: Path | str | None = Non
                 old = tomllib.load(f)
             created = str(old.get("created", created))                    # 作成日時は引き継ぐ
             assets = _raw_assets(old)                                      # 追加の素材ソースも引き継ぐ
+            fonts = old.get("fonts") if isinstance(old.get("fonts"), dict) else None
         except (OSError, tomllib.TOMLDecodeError):
             pass
     path.mkdir(parents=True, exist_ok=True)
@@ -145,7 +155,7 @@ def create_project(name: str, images: Path | str, masks: Path | str | None = Non
             _copy_images(masks_dir, path / "masks", only_png_masks=True)
             mask_ref = Path("masks")
     (path / "out").mkdir(exist_ok=True)
-    _write_config(config, name, created, source, mask_ref, "out", note, assets)
+    _write_config(config, name, created, source, mask_ref, "out", note, assets, fonts)
 
     with_mask = sum(1 for p in files if masks_dir is not None and (masks_dir / f"{p.stem}.png").is_file())
     summary = {"name": name, "path": str(path), "images": len(files),
@@ -170,7 +180,8 @@ def _rewrite_assets(project: Project, data: dict, assets: list[dict]) -> None:
     """設定ファイルを、素材ソースだけ差し替えて書き直す（他の項目は書かれている値のまま）"""
     _write_config(project.config, str(data.get("name") or project.name), str(data.get("created", "")),
                   data["source"], data.get("masks") if isinstance(data.get("masks"), str) else None,
-                  str(data.get("out") or "out"), str(data.get("note", "")), assets)
+                  str(data.get("out") or "out"), str(data.get("note", "")), assets,
+                  data.get("fonts") if isinstance(data.get("fonts"), dict) else None)
 
 
 def add_asset_source(project: Project, name: str, path: Path | str, mode: str = "panel",

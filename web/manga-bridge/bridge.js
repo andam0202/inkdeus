@@ -20,7 +20,8 @@
      updateLayerPanel, saveStateByManual, btmSaveProjectFile, btmSaveCurrentPage, btmGetGuids, btmGetGuidsSize,
      btmWaitForPageReady, btmUpdateHandleText, chengeCanvasByGuid, multiLoadLz4, clearAllProjectPages,
      getContentObjectCount, getCropAndDownloadLinkByMultiplier, removeGrid, drawGrid, showConfirmDialog,
-     flushHistory, OP_showLoading, OP_hideLoading, waitNextFrame, withoutHistory, saveInitialState */
+     flushHistory, OP_showLoading, OP_hideLoading, waitNextFrame, withoutHistory, saveInitialState,
+     fmFontData:writable, FontSelectorManager, collectUsedFontNames, usesFontFamily, projectFontData */
   const G = {
     fabric: () => fabric,
     canvas: () => canvas,
@@ -103,6 +104,8 @@
     inked: { versions: null, changed: new Set(), pairs: new Map() },   // 白黒版の更新時刻と、開いてから変わった物
     events: { connected: false, opened: 0, received: 0 },
     hot: { updated: 0, last: null },                                    // 書き出しの通知で差し替えた回数
+    // ローカルフォント（利用者のPCにあるフォント。inkdeus のサーバが配信する）
+    fonts: { list: [], loaded: new Set(), loading: new Map(), failed: new Map(), registered: false, supported: true },
   };
 
   // ---- 小物 ----
@@ -253,6 +256,10 @@
     ui.autosave = el('input', { type: 'checkbox', id: 'ikb-autosave' });
     ui.autosaveState = el('span', { class: 'ikb-dim' });
     ui.dir = el('div', { class: 'ikb-dim ikb-dir' });
+    ui.fontInfo = el('span', { class: 'ikb-dim ikb-font-info' });
+    ui.fontRow = el('div', { class: 'ikb-row ikb-font-row' }, [ui.fontInfo,
+      el('button', { type: 'button', class: 'ikb-icon', text: '↻', title: 'フォントの一覧を読み直す',
+        'aria-label': 'フォントの一覧を読み直す', onclick: () => run(() => refreshFonts()) })]);
 
     ui.body = el('div', { class: 'ikb-body' }, [
       el('div', { class: 'ikb-head' }, [
@@ -281,6 +288,7 @@
         el('div', { class: 'ikb-row ikb-autosave-row' }, [
           ui.autosave, el('label', { for: 'ikb-autosave', text: '自動保存' }), ui.autosaveState,
         ]),
+        ui.fontRow,
         ui.dir,
       ]),
     ]);
@@ -983,6 +991,122 @@
     return { ok: !!done, changed: !!done, object: describe(sel.obj), src: sel.obj.getSrc() };
   }
 
+  // ---- ローカルフォント ----
+  // 漫画エディタのフォント選択は fmFontData（分類 → フォントの並び）から作られる。そこへ「inkdeus」の分類を足す。
+  // フォント本体は @font-face（/api/fonts/css）で宣言するだけにして、使われたときに初めて読み込む
+  // （数十MB の日本語フォントを起動時に全部は読まない）。漫画エディタ側の IndexedDB には何も保存しない。
+
+  function renderFonts() {
+    const f = state.fonts;
+    const failed = Array.from(f.failed.keys());
+    ui.fontInfo.textContent = !f.supported ? 'フォント: 対応していない版です'
+      : !f.list.length ? 'フォント: 登録なし'
+        : `フォント: ${f.list.length} 個` + (failed.length ? `（読み込み失敗: ${failed.join('、')}）` : '');
+    ui.fontInfo.title = f.list.map((x) => `${x.name}（${x.file}）`).join('\n');
+    ui.fontInfo.dataset.kind = failed.length ? 'error' : 'ok';
+  }
+
+  function loadStylesheet(href) {
+    return new Promise((resolve, reject) => {
+      const old = document.getElementById('ikb-fonts');
+      const link = el('link', { rel: 'stylesheet', href });
+      link.onload = () => { if (old) old.remove(); link.id = 'ikb-fonts'; resolve(); };
+      link.onerror = () => { link.remove(); reject(new Error('フォントの定義を読み込めません')); };
+      document.head.appendChild(link);
+    });
+  }
+
+  async function refreshFonts() {
+    const f = state.fonts;
+    let rows = [];
+    try {
+      rows = await api('GET', '/api/fonts');
+    } catch (e) {
+      rows = [];                                               // 古いサーバ（この API が無い）
+    }
+    f.list = Array.isArray(rows) ? rows : [];
+    f.failed.clear();
+    if (f.list.length || f.registered) {
+      const data = optional(() => fmFontData);
+      f.supported = !!data && typeof data === 'object';
+      if (f.supported) {
+        if (f.list.length) await loadStylesheet('/api/fonts/css?t=' + Date.now());
+        const entries = f.list.map((x) => ({ name: x.name, type: 'web', url: x.css }));
+        const rest = Object.assign({}, data);
+        delete rest.inkdeus;
+        // 見つけやすいよう先頭の分類にする。プレビュー用の書体指定（.fm-font-…）は足さないので、
+        // 選択の一覧を開いただけでは本体を読みに行かない（名前だけが並ぶ）
+        fmFontData = f.list.length ? Object.assign({ inkdeus: { color: '#ff9532', fonts: entries } }, rest) : rest;
+        optional(() => FontSelectorManager.reloadAll());
+        f.registered = true;
+      }
+    }
+    renderFonts();
+    fontTick();
+    return f.list;
+  }
+
+  function fontUsedBy(obj, name) {
+    const check = optional(() => usesFontFamily);
+    return check ? check(obj, name) : obj.fontFamily === name;
+  }
+
+  // フォント本体を読み込み、それを使っている文字を描き直す（読み込み前は代わりの書体で描かれているため）
+  function ensureFont(name) {
+    const f = state.fonts;
+    if (f.loaded.has(name)) return Promise.resolve(true);
+    if (f.loading.has(name)) return f.loading.get(name);
+    const job = document.fonts.load(`32px "${name}"`, 'あA').then((faces) => {
+      if (!faces.length) throw new Error('フォントが見つかりません');
+      f.loaded.add(name);
+      f.failed.delete(name);
+      if (has('canvas')) {
+        optional(() => fabric.util.clearFabricFontCache(name));
+        const redo = () => canvas.getObjects().forEach((obj) => {
+          if (!fontUsedBy(obj, name)) return;
+          obj.dirty = true;
+          if (typeof obj.initDimensions === 'function') obj.initDimensions();
+          obj.setCoords();
+        });
+        const quiet = optional(() => withoutHistory);
+        if (quiet) quiet(redo); else redo();
+        canvas.requestRenderAll();
+        optional(() => updateLayerPanel());
+      }
+      return true;
+    }).catch((e) => {
+      console.error('[inkdeus]', name, e);
+      f.failed.set(name, e.message || String(e));
+      return false;
+    }).finally(() => { f.loading.delete(name); renderFonts(); });
+    f.loading.set(name, job);
+    return job;
+  }
+
+  function usedLocalFonts() {
+    const used = optional(() => collectUsedFontNames());
+    if (!used) return [];
+    return state.fonts.list.map((x) => x.name).filter((name) => used.has(name));
+  }
+
+  // 定期的に呼ぶ: いまのページで使われているフォントを読み込み、漫画データに「どこから取れるか」を記録させる
+  function fontTick() {
+    const f = state.fonts;
+    if (!f.list.length || !f.supported) return;
+    const carried = optional(() => projectFontData);
+    if (carried && typeof carried.set === 'function') {
+      // 保存される漫画データ（fonts.json）に {name, type, url} が入るようにする。URL は相対なのでポートが変わっても使える
+      f.list.forEach((x) => { if (!carried.has(x.name)) carried.set(x.name, { name: x.name, type: 'web', url: x.css }); });
+    }
+    usedLocalFonts().forEach((name) => { if (!f.loaded.has(name) && !f.failed.has(name)) ensureFont(name); });
+  }
+
+  // いまのページで使っているフォントが読み込み終わるまで待つ（書き出しの前に呼ぶ）
+  async function ensurePageFonts() {
+    await Promise.all(usedLocalFonts().map((name) => ensureFont(name)));
+    if (has('canvas')) canvas.renderAll();
+  }
+
   // ---- 保存と読み込み ----
 
   async function listSaved() {
@@ -1176,6 +1300,7 @@
   // いま開いているページを PNG にする。漫画エディタの「画像を保存」と同じ（グリッドを消し、
   // 原稿サイズと DPI から決まる倍率で書き出し、グリッドを戻す）
   async function renderPagePng() {
+    await ensurePageFonts();                                   // フォントが読み込み終わってから描く
     removeGrid();
     let size;
     let link;
@@ -1313,7 +1438,8 @@
     markClean();
     renderStatus();
     renderTarget();
-    setInterval(() => { renderTarget(); renderSelection(false); }, 700);
+    setInterval(() => { renderTarget(); renderSelection(false); fontTick(); }, 700);
+    await refreshFonts().catch((e) => fail(e, 'フォントの一覧を読めません'));
     await refreshVersions();
     connectEvents();
     if (has('canvas')) {
@@ -1348,6 +1474,8 @@
       name: state.name, source: state.source, imageMax: state.imageMax,
       width: state.width, float: !!state.float, preferInked: state.preferInked, autoSwap: state.autoSwap,
       events: Object.assign({}, state.events), hot: Object.assign({}, state.hot),
+      fonts: { names: state.fonts.list.map((x) => x.name), loaded: Array.from(state.fonts.loaded),
+        failed: Array.from(state.fonts.failed.keys()), supported: state.fonts.supported },
       autosave: { enabled: state.autosave.enabled, seconds: state.autosave.seconds,
         dirty: !!state.autosave.dirtySince, lastAt: state.autosave.lastAt } }),
     // 素材
@@ -1371,6 +1499,8 @@
     openEditor, adjustSelected, swapSelected, syncPage: () => queueSync(0), reconnectEvents: connectEvents,
     setPreferInked(on) { state.preferInked = !!on; ui.prefer.value = on ? '1' : '0'; },
     setAutoSwap(on) { state.autoSwap = !!on; ui.autoSwap.checked = !!on; if (on) return queueSync(0); return null; },
+    // フォント
+    refreshFonts, ensureFont, ensurePageFonts,
     // 画面
     setOpen: (open) => setOpen(!!open),
     setWidth: (px) => { const w = setWidth(px); relayout(); return w; },

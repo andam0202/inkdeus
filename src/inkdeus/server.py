@@ -23,6 +23,7 @@ from flask import Flask, Response, abort, jsonify, redirect, request, send_file,
 from PIL import Image
 
 from . import assets as assets_mod
+from . import fonts as fonts_mod
 from . import manga as manga_mod
 from . import schema
 
@@ -347,6 +348,9 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         project_file=project_dir / "inkdeus.project.toml" if project_dir else None,
         local_file=Path(local_config) if local_config else default_local_config())
     manga_dir = (project_dir / "manga") if project_dir else lib.out_dir / "manga"
+    # ローカルフォントの設定（共通 → プロジェクトの順に合算。毎回読み直すので、稼働中に書き足しても反映される）
+    font_configs = [Path(local_config) if local_config else default_local_config(),
+                    project_dir / "inkdeus.project.toml" if project_dir else None]
     manga_site = manga_mod.MangaSite(Path(cache_root) if cache_root else None)
     app = Flask(__name__, static_folder=str(web), static_url_path="")
     app.config["MAX_CONTENT_LENGTH"] = MAX_EXPORT_BYTES
@@ -403,6 +407,10 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         path = request.path
         if path.startswith("/api/assets/") and ("/image/" in path or "/thumb/" in path):
             resp.headers["Cache-Control"] = "no-cache"      # 毎回確かめるが、変わっていなければ再送しない
+        elif path.startswith("/api/fonts/file/"):
+            resp.headers["Cache-Control"] = "public, max-age=86400"   # フォント本体は大きいので使い回させる
+        elif path.startswith("/api/fonts/css"):
+            resp.headers["Cache-Control"] = "no-cache"
         elif path.startswith("/api/"):
             resp.headers["Cache-Control"] = "no-store"
         elif path.startswith("/manga"):
@@ -520,6 +528,31 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
     def api_assets_thumb(source: str, rel: str):
         item = asset_item(source, rel)
         return send_derived(item, "thumb", int_arg("h", 160, *assets_mod.THUMB_RANGE))
+
+    # ---- 漫画の構成: ローカルフォント（利用者のPCにあるフォントファイル） ----
+
+    @app.get("/api/fonts")
+    def api_fonts():
+        fonts, _ = fonts_mod.resolve(font_configs)
+        return jsonify([f.info() for f in fonts])
+
+    @app.get("/api/fonts/file/<font_id>")
+    def api_font_file(font_id: str):
+        fonts, _ = fonts_mod.resolve(font_configs)
+        font = next((f for f in fonts if f.id == font_id), None)      # 一覧にある物だけ
+        if font is None:
+            abort(404)
+        return send_file(font.path, mimetype=font.mime, conditional=True)
+
+    @app.get("/api/fonts/css")
+    def api_fonts_css():
+        fonts, _ = fonts_mod.resolve(font_configs)
+        family = request.args.get("family")
+        if family is not None:
+            fonts = [f for f in fonts if f.name == family]
+            if not fonts:
+                abort(404)
+        return Response(fonts_mod.css_for(fonts), mimetype="text/css")
 
     # ---- 漫画の構成: 漫画データ（漫画エディタの保存形式のまま）と書き出したページ ----
 
