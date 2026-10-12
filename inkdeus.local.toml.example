@@ -1,0 +1,3 @@
+# Copy to "inkdeus.local.toml" (git-ignored) to run the server in owner mode.
+# 所有者モード: 透かしのオン/オフスイッチが UI に出る（既定はオフ）。
+owner = true

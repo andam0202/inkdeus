@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+inkdeus_out/
+inkdeus.local.toml
+tests/_generated/
+demo_images/
+dist/
+*.egg-info/
