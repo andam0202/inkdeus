@@ -237,6 +237,8 @@
   function buildPanel() {
     ui.msg = el('div', { class: 'ikb-msg', role: 'status', hidden: true });
     ui.resume = el('div', { class: 'ikb-resume', hidden: true });
+    // 導入済みの漫画エディタに、未適用の差分（inkdeus が上流へ当てる変更）があるときの案内
+    ui.patchNotice = el('div', { class: 'ikb-msg ikb-patch-notice', 'data-kind': 'error', hidden: true });
     ui.projectName = el('span', { class: 'ikb-project-name' });
     ui.tabs = el('div', { class: 'ikb-tabs', role: 'tablist' });
     // 画像フォルダが複数あるとき、元画像・白黒のタブで見るフォルダを選ぶ（タブをフォルダの数だけ増やさない）
@@ -297,6 +299,7 @@
         ui.float,
       ]),
       ui.msg,
+      ui.patchNotice,
       ui.resume,
       ui.sel,
       el('div', { class: 'ikb-section ikb-assets' }, [
@@ -1661,6 +1664,9 @@
       state.mangaDir = status.dir || '';
       ui.projectName.textContent = state.project ? state.project.name : '';
       if (state.project) ui.projectName.title = 'プロジェクト: ' + state.project.name;
+      state.patches = status.patches || null;
+      ui.patchNotice.textContent = status.patchNotice || '';
+      ui.patchNotice.hidden = !status.patchNotice;
     } catch (e) {
       fail(e, 'inkdeus のサーバに接続できません');
     }
@@ -1746,6 +1752,9 @@
     ready: init(),
     status: () => ({ ready: state.ready, busy: state.busy, features: Object.assign({}, state.features),
       server: (state.server || []).slice(), modules: (state.modules || []).slice(),
+      // 差分: applied = 導入のときに当てた物（サーバの記録）、active = 実際に読み込まれた物（差分が自分で名乗る）
+      patches: { applied: state.patches ? state.patches.applied.slice() : [], pending: state.patches ? state.patches.pending.slice() : [],
+        active: (window.__inkdeusPatches || []).slice() },
       missing: Object.assign({}, state.missing), project: state.project, mangaDir: state.mangaDir,
       name: state.name, source: state.source, folder: state.folder, folders: state.folders.slice(),
       imageMax: state.imageMax,

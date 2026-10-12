@@ -4,6 +4,10 @@
 1ファイルも含めず、`inkdeus manga install` で利用者のキャッシュへ取得する。配信時に index.html だけを
 書き換え（キャッシュ上のファイルは変えない）、アクセス解析と service worker を外して、
 inkdeus の連携スクリプト（web/manga-bridge/）を差し込む。
+
+上流のコードそのものを変える必要がある所は、リポジトリの patches/manga-editor-desu/<コミット>/ に置いた
+差分ファイル（unified diff）を、取得のときにキャッシュ上の作業ツリーへ当てる（git apply）。
+1つでも当たらなければ全部を取り消して、差分なしの状態で使えるようにする。
 """
 
 from __future__ import annotations
@@ -28,7 +32,8 @@ UPSTREAM_URL = "https://github.com/new-sankaku/manga-editor-desu"
 PINNED_COMMIT = "04e0cf3de1f3677682f6d1831f2713db70e441ba"
 
 CURRENT_FILE = "current"                    # いま配信する版（コミット）を1行で書いたファイル
-MARKER_FILE = ".inkdeus-install.json"       # 取得が最後まで終わった印（取得元と日時）
+MARKER_FILE = ".inkdeus-install.json"       # 取得が最後まで終わった印（取得元と日時、当てた差分）
+PATCH_SUFFIX = ".patch"
 BRIDGE_CSS = '<link rel="stylesheet" href="/manga-bridge/bridge.css">'
 BRIDGE_JS = '<script src="/manga-bridge/bridge.js"></script>'
 
@@ -74,7 +79,7 @@ def installed_dir(root: Path | None = None) -> Path | None:
     return None
 
 
-def status(root: Path | None = None) -> dict:
+def status(root: Path | None = None, patch_root: Path | None = None) -> dict:
     base = upstream_root(root)
     path = installed_dir(root)
     info: dict = {"installed": path is not None, "cache": str(base), "pinned": PINNED_COMMIT,
@@ -85,8 +90,74 @@ def status(root: Path | None = None) -> dict:
         except (OSError, ValueError):
             marker = {}
         info.update(path=str(path), commit=path.name, matchesPinned=path.name == PINNED_COMMIT,
-                    source=marker.get("source"), installedAt=marker.get("installedAt"))
+                    source=marker.get("source"), installedAt=marker.get("installedAt"),
+                    patches=patch_status(path.name, marker, patch_root))
     return info
+
+
+# ---- 上流への差分 ----
+
+def patches_root() -> Path:
+    """差分ファイルの置き場（リポジトリ直下の patches/ を優先し、無ければパッケージ同梱）"""
+    here = Path(__file__).resolve()
+    for cand in (here.parents[2] / "patches", here.parent / "patches"):
+        if (cand / UPSTREAM_NAME).is_dir():
+            return cand / UPSTREAM_NAME
+    return here.parents[2] / "patches" / UPSTREAM_NAME
+
+
+def available_patches(commit: str, patch_root: Path | None = None) -> list[Path]:
+    """その版（コミット）用の差分ファイル（番号順 = ファイル名順）"""
+    folder = (patches_root() if patch_root is None else Path(patch_root)) / commit
+    try:
+        return sorted(p for p in folder.iterdir() if p.is_file() and p.suffix == PATCH_SUFFIX)
+    except OSError:
+        return []
+
+
+def patch_status(commit: str, marker: dict, patch_root: Path | None = None) -> dict:
+    """導入済みの版に当たっている差分と、まだ当たっていない差分"""
+    recorded = marker.get("patches") if isinstance(marker.get("patches"), dict) else {}
+    applied = [n for n in recorded.get("applied", []) if isinstance(n, str)]
+    available = [p.stem for p in available_patches(commit, patch_root)]
+    return {"applied": applied, "available": available,
+            "pending": [n for n in available if n not in applied],
+            "failed": recorded.get("failed") or None,          # {"name", "reason", "rolledBack"}
+            "disabled": recorded.get("disabled") is True}      # --no-patches で入れた
+
+
+def _git_apply(work: Path, patch: Path, reverse: bool = False) -> str | None:
+    """作業ツリーへ差分を当てる（reverse で取り消す）。失敗したら理由を返す"""
+    env = dict(os.environ)
+    # 作業ツリーの外側にある git リポジトリを見に行かせない（見つけると、その中の一部として扱われてしまう）
+    env["GIT_CEILING_DIRECTORIES"] = str(work.parent)
+    cmd = ["git", "apply", "--whitespace=nowarn", *(["-R"] if reverse else []), str(patch.resolve())]
+    try:
+        proc = subprocess.run(cmd, cwd=work, capture_output=True, check=False, env=env)
+    except FileNotFoundError as e:
+        raise MangaError("git が見つかりません（差分を当てるには git が必要です）") from e
+    if proc.returncode == 0:
+        return None
+    lines = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+    return lines[0] if lines else f"git apply が失敗しました（{proc.returncode}）"
+
+
+def apply_patches(work: Path, patches: list[Path], say=print) -> dict:
+    """差分を番号順に当てる。1つでも当たらなければ、当てた分を取り消して「当てる前の状態」へ戻す"""
+    done: list[Path] = []
+    for patch in patches:
+        reason = _git_apply(work, patch)
+        if reason is None:
+            done.append(patch)
+            continue
+        for applied in reversed(done):
+            undo = _git_apply(work, applied, reverse=True)
+            if undo is not None:
+                raise MangaError(f"差分 {applied.name} を取り消せませんでした: {undo}")
+        say(f"警告: 差分 {patch.name} が当たりませんでした（{reason}）。差分なしの状態で導入します")
+        return {"applied": [], "failed": {"name": patch.stem, "reason": reason,
+                                          "rolledBack": [p.stem for p in done]}}
+    return {"applied": [p.stem for p in done], "failed": None}
 
 
 # ---- 取得 ----
@@ -147,8 +218,10 @@ def _from_network(url: str, ref: str, dest: Path, say) -> str:
 
 
 def install(ref: str = PINNED_COMMIT, source: Path | str | None = None, allow_mismatch: bool = False,
-            root: Path | None = None, url: str = UPSTREAM_URL, say=print) -> dict:
-    """上流を取得してキャッシュへ置く。source があればそのローカルのクローンから（ネットワーク不要）"""
+            root: Path | None = None, url: str = UPSTREAM_URL, say=print,
+            patches: bool = True, patch_root: Path | None = None) -> dict:
+    """上流を取得してキャッシュへ置く。source があればそのローカルのクローンから（ネットワーク不要）。
+    patches が真なら、その版用の差分（patch_root。省略時はリポジトリの patches/）を当てる"""
     base = upstream_root(root)
     base.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix=".install-", dir=base))
@@ -162,8 +235,13 @@ def install(ref: str = PINNED_COMMIT, source: Path | str | None = None, allow_mi
         if not (work / "index.html").is_file():
             raise MangaError("取得した内容に index.html がありません（対象のリポジトリではないようです）")
         shutil.rmtree(work / ".git", ignore_errors=True)
+        if patches:
+            patched = apply_patches(work, available_patches(commit, patch_root), say)
+        else:
+            patched = {"applied": [], "failed": None, "disabled": True}
         marker = {"commit": commit, "source": origin,
-                  "installedAt": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
+                  "installedAt": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+                  "patches": patched}
         (work / MARKER_FILE).write_text(json.dumps(marker, indent=2) + "\n", encoding="utf-8")
         target = base / commit
         if target.exists():
@@ -176,7 +254,19 @@ def install(ref: str = PINNED_COMMIT, source: Path | str | None = None, allow_mi
     os.replace(tmp, base / CURRENT_FILE)
     if commit != PINNED_COMMIT:
         say(f"注意: 動作を確かめてある版（{PINNED_COMMIT}）とは別の版です。連携が動かないことがあります")
-    return status(root)
+    return status(root, patch_root)
+
+
+def pending_notice(info: dict) -> str | None:
+    """導入済みの版に未適用の差分があるときの案内（無ければ None）。自動では当てない"""
+    patches = info.get("patches") if info.get("installed") else None
+    if not patches or not patches["pending"] or patches["disabled"]:
+        return None
+    if patches["failed"]:
+        return (f"上流への差分 {patches['failed']['name']} が当たらなかったため、差分なしで動いています"
+                "（一部の機能が使えません）")
+    return (f"導入済みの漫画エディタに、未適用の差分が {len(patches['pending'])} 個あります。"
+            "inkdeus manga install をやり直すと当たります")
 
 
 # ---- 配信時の書き換え ----
@@ -336,10 +426,28 @@ class MangaSite:
 
 # ---- CLI ----
 
+def _print_patches(info: dict) -> None:
+    patches = info["patches"]
+    if patches["disabled"]:
+        print("  上流への差分: 当てていません（--no-patches）")
+    elif patches["applied"]:
+        print(f"  当てた差分: {'、'.join(patches['applied'])}")
+    elif not patches["available"]:
+        print("  上流への差分: この版用の物はありません")
+    if patches["failed"]:
+        failed = patches["failed"]
+        print(f"  当たらなかった差分: {failed['name']}（{failed['reason']}）→ 差分なしの状態です")
+    if patches["pending"]:
+        print(f"  未適用の差分: {'、'.join(patches['pending'])}"
+              + ("" if patches["disabled"] or patches["failed"] else "（inkdeus manga install をやり直すと当たります）"))
+
+
 def cmd_install(args) -> int:
-    info = install(ref=args.ref, source=args.source, allow_mismatch=args.allow_mismatch)
+    info = install(ref=args.ref, source=args.source, allow_mismatch=args.allow_mismatch,
+                   patches=not args.no_patches)
     print(f"導入しました: {info['commit']}")
     print(f"  場所: {info['path']}")
+    _print_patches(info)
     print("  inkdeus を起動（run / open）して、ブラウザで /manga/ を開いてください")
     return 0
 
@@ -358,6 +466,7 @@ def cmd_status(args) -> int:
     print(f"導入済み: {info['commit']}{note}")
     print(f"  場所: {info['path']}")
     print(f"  取得元: {info.get('source') or '不明'} / 取得日時: {info.get('installedAt') or '不明'}")
+    _print_patches(info)
     return 0
 
 
@@ -375,6 +484,8 @@ def main(argv: list[str]) -> int:
                    help="取得済みのローカルのクローンから取り出す（ネットワークを使わない）")
     p.add_argument("--allow-mismatch", action="store_true",
                    help="--from のクローンに指定の版が無いとき、クローンの現在の版をそのまま使う")
+    p.add_argument("--no-patches", action="store_true",
+                   help="上流への差分（patches/manga-editor-desu/<コミット>/*.patch）を当てない")
     p = sub.add_parser("status", help="導入済みの版と場所を表示する")
     p.add_argument("--json", action="store_true", help="JSON で出力")
     args = ap.parse_args(argv)

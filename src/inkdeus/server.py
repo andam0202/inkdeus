@@ -56,7 +56,7 @@ PAINT_ALL = "all-targets"                              # 削除でだけ使え�
 MAX_PAINT_BYTES = 1 << 28
 # 画面が、サーバにある機能を確かめるための名前
 FEATURES = ["layerIds", "paint", "parts", "userStyles", "mangaPdf", "mangaCommand"]
-MANGA_COMMANDS = ("pdf", "pdf-abort")       # 漫画の構成の画面へ出せる指示
+MANGA_COMMANDS = ("pdf", "pdf-abort", "layout")       # 漫画の構成の画面へ出せる指示
 MANGA_RESULT_KEEP = 32                                 # 覚えておく指示の結果の数
 
 
@@ -730,6 +730,9 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
     app.config["INKDEUS_STYLES"] = style_store
     if watch:
         session.start_watching(registry.sessions)
+    notice = manga_mod.pending_notice(manga_mod.status(manga_site.root))
+    if notice:
+        manga_mod.log.warning("manga: %s", notice)
 
     def pick() -> tuple[str, Library, Session]:
         """クエリ ?folder=<名前>（省略 = 既定）の画像フォルダ。無い名前は 404"""
@@ -812,8 +815,10 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
     @app.get("/api/manga/status")
     def api_manga_status():
         base = manga_site.dir()
+        info = manga_mod.status(manga_site.root)
         return jsonify({"installed": base is not None, "commit": base.name if base else None,
-                        "pinned": manga_mod.PINNED_COMMIT, "dir": str(manga_dir), "project": project})
+                        "pinned": manga_mod.PINNED_COMMIT, "dir": str(manga_dir), "project": project,
+                        "patches": info.get("patches"), "patchNotice": manga_mod.pending_notice(info)})
 
     # ---- 漫画の構成: 取得済みの漫画エディタの配信（/manga/）----
 
