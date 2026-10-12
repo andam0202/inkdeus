@@ -533,7 +533,7 @@ export class Renderer {
       if (name !== 'all') {
         const set = prep.sets[name === 'person' ? 0 : 1];
         // 層ごとの「描かれている画素の割合」（その領域の中で）。layer は設定上の層番号
-        o.layers = set.index.map((layerIndex, k) => ({ layer: layerIndex, coverage: t.n ? round(t.layers[k] / t.n) : null }));
+        o.layers = t.n ? set.index.map((layerIndex, k) => ({ layer: layerIndex, coverage: round(t.layers[k] / t.n) })) : [];
       }
       output[name] = o;
       input[name] = { luminance: summary(t.lum, t.n), adjusted: summary(t.adjusted, t.n) };
