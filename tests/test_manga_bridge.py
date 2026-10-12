@@ -494,9 +494,9 @@ def test_swap_between_inked_and_source(hot):
     page.evaluate("(g) => { canvas.setActiveObject(canvas.getObjects().find(o => o.guid === g)); canvas.renderAll(); }", guid)
     page.wait_for_function("() => !document.querySelector('.ikb-sel').hidden")
     assert "選択中の画像: scene（白黒版）" in page.evaluate("() => document.querySelector('.ikb-sel-name').textContent")
-    buttons = page.evaluate("""() => Array.from(document.querySelectorAll('.ikb-sel button'))
-        .filter(b => !b.hidden).map(b => b.textContent)""")
-    assert buttons == ["白黒を調整", "元画像に戻す", "新しいバージョンを作って調整"]
+    # 「新しいバージョンを作って調整」は、元画像との対応を問い合わせたあとに出る。出そろうのを待ってから確かめる
+    page.wait_for_function("() => Array.from(document.querySelectorAll('.ikb-sel button')).filter(b => !b.hidden)"
+                           ".map(b => b.textContent).join() === '白黒を調整,元画像に戻す,新しいバージョンを作って調整'")
     before = page.evaluate(PROBE, guid)
     depth = page.evaluate("() => { flushHistory(); return stateStack.length; }")
     page.click(".ikb-sel button:has-text('元画像に戻す')")
