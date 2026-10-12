@@ -12,7 +12,8 @@ inkdeus はブラウザで動くエディタで、設定ファイルを書き換
 
 ## 守ること
 
-- **画像そのものは開いて見ない**（入力画像・マスク・書き出した PNG のどれも）。判断は `ctl stats` の数値で行い、見た目の良し悪しは利用者が画面で確かめる。
+- **画像そのものは開いて見ない**（入力画像・マスク・書き出した PNG・消しゴムやペンの PNG のどれも）。判断は `ctl stats` の数値で行い、見た目の良し悪しは利用者が画面で確かめる。
+- **消しゴム・ペンは人が画面で行う物**。Claude Code は画像を見て描かない（`ctl` に描く操作は無い。できるのは、保存されている対象の一覧と消去だけ）。
 - サーバの停止に `pkill -f` は使わない。`ss -ltnp | grep :8770` で PID を調べて `kill <PID>`。
 - 設定の全体を書き直さない。変えたい項目だけを `ctl preset` / `ctl set` / `ctl patch` で変える。
 
@@ -121,6 +122,26 @@ uv run inkdeus ctl version delete bg-white               # 設定と PNG を消�
 - `/manga/` では各バージョンが別の素材として並ぶ。名前を変える・削除すると、漫画のページで使っている絵に影響する
   （削除 → 既定へ切り替わる。名前の変更 → 開いているページだけ追従）ので、利用者に確かめてから行う。
 
+### 消しゴム・ペン（利用者が画面で手を入れた所）
+
+利用者は、プレビューの上のツールバーで、消しゴム（層ごと・ベタ・線画・すべて）とペン（黒・白）を使って仕上げる。これは**利用者が画面で行う作業**で、
+`ctl` からは描けない。`ctl` でできるのは、保存されている対象の一覧と、消去だけ。
+
+```bash
+uv run inkdeus ctl paint list                      # 保存されている対象（targets）。省略時は、いまブラウザで開いている画像・バージョン
+uv run inkdeus ctl paint clear lines               # その対象の消しゴムを消す（開いている画面にもすぐ反映。その画面の取り消し履歴は消える）
+uv run inkdeus ctl paint clear all-targets         # 全部消す
+```
+
+- 対象は `layer-<層の id>`（id は `ctl get` の `regions.<領域>.layers[].id`）/ `solid-person` / `solid-background` / `lines` / `all`（その場所を白にする）/ `pen`。
+- 消すのは利用者の手作業を捨てる操作なので、**頼まれたときだけ**行う（消す前に `paint list` で何があるかを伝える）。
+- `ctl stats` の数値は、消しゴム・ペンを反映した最終出力に対する物。`stats.paint.targets` / `penUsed` が空でなければ、
+  設定を変えても数値が思ったほど動かないことがある（その場所が手で消されている・描き足されている）。
+- 消しゴムは層の `id` で結び付いている。`ctl set regions.person.layers.0.width 0.4` のように1項目ずつ変えれば保たれる。
+  `ctl preset`（スタイルの適用）は層を入れ替えるので、**前の層の消しゴムは保存先からも消える**。`paint list` に `layer-…` があるときは、先に利用者に確かめる。
+  `ctl patch` で層を丸ごと書き直すときは、`id` を省けば同じ位置の層の id（と消しゴム）を引き継ぐ。
+- 置き場所は `<out>/<名前>[@<バージョン>].paint/`（対象ごとの PNG と `index.json`）。バージョンの複製で写り、削除で消える。
+
 ### 画像フォルダが複数あるプロジェクト
 
 プロジェクトは画像フォルダ（画像セット）をいくつも持てる。保存先は、既定のフォルダが `out/` 直下、足したフォルダが `out/@<名前>/`。
@@ -152,6 +173,7 @@ uv run inkdeus ctl open <画像名> [--version V] # 開く画像（とバージ�
 uv run inkdeus ctl export                      # ブラウザに PNG 書き出しを指示（保存先が返る）
 uv run inkdeus ctl export-all [--force] [--default-only] [--wait]   # 全画像・全バージョンの書き出し（--status / --abort）
 uv run inkdeus ctl versions / version new|rename|delete   # バージョン（上の節）
+uv run inkdeus ctl paint list / paint clear <対象|all-targets>   # 消しゴム・ペンの一覧と消去（上の節。描くのは利用者）
 ```
 
 値が範囲外・キーの打ち間違いなどは非0終了になり、何も変わらない（`problems` に理由）。
@@ -226,5 +248,6 @@ uv run inkdeus ctl stats --wait                 # 目標に届くまで調整を
   - `areaRatio`: その領域が画像に占める割合
 - `input.<領域>.luminance`: 入力の輝度（0=黒、1=白）の `mean` / `median` / `p10` / `p25` / `p75` / `p90`。`adjusted` は明るさ補正後。
 - `backgroundMode`、`hasMask`、`renderMs`（1回の再描画にかかった時間）。
+- `paint.targets`（消しゴム・ペンで手が入っている対象）と `paint.penUsed`。上の数値は、それらを反映した最終出力に対する物。
 
 数値は画素を間引いて数えた推定値（誤差は 1〜2% ほど）。`hasMask` が `false` の画像は全体が人物扱いで、背景の設定は効かない。
