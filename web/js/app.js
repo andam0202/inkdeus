@@ -6,6 +6,7 @@ import { buildPanel } from './panel.js';
 import { createGallery } from './gallery.js';
 import {
   SCHEMA, normalize, defaultParams, applyStyle, effectiveUnit, effectiveWatermark, STYLES,
+  withoutIds, inheritIds,
 } from './schema.js';
 
 const $ = (id) => document.getElementById(id);
@@ -29,6 +30,8 @@ const state = {
   name: null,           // 表示中の画像名
   version: '',          // 表示中のバージョン（'' = 既定。同じ画像から作る、設定の違う白黒版）
   versionsOK: false,    // サーバがバージョンに対応しているか（古いサーバにつないだときは既定だけで動く）
+  idsOK: false,         // サーバが層の id を知っているか（知らない古いサーバへは、id を除いて保存する）
+  paintOK: false,       // サーバが消しゴム・ペンを保存できるか（できなければメモリ上だけで働く）
   remote: false,        // 表示中の画像がサーバの一覧のものか（ドロップした画像は false）
   params: null,
   rev: null,            // 表示中の設定に対応する設定ファイルの版（未保存の変更があるときは古い）
@@ -417,15 +420,22 @@ function stepHistory(delta) {
 const undo = () => stepHistory(-1);
 const redo = () => stepHistory(1);
 
-/** 任意の JSON を設定として読み込む（警告があれば表示する） */
+/** 層の id だけが違う設定を「同じ」と見なす比較用の文字列 */
+const sig = (params) => JSON.stringify(withoutIds(params));
+
+/**
+ * 任意の JSON を設定として読み込む（警告があれば表示する）。
+ * fresh でなければ、id の書かれていない層は同じ位置にあった層の id を引き継ぐ。
+ * 戻り値の filledIds は「id の無い層に新しい id を振った」（保存し直す必要がある）
+ */
 function loadParams(raw, { fresh = false, save = true } = {}) {
-  const { params, warnings } = normalize(raw);
+  const { params, warnings, filledIds } = normalize(fresh ? raw : inheritIds(raw, state.params));
   state.params = params;
   state.solo = null;
   if (warnings.length) showMessage(`設定の読み込みで気になる点がありました:\n・${warnings.join('\n・')}`, 'info', 20000);
   if (fresh) resetHistory(); else commit(save);
   rebuild();
-  return warnings;
+  return Object.assign(warnings, { filledIds });
 }
 
 function canAutoSave() {
@@ -439,15 +449,18 @@ function scheduleSave() {
   saveTimer = setTimeout(() => { saveTimer = null; saveNow(); }, SAVE_DELAY_MS);
 }
 
-async function saveNow() {
+/** 設定を保存する。idsOnly は「層の id を補っただけ」の保存（見た目は変わらないので、白黒版を「古い」にしない） */
+async function saveNow({ idsOnly = false } = {}) {
   if (!canAutoSave()) return;
   const name = state.name;
   const version = state.version;
   saving = true;
   try {
     const r = await fetch(apiPath('params', name, version), {
-      method: 'PUT', body: JSON.stringify(state.params),
-      headers: { 'Content-Type': 'application/json', 'X-Inkdeus-Client': CLIENT_ID },
+      // 層の id を知らない古いサーバは、id のある設定を外部操作（ctl）で受け付けなくなるので、除いて保存する
+      method: 'PUT', body: JSON.stringify(state.idsOK ? state.params : withoutIds(state.params)),
+      headers: { 'Content-Type': 'application/json', 'X-Inkdeus-Client': CLIENT_ID,
+        ...(idsOnly ? { 'X-Inkdeus-Ids-Only': '1' } : {}) },
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
@@ -515,8 +528,8 @@ function postState() {
 async function onExternalParams(ev) {
   if (folderOf(ev) !== state.folder) return;      // 別の画像フォルダの物（一覧はいまのフォルダの分だけ持っている）
   const version = typeof ev.version === 'string' ? ev.version : '';
-  // 設定が書き換わったので、いまの白黒版はもう最新ではない
-  mark(ev.name, version, { hasParams: ev.rev !== null, exportFresh: false });
+  // 設定が書き換わったので、いまの白黒版はもう最新ではない（層の id を補っただけの保存では、見た目は変わらない）
+  mark(ev.name, version, { hasParams: ev.rev !== null, ...(ev.idsOnly ? {} : { exportFresh: false }) });
   if (ev.source === CLIENT_ID || !state.remote || ev.name !== state.name || version !== state.version) return;
   if (ev.rev === null || ev.rev === state.rev) return;
   const r = await fetch(apiPath('params', ev.name, version), { cache: 'no-store' });
@@ -532,10 +545,11 @@ async function onExternalParams(ev) {
   }
   clearTimeout(saveTimer);        // 手元の未保存の変更より外部の変更を優先する
   saveTimer = null;
-  loadParams(raw, { save: false });
+  const loaded = loadParams(raw, { save: false });
   state.rev = rev;
   setSaveState('外部から更新');
   renderNow();
+  if (loaded.filledIds && state.idsOK) scheduleSave();      // 手で書かれた設定に層の id が無かった。補った id を保存する
 }
 
 function connectEvents() {
@@ -911,14 +925,17 @@ async function openIndex(i, version = '') {
     const saved = rec && rec.hasParams ? await fetch(apiPath('params', item.name, version), { cache: 'no-store' }) : null;
     if (saved && saved.ok) {
       const rev = saved.headers.get('X-Inkdeus-Rev');
-      loadParams(await saved.json(), { fresh: true });
+      const loaded = loadParams(await saved.json(), { fresh: true });
       state.rev = rev;
       // このバージョンを離れたときの履歴が、いまの設定の続きとして使えるなら戻す
       const kept = sameImage ? historyStash.get(version) : null;
-      if (kept && kept.history[kept.hpos] === JSON.stringify(state.params)) {
+      if (kept && sig(JSON.parse(kept.history[kept.hpos])) === sig(state.params)) {
         history = kept.history;
         hpos = kept.hpos;
+        state.params = JSON.parse(history[hpos]);
         rebuild();
+      } else if (loaded.filledIds && state.idsOK) {
+        await saveNow({ idsOnly: true });   // 層の id が入る前に保存された設定。補った id をその場で保存する
       }
       setSaveState('保存済み');
     } else if (version) {
@@ -928,7 +945,7 @@ async function openIndex(i, version = '') {
       resetHistory();
       rebuild();
       // 既定値と違う設定を引き継いだときは、サーバ（と外部の操作）にも分かるようすぐ保存する
-      if (JSON.stringify(state.params) !== JSON.stringify(defaultParams())) await saveNow();
+      if (sig(state.params) !== sig(defaultParams())) await saveNow();
     }
     historyStash.delete(version);
     rememberLast();
@@ -1255,6 +1272,8 @@ async function exportAll({ force = false, defaultOnly = false, allFolders = fals
     showMessage('全画像の書き出しはサーバありのときだけ使えます', 'error');
     return null;
   }
+  // 前回の結果を先に片付ける（準備の間に進み具合を見た相手が、前回の件数を今回の物と取り違えないように）
+  Object.assign(batch, { abort: false, total: 0, done: 0, exported: 0, skipped: 0, failed: 0, errors: [] });
   await flushSave();
   await flushAutoExport();
   await refreshFolders();
@@ -1369,6 +1388,9 @@ async function init() {
   state.server = !!(list && Array.isArray(list.images));
   state.images = state.server ? list.images : [];
   state.project = state.server && config && config.project ? config.project : null;
+  const features = state.server && config && Array.isArray(config.features) ? config.features : [];
+  state.idsOK = features.includes('layerIds');
+  state.paintOK = features.includes('paint');
   showProject();
   state.params = defaultParams();
   try { state.autoExport = localStorage.getItem(AUTO_EXPORT_KEY) !== '0'; } catch { state.autoExport = true; }

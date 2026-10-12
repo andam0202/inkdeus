@@ -11,12 +11,25 @@ import copy
 import functools
 import json
 import math
+import re
+import secrets
 import unicodedata
 from pathlib import Path
 from typing import Any
 
 REGIONS = ("person", "background")
 TONE_KEYS = ("levels", "solid", "layers")
+# 層の id（消しゴムのマスクがどの層の物かを決める名前）。短い乱数文字列で、並べ替えても変わらない。
+# 形は web/schema.json の layerId と同じ
+LAYER_ID_RE = re.compile(r"[a-z0-9]{4,16}")
+_ID_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+
+def new_layer_id(taken: set[str] | None = None) -> str:
+    while True:
+        value = "".join(secrets.choice(_ID_CHARS) for _ in range(8))
+        if taken is None or value not in taken:
+            return value
 
 
 class ValidationError(ValueError):
@@ -79,8 +92,11 @@ def _norm_fields(raw: Any, fields: dict, path: str, problems: list[str],
             for key, f in fields.items()}
 
 
-def _norm_layers(raw: Any, path: str, problems: list[str], fallback: list, present: bool) -> list:
+def _norm_layers(raw: Any, path: str, problems: list[str], fallback: list, present: bool,
+                 taken: set[str] | None = None) -> list:
+    """層の並びを整える。id の無い層には新しい id を振る（taken は、同じ設定の中で既に使われている id）"""
     s = load()
+    taken = set() if taken is None else taken
     layers = raw if present else fallback
     if not isinstance(layers, list):
         problems.append(f"{path}: 配列ではありません")
@@ -88,16 +104,29 @@ def _norm_layers(raw: Any, path: str, problems: list[str], fallback: list, prese
     if len(layers) > s["maxLayers"]:
         problems.append(f"{path}: {len(layers)} 層あります（最大 {s['maxLayers']} 層）")
         layers = layers[: s["maxLayers"]]
-    return [_norm_fields(layer, s["layer"], f"{path}[{i}]", problems) for i, layer in enumerate(layers)]
+    out = []
+    for i, layer in enumerate(layers):
+        fields = _norm_fields(layer, s["layer"], f"{path}[{i}]", problems, ("id",))
+        given = layer.get("id") if isinstance(layer, dict) else None
+        if given is not None and given != "" and not (isinstance(given, str) and LAYER_ID_RE.fullmatch(given)):
+            problems.append(f"{path}[{i}].id: 値 {json.dumps(given, ensure_ascii=False)} は使えません"
+                            f"（英小文字と数字で 4〜16 文字）")
+            given = None
+        if not given or given in taken:               # 無い・重複している（複製された層）ときは振り直す
+            given = new_layer_id(taken)
+        taken.add(given)
+        out.append({"id": given, **fields})
+    return out
 
 
-def _norm_region_tone(src: dict, out: dict, path: str, problems: list[str]) -> None:
+def _norm_region_tone(src: dict, out: dict, path: str, problems: list[str], taken: set[str]) -> None:
     s = load()
     style = s["styles"][s["defaultStyle"]]
     out["levels"] = _norm_fields(src.get("levels"), s["levels"], f"{path}.levels", problems)
     out["solid"] = _norm_fields(src["solid"] if "solid" in src else style["solid"], s["solid"],
                                 f"{path}.solid", problems)
-    out["layers"] = _norm_layers(src.get("layers"), f"{path}.layers", problems, style["layers"], "layers" in src)
+    out["layers"] = _norm_layers(src.get("layers"), f"{path}.layers", problems, style["layers"], "layers" in src,
+                                 taken)
 
 
 def migrate(raw: Any) -> Any:
@@ -151,13 +180,14 @@ def normalize(raw: Any, strict: bool = False) -> tuple[dict, list[str]]:
     for key in regions:
         if key not in REGIONS:
             problems.append(f"未知のキー: regions.{key}")
+    taken: set[str] = set()                        # 層の id は、人物・背景を通して重複させない
     person = _norm_fields(regions.get("person"), {}, "regions.person", problems, TONE_KEYS)
     _norm_region_tone(regions["person"] if isinstance(regions.get("person"), dict) else {},
-                      person, "regions.person", problems)
+                      person, "regions.person", problems, taken)
     background = _norm_fields(regions.get("background"), s["background"], "regions.background",
                               problems, TONE_KEYS)
     _norm_region_tone(regions["background"] if isinstance(regions.get("background"), dict) else {},
-                      background, "regions.background", problems)
+                      background, "regions.background", problems, taken)
     params["regions"] = {"person": person, "background": background}
 
     params["watermark"] = _norm_fields(raw.get("watermark"), sections["watermark"], "watermark", problems)
@@ -169,6 +199,48 @@ def normalize(raw: Any, strict: bool = False) -> tuple[dict, list[str]]:
 
 def default_params() -> dict:
     return normalize({})[0]
+
+
+def _layer_lists(raw: Any):
+    """設定（整える前でもよい）の中の、層の並び（人物・背景）を順に返す"""
+    regions = raw.get("regions") if isinstance(raw, dict) else None
+    for name in REGIONS:
+        region = regions.get(name) if isinstance(regions, dict) else None
+        layers = region.get("layers") if isinstance(region, dict) else None
+        if isinstance(layers, list):
+            yield name, layers
+
+
+def layer_ids(raw: Any) -> set[str]:
+    """設定に含まれる層の id（人物・背景の両方）"""
+    return {layer["id"] for _, layers in _layer_lists(raw) for layer in layers
+            if isinstance(layer, dict) and isinstance(layer.get("id"), str) and layer["id"]}
+
+
+def lacks_layer_ids(raw: Any) -> bool:
+    """id の無い層（層の id が入る前に保存された設定）があるか。層の並びが無い設定も「無い」に数える"""
+    lists = list(_layer_lists(migrate(raw) if isinstance(raw, dict) else raw))
+    if len(lists) < len(REGIONS):
+        return True
+    return any(not (isinstance(layer, dict) and layer.get("id")) for _, layers in lists for layer in layers)
+
+
+def inherit_layer_ids(raw: Any, base: dict) -> Any:
+    """層を丸ごと差し替える変更（JSON Merge Patch の配列）で id が書かれていない層に、
+    同じ位置にあった層の id を引き継がせる（その層の消しゴムのマスクが外れないように）"""
+    out = copy.deepcopy(raw)
+    used = layer_ids(out)
+    old = dict(_layer_lists(base))
+    for name, layers in _layer_lists(out):
+        for i, layer in enumerate(layers):
+            if not isinstance(layer, dict) or layer.get("id"):
+                continue
+            before = old.get(name, [])
+            given = before[i].get("id") if i < len(before) and isinstance(before[i], dict) else None
+            if given and given not in used:
+                layer["id"] = given
+                used.add(given)
+    return out
 
 
 def merge_patch(target: Any, patch: Any) -> Any:
@@ -240,9 +312,12 @@ def apply_style(params: dict, name: str, region: str = "person") -> dict:
     style = s["styles"][key]
     out = copy.deepcopy(params)
 
+    taken = layer_ids(out)
+
     def fill(target: dict) -> None:
+        # 層は入れ替わるので、新しい id を振る（前の層の消しゴムのマスクは引き継がない）
         target["solid"] = {**target["solid"], **copy.deepcopy(style["solid"])}
-        target["layers"] = [_norm_fields(layer, s["layer"], "layer", [], False) for layer in style["layers"]]
+        target["layers"] = _norm_layers(style["layers"], "layer", [], [], True, taken)
 
     if region in ("person", "both"):
         fill(out["regions"]["person"])

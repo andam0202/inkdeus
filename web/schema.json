@@ -4,6 +4,7 @@
   "unitBaseWidth": 1280,
   "unitRange": { "min": 0.1, "max": 16 },
   "watermarkFallbackText": "inkdeus",
+  "layerId": { "pattern": "^[a-z0-9]{4,16}$", "length": 8 },
   "sections": {
     "input": {
       "autoLevel": { "type": "bool", "def": true, "label": "自動レベル補正（1〜99%）" },

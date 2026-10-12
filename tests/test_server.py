@@ -9,6 +9,7 @@ import pytest
 from PIL import Image
 
 import synth
+from conftest import no_ids
 from inkdeus.cli import build_parser
 from inkdeus.server import create_app, read_local_config
 
@@ -139,7 +140,8 @@ def test_static_index(client):
 # ---- 透かしは任意の機能（廃止した所有者モードの指定は受け付けるが何もしない） ----
 
 def test_config_has_no_owner_mode(client):
-    assert client.get("/api/config").get_json() == {"project": None}
+    config = client.get("/api/config").get_json()
+    assert config["project"] is None and set(config) == {"project", "features"}     # 所有者まわりの項目は無い
 
 
 def test_owner_flag_is_accepted_but_ignored(dirs, capsys):
@@ -157,7 +159,7 @@ def test_owner_settings_do_not_change_anything(dirs, tmp_path, monkeypatch):
     """INKDEUS_OWNER や inkdeus.local.toml の owner があっても、既定値も応答も変わらない"""
     _, images, _ = dirs
     before = create_app(images, watch=False).test_client()
-    expected = (before.get("/api/config").get_json(), before.get("/api/params/scene.png?resolve=1").get_json())
+    expected = (before.get("/api/config").get_json(), no_ids(before.get("/api/params/scene.png?resolve=1").get_json()))
     assert expected[1]["params"]["watermark"]["enabled"] is False
     cfg = tmp_path / "inkdeus.local.toml"
     cfg.write_text('owner = true\nprojects_root = "somewhere"\n', encoding="utf-8")
@@ -165,7 +167,7 @@ def test_owner_settings_do_not_change_anything(dirs, tmp_path, monkeypatch):
     monkeypatch.setenv("INKDEUS_OWNER", "1")
     monkeypatch.setattr("inkdeus.server.default_local_config", lambda: cfg)
     after = create_app(images, watch=False).test_client()
-    assert (after.get("/api/config").get_json(), after.get("/api/params/scene.png?resolve=1").get_json()) == expected
+    assert (after.get("/api/config").get_json(), no_ids(after.get("/api/params/scene.png?resolve=1").get_json())) == expected
     cfg.write_text("this is not toml = = =", encoding="utf-8")
     assert read_local_config(cfg) == {}
 

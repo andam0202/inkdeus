@@ -3,7 +3,7 @@
 
 import {
   SECTIONS, LEVEL_FIELDS, SOLID_FIELDS, BACKGROUND_FIELDS, LAYER_FIELDS, STYLES, MAX_LAYERS, UNIT_RANGE,
-  effectiveUnit, newLayer, WATERMARK_FALLBACK_TEXT,
+  effectiveUnit, newLayer, newId, layerIds, WATERMARK_FALLBACK_TEXT,
 } from './schema.js';
 
 const SECTION_LABELS = { input: '入力', lines: '線画', tone: 'トーン（ベタ・層）', watermark: '透かし', output: '出力' };
@@ -183,7 +183,7 @@ function layerCard(ctx, region, layers, layer, index) {
     el('button', { title: '下へ', disabled: index === layers.length - 1,
       onclick: change(() => layers.splice(index + 1, 0, layers.splice(index, 1)[0])) }, '↓'),
     el('button', { title: '複製', disabled: layers.length >= MAX_LAYERS,
-      onclick: change(() => layers.splice(index + 1, 0, { ...layer })) }, '複製'),
+      onclick: change(() => layers.splice(index + 1, 0, { ...layer, id: newId(layerIds(ctx.state.params)) })) }, '複製'),
     el('button', { title: '削除', onclick: change(() => layers.splice(index, 1)) }, '削除'));
   const body = el('div', { class: 'body' },
     Object.entries(LAYER_FIELDS)
@@ -215,7 +215,7 @@ function regionTone(ctx, region, target) {
       layers.push(newLayer(last ? {
         threshold: Math.max(0.05, Number((last.threshold * 0.75).toFixed(3))),
         angle: (last.angle + 45) % 180, spacing: last.spacing, width: last.width,
-      } : { threshold: 0.6 }));
+      } : { threshold: 0.6 }, layerIds(ctx.state.params)));
       ctx.setSolo(null, false);
       ctx.live(); ctx.commit(); ctx.rebuild();
     },
@@ -263,7 +263,8 @@ function toneSection(ctx) {
             // いまの人物の設定を写してから切り離す（切り離した瞬間に見た目が変わらないように）
             bg.levels = { ...person.levels };
             bg.solid = { ...person.solid };
-            bg.layers = person.layers.map((l) => ({ ...l }));
+            const taken = layerIds(ctx.state.params);
+            bg.layers = person.layers.map((l) => { const id = newId(taken); taken.add(id); return { ...l, id }; });
             bg.linked = false;
             ctx.live(); ctx.commit(); ctx.rebuild();
           },

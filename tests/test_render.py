@@ -15,7 +15,7 @@ import pytest
 from PIL import Image, ImageFilter
 
 import synth
-from conftest import BLANK, deep_merge, ink, layer, open_image, open_page, pixels, render
+from conftest import BLANK, deep_merge, ink, layer, no_ids, open_image, open_page, pixels, render
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
@@ -334,7 +334,7 @@ def test_unknown_keys_are_reported_and_missing_keys_filled(page):
     params = page.evaluate("() => window.inkdeus.getParams()")
     defaults = page.evaluate("() => window.inkdeus.defaults()")
     assert params["lines"]["sigma"] == 1.0 and params["lines"]["phi"] == defaults["lines"]["phi"]
-    assert params["regions"]["background"] == defaults["regions"]["background"]
+    assert no_ids(params["regions"]["background"]) == no_ids(defaults["regions"]["background"])
     person = params["regions"]["person"]
     assert person["layers"][0]["type"] == "hatch" and person["layers"][0]["threshold"] == 0.4
     assert person["solid"]["threshold"] == 1
@@ -531,7 +531,7 @@ def test_layer_list_editing(page):
     first = page.locator('.layer[data-layer="0"]')
     first.get_by_title("複製").click()
     layers = page.evaluate("() => window.inkdeus.getParams().regions.person.layers")
-    assert len(layers) == 6 and layers[0] == layers[1]
+    assert len(layers) == 6 and no_ids(layers[0]) == no_ids(layers[1]) and layers[0]["id"] != layers[1]["id"]
     page.locator('.layer[data-layer="0"]').get_by_title("下へ").click()
     page.locator('.layer[data-layer="5"]').get_by_title("削除").click()
     assert page.evaluate(count) == 5

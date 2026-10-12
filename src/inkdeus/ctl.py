@@ -221,6 +221,22 @@ def cmd_version(c: Client, args) -> dict:
     return c.call("DELETE", _path("versions", name, args.version_name, folder))
 
 
+def _paint_path(name: str, version: str, folder: str, target: str = "") -> str:
+    path = _path("paint", name, version, folder)
+    if not target:
+        return path
+    base, sep, query = path.partition("?")
+    return f"{base}/{quote(target, safe='')}{sep}{query}"
+
+
+def cmd_paint(c: Client, args) -> dict:
+    """消しゴム・ペン（人が画面で描いた物）の一覧と消去。描くのは人が画面で行う"""
+    name, version, folder = c.target(args)
+    if args.action == "list":
+        return c.call("GET", _paint_path(name, version, folder))
+    return c.call("DELETE", _paint_path(name, version, folder, args.target))
+
+
 def cmd_folders(c: Client, args) -> dict:
     return c.call("GET", "/api/folders")
 
@@ -327,6 +343,13 @@ def build_parser() -> argparse.ArgumentParser:
     q = with_name(vsub.add_parser("delete", parents=[target], help="バージョンを削除する（設定と PNG を消す）"),
                   version=False)
     q.add_argument("version_name", metavar="V")
+    p = add("paint", cmd_paint, "消しゴム・ペン（人が画面で描いた物）の一覧と消去")
+    psub = p.add_subparsers(dest="action", required=True, metavar="<list|clear>")
+    with_name(psub.add_parser("list", parents=[target], help="保存されている対象（どの層・ベタ・線画・すべて・ペン）の一覧"))
+    q = with_name(psub.add_parser("clear", parents=[target],
+                                  help="対象の消しゴム（またはペンで描いた物）を消す。開いている画面にも反映される"))
+    q.add_argument("target", metavar="<対象|all-targets>",
+                   help="layer-<層の id> / solid-person / solid-background / lines / all / pen。all-targets で全部")
     p = add("export-all", cmd_export_all,
             "ブラウザに全画像・全バージョンの書き出しを指示する。各画像は保存済みの設定で、設定の無い画像は"
             "いま画面に出ている設定で書き出す。書き出し済みで設定が変わっていない物は飛ばす")

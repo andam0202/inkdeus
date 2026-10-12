@@ -11,6 +11,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import struct
 import threading
 import time
@@ -41,6 +42,14 @@ MANGA_AUTOSAVE = "autosave"                            # 自動保存用の予�
 MANGA_SUFFIX = ".lz4"
 VERSION_SEP = "@"                                      # <stem>@<バージョン>.png / .inkdeus.json
 VERSION_RE = re.compile(r"[\w\-]{1,32}")               # バージョン名（英数・かな漢字・_ -。@・空白・パス区切りは不可）
+# 消しゴム・ペン（人が画面で描いた物）。<stem>[@<バージョン>].paint/<対象>.png と目録 index.json
+PAINT_SUFFIX = ".paint"
+PAINT_INDEX = "index.json"
+PAINT_FORMAT = 1
+PAINT_TARGET_RE = re.compile(r"layer-[a-z0-9]{4,16}|solid-person|solid-background|lines|all|pen")
+PAINT_ALL = "all-targets"                              # 削除でだけ使える「全部の対象」
+MAX_PAINT_BYTES = 1 << 28
+FEATURES = ["layerIds", "paint"]                       # 画面が、サーバにある機能を確かめるための名前
 
 
 class VersionError(ValueError):
@@ -154,6 +163,49 @@ class Library:
     def export_path(self, entry: Entry, version: str = "") -> Path:
         return self.out_dir / f"{self._base(entry, version)}.png"
 
+    def paint_dir(self, entry: Entry, version: str = "") -> Path:
+        """消しゴム・ペンの置き場所（バージョンごと）"""
+        return self.out_dir / f"{self._base(entry, version)}{PAINT_SUFFIX}"
+
+    def paint_rows(self, entry: Entry, version: str = "") -> list[dict]:
+        """保存されている対象の一覧（実際にあるファイルから作る）"""
+        rows = []
+        try:
+            with os.scandir(self.paint_dir(entry, version)) as it:
+                items = sorted(it, key=lambda i: i.name)
+        except OSError:
+            return rows
+        for item in items:
+            target = item.name[:-4] if item.name.endswith(".png") else ""
+            if PAINT_TARGET_RE.fullmatch(target) is None:
+                continue
+            try:
+                if not item.is_file():
+                    continue
+                st = item.stat()
+            except OSError:
+                continue
+            rows.append({"target": target, "file": item.name, "bytes": st.st_size, "mtime": st.st_mtime,
+                         "stamp": st.st_mtime_ns // 1_000_000})
+        return rows
+
+    def write_paint_index(self, entry: Entry, version: str = "") -> list[dict]:
+        """目録（index.json）を書き直す。対象が1つも無くなったらフォルダごと片付ける"""
+        folder = self.paint_dir(entry, version)
+        rows = self.paint_rows(entry, version)
+        if not rows:
+            shutil.rmtree(folder, ignore_errors=True)
+            return rows
+        data = {"version": PAINT_FORMAT, "targets": [{k: r[k] for k in ("target", "file", "bytes", "mtime")}
+                                                     for r in rows]}
+        _atomic_write(folder / PAINT_INDEX, (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+        return rows
+
+    def paint_stamp(self, entry: Entry, version: str = "") -> int | None:
+        """消しゴム・ペンが最後に変わった時刻（ns）。無ければ None。
+        対象を消したときも分かるよう、フォルダ自身の時刻も見る（消すと目録が書き直される）"""
+        return _newest(self.paint_dir(entry, version))
+
     def check_version(self, entry: Entry, version: str, entries: dict[str, Entry] | None = None) -> str:
         """バージョン名を確かめる（"" は既定）。使えなければ VersionError"""
         if version == "":
@@ -192,15 +244,22 @@ class Library:
                 kind, stem = "params", fname[: -len(PARAMS_SUFFIX)]
             elif fname.endswith(".png"):
                 kind, stem = "export", fname[:-4]
+            elif fname.endswith(PAINT_SUFFIX):
+                kind, stem = "paint", fname[: -len(PAINT_SUFFIX)]
             else:
                 continue
             found = self.resolve_stem(stem, entries)
             if found is None:
                 continue
             try:
-                if not item.is_file():
+                if kind == "paint":
+                    st = _newest(Path(item.path)) if item.is_dir() else None
+                    if st is None:
+                        continue
+                elif not item.is_file():
                     continue
-                st = item.stat()
+                else:
+                    st = item.stat()
             except OSError:
                 continue
             index[found[0].name].setdefault(found[1], {})[kind] = st
@@ -220,9 +279,10 @@ class Library:
         for name in ["", *sorted(v for v in found if v)]:
             rec = found.get(name, {})
             params, export = rec.get("params"), rec.get("export")
+            paint = [rec["paint"]] if rec.get("paint") else []        # 消しゴム・ペンが変わっても「古い」になる
             # 設定がまだ保存されていない物は「新しい」とは見なさない
             fresh = (export is not None and params is not None and bool(inputs)
-                     and export.st_mtime_ns >= max(params.st_mtime_ns, *inputs))
+                     and export.st_mtime_ns >= max(params.st_mtime_ns, *inputs, *paint))
             stamps = [st.st_mtime for st in (params, export) if st is not None]
             rows.append({
                 "name": name, "hasParams": params is not None, "hasExport": export is not None,
@@ -251,7 +311,21 @@ class Library:
         mask = self.mask_path(entry)
         if mask is not None:
             inputs.append(mask.stat().st_mtime_ns)
+        paint = self.paint_stamp(entry, version)
+        if paint is not None:
+            inputs.append(paint)
         return True, done >= max(inputs)
+
+
+def _newest(folder: Path) -> int | None:
+    """フォルダと、その直下のファイルのうち、いちばん新しい更新時刻（ns）。フォルダが無ければ None"""
+    try:
+        stamps = [folder.stat().st_mtime_ns]
+        with os.scandir(folder) as it:
+            stamps += [i.stat().st_mtime_ns for i in it if i.is_file()]
+    except OSError:
+        return None
+    return max(stamps)
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -334,8 +408,9 @@ class Session:
             return None, None
         return data, rev_of(data)
 
-    def resolved(self, entry: Entry, version: str = "") -> dict:
-        """いまの設定（ファイルが無ければ既定値）を整えて返す"""
+    def resolved(self, entry: Entry, version: str = "", persist: bool = True) -> dict:
+        """いまの設定（ファイルが無ければ既定値）を整えて返す。
+        persist: 層の id が無い設定ファイルだったら、補った id をその場で保存する（続けて書き込むなら不要）"""
         data, rev = self.read_params(entry, version)
         raw = None
         problems: list[str] = []
@@ -345,6 +420,9 @@ class Session:
             except (UnicodeDecodeError, ValueError):
                 problems.append("設定ファイルが JSON として読めないため既定値を使いました")
         params, warns = schema.normalize(raw)
+        if persist and isinstance(raw, dict) and schema.lacks_layer_ids(raw):
+            # 層の id が入る前に保存された設定。補った id をその場で保存する（読むたびに違う id にならないように）
+            rev = self.write_params(entry, params, None, version, keep_mtime=True)
         return {"name": entry.name, "version": version, "rev": rev, "exists": data is not None,
                 "params": params, "warnings": problems + warns}
 
@@ -362,17 +440,40 @@ class Session:
             self._stamps[path.name] = (st.st_mtime_ns, st.st_size)
             self._owners[path.name] = (entry.name, version)
 
-    def write_params(self, entry: Entry, params: dict, source: str | None, version: str = "") -> str:
-        """設定を書き込み、ブラウザへ知らせる。source は書いた本人（ブラウザの ID）で、外部からなら None"""
+    def write_params(self, entry: Entry, params: dict, source: str | None, version: str = "",
+                     keep_mtime: bool = False) -> str:
+        """設定を書き込み、ブラウザへ知らせる。source は書いた本人（ブラウザの ID）で、外部からなら None。
+        keep_mtime: 層の id を補うだけの保存。見た目は変わらないので、ファイルの更新時刻を保つ
+        （書き出し済みの白黒版が「古い」扱いにならないように）"""
         data = (json.dumps(params, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         path = self.lib.params_path(entry, version)
         with self.lock:
+            try:
+                before = path.stat() if keep_mtime else None
+            except OSError:
+                before = None
             _atomic_write(path, data)
+            if before is not None:
+                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
             rev = rev_of(data)
             self.remember(path, entry, version, rev)
+            if source is None:
+                self.prune_paint(entry, params, version)
         self.hub.publish({"type": "params", "folder": self.folder, "name": entry.name, "version": version,
-                          "rev": rev, "source": source})
+                          "rev": rev, "source": source, **({"idsOnly": True} if keep_mtime else {})})
         return rev
+
+    def prune_paint(self, entry: Entry, params: dict, version: str = "") -> list[str]:
+        """設定から無くなった層の消しゴムのマスクを片付ける（外部からの変更で層が入れ替わったとき）。
+        画面からの変更では、画面が自分で片付ける（取り消しで戻せるように、画面はメモリに持っている）"""
+        keep = {f"layer-{i}" for i in schema.layer_ids(params)}
+        gone = [r for r in self.lib.paint_rows(entry, version)
+                if r["target"].startswith("layer-") and r["target"] not in keep]
+        for row in gone:
+            (self.lib.paint_dir(entry, version) / row["file"]).unlink(missing_ok=True)
+        if gone:
+            self.lib.write_paint_index(entry, version)
+        return [r["target"] for r in gone]
 
     # ---- 設定ファイルの外部変更の監視 ----
 
@@ -621,7 +722,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
 
     @app.get("/api/config")
     def api_config():
-        return jsonify({"project": project})
+        return jsonify({"project": project, "features": FEATURES})
 
     @app.get("/api/manga/status")
     def api_manga_status():
@@ -901,12 +1002,13 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         body = json_body()
         if request.method == "PUT":
             # ブラウザ自身の保存（ブラウザ側で整えてあるのでそのまま書く）
-            rev = fs.write_params(entry, body, request.headers.get("X-Inkdeus-Client"), version)
+            rev = fs.write_params(entry, body, request.headers.get("X-Inkdeus-Client"), version,
+                                  keep_mtime=request.headers.get("X-Inkdeus-Ids-Only") == "1")
             return jsonify({"path": str(lib.params_path(entry, version)), "rev": rev, "version": version})
         # PATCH: 外部からの部分更新（JSON Merge Patch）。検証に通らなければ何も書かない
-        base = fs.resolved(entry, version)["params"]
+        base = fs.resolved(entry, version, persist=False)["params"]
         try:
-            params, _ = schema.normalize(schema.merge_patch(base, body), strict=True)
+            params, _ = schema.normalize(schema.inherit_layer_ids(schema.merge_patch(base, body), base), strict=True)
         except schema.ValidationError as e:
             return fail(e.problems)
         rev = fs.write_params(entry, params, None, version)
@@ -920,7 +1022,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         body = json_body()
         if not isinstance(body.get("key"), str) or "value" not in body:
             return fail(["key と value が必要です"])
-        base = fs.resolved(entry, version)["params"]
+        base = fs.resolved(entry, version, persist=False)["params"]
         try:
             params, _ = schema.normalize(schema.set_path(base, body["key"], body["value"]),
                                          strict=True)
@@ -935,7 +1037,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         entry = lib.get(name)
         version = ver_arg(lib, entry)
         body = json_body()
-        base = fs.resolved(entry, version)["params"]
+        base = fs.resolved(entry, version, persist=False)["params"]
         try:
             style = schema.resolve_style(str(body.get("style", "")))
             params = schema.apply_style(base, str(body.get("style", "")), str(body.get("region", "person")))
@@ -982,6 +1084,59 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         entry = lib.get(name)
         return jsonify(fs.exports.get((entry.name, ver_arg(lib, entry)), {"seq": 0}))
 
+    # ---- 消しゴム・ペン（人が画面で描いた物。対象ごとの PNG をそのまま預かる）----
+
+    def paint_listing(folder: str, lib: Library, entry: Entry, version: str) -> dict:
+        return {"folder": folder, "name": entry.name, "version": version, "format": PAINT_FORMAT,
+                "dir": str(lib.paint_dir(entry, version)), "targets": lib.paint_rows(entry, version)}
+
+    def paint_changed(folder: str, entry: Entry, version: str, action: str, targets: list[str]) -> None:
+        session.hub.publish({"type": "paint", "action": action, "folder": folder, "name": entry.name,
+                             "version": version, "targets": targets,
+                             "source": request.headers.get("X-Inkdeus-Client")})
+
+    @app.get("/api/paint/<path:name>")
+    def api_paint_index(name: str):
+        folder, lib, _fs = pick()
+        entry = lib.get(name)
+        return jsonify(paint_listing(folder, lib, entry, ver_arg(lib, entry)))
+
+    @app.route("/api/paint/<path:name>/<target>", methods=["GET", "PUT", "DELETE"])
+    def api_paint(name: str, target: str):
+        folder, lib, fs = pick()
+        entry = lib.get(name)
+        version = ver_arg(lib, entry)
+        everything = request.method == "DELETE" and target == PAINT_ALL
+        if not everything and PAINT_TARGET_RE.fullmatch(target) is None:
+            abort(400, description="対象は layer-<層の id> / solid-person / solid-background / lines / all / pen のどれかです")
+        path = lib.paint_dir(entry, version) / f"{target}.png"
+        if request.method == "GET":
+            if not path.is_file():
+                abort(404)
+            return send_file(path, mimetype="image/png")
+        if request.method == "PUT":
+            data = request.get_data(cache=False)
+            if len(data) > MAX_PAINT_BYTES:
+                abort(413)
+            if not data.startswith(PNG_SIGNATURE):
+                abort(400, description="PNG ではありません")
+            with fs.lock:
+                _atomic_write(path, data)
+                lib.write_paint_index(entry, version)
+            paint_changed(folder, entry, version, "put", [target])
+            st = path.stat()
+            return jsonify({"target": target, "path": str(path), "bytes": len(data), "mtime": st.st_mtime,
+                            "stamp": st.st_mtime_ns // 1_000_000})
+        with fs.lock:
+            gone = [r for r in lib.paint_rows(entry, version) if everything or r["target"] == target]
+            for row in gone:
+                (lib.paint_dir(entry, version) / row["file"]).unlink(missing_ok=True)
+            if gone:
+                lib.write_paint_index(entry, version)
+        if gone:
+            paint_changed(folder, entry, version, "delete", [r["target"] for r in gone])
+        return jsonify({**paint_listing(folder, lib, entry, version), "deleted": [r["target"] for r in gone]})
+
     # ---- バージョン（同じ元画像から作る、設定の違う白黒版）----
 
     def version_listing(folder: str, lib: Library, entry: Entry) -> dict:
@@ -1017,7 +1172,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
                 return jsonify({"error": f"バージョン「{version}」は既にあります"}), 409
             if not lib.has_version(entry, source):
                 abort(404)
-            params = fs.resolved(entry, source)["params"]
+            params = fs.resolved(entry, source, persist=False)["params"]
             rev = fs.write_params(entry, params, None, version)
             copied = False
             if body.get("copyExport") is True:
@@ -1026,6 +1181,10 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
                     copied = True
                 except OSError:
                     pass                                    # 複製元がまだ書き出されていない
+            # 消しゴム・ペンも写す（層の id は設定ごと複製されているので、そのまま対応する）
+            shutil.rmtree(lib.paint_dir(entry, version), ignore_errors=True)
+            if lib.paint_dir(entry, source).is_dir():
+                shutil.copytree(lib.paint_dir(entry, source), lib.paint_dir(entry, version))
             announce(folder, lib, entry, "create", version, copyFrom=source)
             return jsonify({**version_listing(folder, lib, entry), "version": version, "copyFrom": source, "rev": rev,
                             "copiedExport": copied, "file": lib.export_path(entry, version).name})
@@ -1043,6 +1202,9 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
                     src, dst = getter(entry, version), getter(entry, target)
                     if src.is_file():
                         os.replace(src, dst)
+                shutil.rmtree(lib.paint_dir(entry, target), ignore_errors=True)
+                if lib.paint_dir(entry, version).is_dir():
+                    os.replace(lib.paint_dir(entry, version), lib.paint_dir(entry, target))
                 old, new = lib.params_path(entry, version), lib.params_path(entry, target)
                 rev = fs.revs.get(old.name)
                 fs.remember(old, entry, version, None)
@@ -1066,6 +1228,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         with fs.lock:
             for path in (lib.params_path(entry, version), lib.export_path(entry, version)):
                 path.unlink(missing_ok=True)
+            shutil.rmtree(lib.paint_dir(entry, version), ignore_errors=True)
             fs.remember(lib.params_path(entry, version), entry, version, None)
             for table in (fs.stats, fs.exports):
                 table.pop((entry.name, version), None)

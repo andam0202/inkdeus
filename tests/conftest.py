@@ -168,6 +168,15 @@ BLANK = {
 }
 
 
+def no_ids(value):
+    """層の id（乱数）を除いた写し。設定どうしを「id 以外が同じか」で比べるときに使う"""
+    if isinstance(value, dict):
+        return {k: no_ids(v) for k, v in value.items() if k != "id"}
+    if isinstance(value, list):
+        return [no_ids(v) for v in value]
+    return value
+
+
 def layer(**kw) -> dict:
     base = {"type": "hatch", "enabled": True, "threshold": 0.5, "soft": 0.0, "angle": 45,
             "spacing": 2.0, "width": 0.5, "widthByDarkness": 0.0, "opacity": 1.0, "phase": 0.0}

@@ -19,6 +19,34 @@ export const REGIONS = ['person', 'background'];
 const isObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
 const clone = (v) => JSON.parse(JSON.stringify(v));
 
+// 層の id（消しゴムのマスクがどの層の物かを決める名前）。短い乱数文字列で、並べ替えても変わらない
+const LAYER_ID_RE = /^[a-z0-9]{4,16}$/;
+const ID_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789';
+
+export function newId(taken = null) {
+  for (;;) {
+    let id = '';
+    for (let i = 0; i < 8; i++) id += ID_CHARS[Math.floor(Math.random() * ID_CHARS.length)];
+    if (!taken || !taken.has(id)) return id;
+  }
+}
+
+/** 設定に含まれる層の id（人物・背景の両方） */
+export function layerIds(params) {
+  const out = new Set();
+  for (const r of REGIONS) {
+    for (const l of (params && params.regions && params.regions[r] && params.regions[r].layers) || []) {
+      if (l && l.id) out.add(l.id);
+    }
+  }
+  return out;
+}
+
+/** 層の id を除いた設定（id だけが違う設定を「同じ」と見なすための比較用、と、id を知らない古いサーバへの保存用） */
+export function withoutIds(params) {
+  return JSON.parse(JSON.stringify(params, (key, value) => (key === 'id' ? undefined : value)));
+}
+
 function normValue(v, f, path, problems) {
   const def = f.def;
   if (v === undefined) return def;
@@ -61,7 +89,7 @@ function normFields(raw, fields, path, problems, extra = []) {
   return out;
 }
 
-function normLayers(raw, path, problems, fallback) {
+function normLayers(raw, path, problems, fallback, ids) {
   let layers = raw === undefined ? fallback : raw;
   if (!Array.isArray(layers)) {
     problems.push(`${path}: 配列ではないため既定値にしました`);
@@ -71,15 +99,28 @@ function normLayers(raw, path, problems, fallback) {
     problems.push(`${path}: ${layers.length} 層あります。先頭の ${MAX_LAYERS} 層だけ使います`);
     layers = layers.slice(0, MAX_LAYERS);
   }
-  return layers.map((l, i) => normFields(l, LAYER_FIELDS, `${path}[${i}]`, problems));
+  return layers.map((l, i) => {
+    const fields = normFields(l, LAYER_FIELDS, `${path}[${i}]`, problems, ['id']);
+    let id = isObject(l) ? l.id : undefined;
+    if (id !== undefined && id !== null && id !== '' && !(typeof id === 'string' && LAYER_ID_RE.test(id))) {
+      problems.push(`${path}[${i}].id: 値 ${JSON.stringify(id)} は使えないため振り直しました`);
+      id = undefined;
+    }
+    if (!id || ids.taken.has(id)) {                 // 無い・重複している（複製された層）ときは振り直す
+      id = newId(ids.taken);
+      ids.filled = true;
+    }
+    ids.taken.add(id);
+    return { id, ...fields };
+  });
 }
 
 /** 領域（人物 / 背景）に共通の levels・solid・layers を out に足す */
-function normRegionTone(src, out, path, problems) {
+function normRegionTone(src, out, path, problems, ids) {
   const style = STYLES[SCHEMA.defaultStyle];
   out.levels = normFields(src.levels, LEVEL_FIELDS, `${path}.levels`, problems);
   out.solid = normFields(src.solid === undefined ? style.solid : src.solid, SOLID_FIELDS, `${path}.solid`, problems);
-  out.layers = normLayers(src.layers, `${path}.layers`, problems, style.layers);
+  out.layers = normLayers(src.layers, `${path}.layers`, problems, style.layers, ids);
 }
 
 /** 旧形式（version 1: トップレベルに solid / layers / background）を領域別の形へ移す */
@@ -135,23 +176,46 @@ export function normalize(input) {
     if (!REGIONS.includes(key)) warnings.push(`未知のキー: regions.${key}`);
   }
   const tone = ['levels', 'solid', 'layers'];
+  const ids = { taken: new Set(), filled: false };   // 層の id は、人物・背景を通して重複させない
   const personSrc = normFields(regions.person, {}, 'regions.person', warnings, tone);
-  normRegionTone(isObject(regions.person) ? regions.person : {}, personSrc, 'regions.person', warnings);
+  normRegionTone(isObject(regions.person) ? regions.person : {}, personSrc, 'regions.person', warnings, ids);
   const bg = normFields(regions.background, BACKGROUND_FIELDS, 'regions.background', warnings, tone);
-  normRegionTone(isObject(regions.background) ? regions.background : {}, bg, 'regions.background', warnings);
+  normRegionTone(isObject(regions.background) ? regions.background : {}, bg, 'regions.background', warnings, ids);
   params.regions = { person: personSrc, background: bg };
 
   params.watermark = normFields(raw.watermark, SECTIONS.watermark, 'watermark', warnings);
   params.output = normFields(raw.output, SECTIONS.output, 'output', warnings);
-  return { params, warnings };
+  // filledIds: id の無い層に新しい id を振った（層の id が入る前に保存された設定を読んだ）
+  return { params, warnings, filledIds: ids.filled };
 }
 
 export function defaultParams() {
   return normalize({}).params;
 }
 
-export function newLayer(overrides = {}) {
-  return normFields(overrides, LAYER_FIELDS, 'layer', []);
+/** 新しい層（新しい id つき）。taken は、その設定で既に使われている id */
+export function newLayer(overrides = {}, taken = null) {
+  return { id: newId(taken), ...normFields(overrides, LAYER_FIELDS, 'layer', [], ['id']) };
+}
+
+/**
+ * id の書かれていない層に、同じ位置にあった層の id を引き継がせる
+ * （層を丸ごと書き直した設定を読み込んでも、その層の消しゴムのマスクが外れないように）
+ */
+export function inheritIds(raw, base) {
+  if (!isObject(raw) || !isObject(raw.regions) || !base) return raw;
+  const out = clone(raw);
+  const used = layerIds(out);
+  for (const r of REGIONS) {
+    const layers = isObject(out.regions[r]) ? out.regions[r].layers : null;
+    const before = (base.regions && base.regions[r] && base.regions[r].layers) || [];
+    if (!Array.isArray(layers)) continue;
+    layers.forEach((l, i) => {
+      const id = before[i] && before[i].id;
+      if (isObject(l) && !l.id && id && !used.has(id)) { l.id = id; used.add(id); }
+    });
+  }
+  return out;
 }
 
 const styleKeyOf = (s) => String(s).normalize('NFKC').toLowerCase().replace(/[\s_]/g, '');
@@ -175,9 +239,11 @@ export function applyStyle(params, name, region = 'person') {
   if (!key) throw new Error(`スタイルが見つかりません: ${name}`);
   const style = STYLES[key];
   const next = clone(params);
+  const taken = layerIds(next);
   const fill = (target) => {
+    // 層は入れ替わるので、新しい id を振る（前の層の消しゴムのマスクは引き継がない）
     target.solid = { ...target.solid, ...clone(style.solid) };
-    target.layers = style.layers.map((l) => newLayer(l));
+    target.layers = style.layers.map((l) => { const made = newLayer(l, taken); taken.add(made.id); return made; });
   };
   if (region === 'person' || region === 'both') fill(next.regions.person);
   if (region === 'background' || region === 'both') {

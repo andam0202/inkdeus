@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 import synth
-from conftest import BLANK, deep_merge, ink, layer, make_images, open_image, open_page, pixels, render, serve
+from conftest import BLANK, deep_merge, ink, layer, make_images, no_ids, open_image, open_page, pixels, render, serve
 from inkdeus import cli
 from inkdeus.server import create_app
 
@@ -293,7 +293,7 @@ def test_region_tabs_in_the_panel(live):
     regions = page.evaluate(get)
     assert regions["background"]["linked"] is False
     assert page.evaluate(tab_names) == ["人物", "背景"] and page.locator("#bgLinkedNote").count() == 0
-    assert regions["background"]["layers"] == regions["person"]["layers"]      # 人物の設定を写して切り離す
+    assert no_ids(regions["background"]["layers"]) == no_ids(regions["person"]["layers"])      # 人物の設定を写して切り離す
     page.locator("#selPreset").select_option("hatch1")           # 背景タブのスタイルは背景に当たる
     regions = page.evaluate(get)
     assert len(regions["background"]["layers"]) == 1 and len(regions["person"]["layers"]) == 2
