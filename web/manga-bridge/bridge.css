@@ -180,3 +180,9 @@ html.ikb-resizing, html.ikb-resizing * { cursor: ew-resize !important; user-sele
 /* ローカルフォントの状態 */
 .ikb-font-row > .ikb-font-info { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ikb-font-info[data-kind="error"] { color: #ffb4ac; }
+
+/* 元画像・白黒のタブで見る画像フォルダの切り替え */
+.ikb-folder-row { margin: 0; color: var(--ikb-dim); }
+.ikb-folder-row[hidden] { display: none; }
+.ikb-folder-row > span { flex: none; }
+.ikb-folder-row > select { flex: 1; min-width: 0; }

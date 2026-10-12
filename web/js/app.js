@@ -22,7 +22,9 @@ const ZOOM_MAX = 32;
 
 const state = {
   server: false,        // サーバの API が使えるか
-  images: [],           // サーバの画像一覧
+  images: [],           // サーバの画像一覧（いま開いている画像フォルダの物）
+  folder: 'default',    // いま開いている画像フォルダ（'default' = 既定。プロジェクトは複数の画像フォルダを持てる）
+  folders: [],          // 画像フォルダの一覧 [{name, label, counts}]（古いサーバ・1つだけのときは切り替えを出さない）
   index: -1,
   name: null,           // 表示中の画像名
   version: '',          // 表示中のバージョン（'' = 既定。同じ画像から作る、設定の違う白黒版）
@@ -38,6 +40,7 @@ const state = {
   autoExport: true,     // 変更を自動で書き出す（漫画の構成の画面へ反映するため）
   batchForce: false,    // 一括書き出しで、書き出し済みの画像も作り直す
   batchDefaultOnly: false,   // 一括書き出しで、既定のバージョンだけを書き出す
+  batchAllFolders: false,    // 一括書き出しで、すべての画像フォルダを書き出す（既定は、いまのフォルダ）
   lastBatch: '',        // 直近の一括書き出しの結果
   view: { zoom: 1, cx: 0, cy: 0 },
   compare: false,
@@ -104,8 +107,35 @@ async function getJSON(url) {
   }
 }
 
-const apiPath = (kind, name, version = '') => `api/${kind}/${encodeURIComponent(name)}`
-  + (version ? `?version=${encodeURIComponent(version)}` : '');
+const DEFAULT_FOLDER = 'default';
+const FOLDER_KEY = 'inkdeus.folder';            // 最後に開いていた画像フォルダ
+const FOLDER_LAST_KEY = 'inkdeus.folderLast';   // 画像フォルダ → 最後に開いていた画像名
+/** クエリ文字列（version と folder。既定の物は付けない＝これまでの URL のまま） */
+function queryOf(version = '', folder = state.folder, extra = '') {
+  const parts = [];
+  if (version) parts.push(`version=${encodeURIComponent(version)}`);
+  if (folder && folder !== DEFAULT_FOLDER) parts.push(`folder=${encodeURIComponent(folder)}`);
+  if (extra) parts.push(extra);
+  return parts.length ? `?${parts.join('&')}` : '';
+}
+const apiPath = (kind, name, version = '', folder = state.folder) => `api/${kind}/${encodeURIComponent(name)}`
+  + queryOf(version, folder);
+const folderOf = (ev) => (typeof ev.folder === 'string' && ev.folder ? ev.folder : DEFAULT_FOLDER);
+const multiFolder = () => state.folders.length > 1;
+const folderLabel = (name) => (state.folders.find((f) => f.name === name) || {}).label || name;
+
+function readLast() {
+  try { return JSON.parse(localStorage.getItem(FOLDER_LAST_KEY) || '{}') || {}; } catch { return {}; }
+}
+function rememberLast() {
+  if (!state.remote || !state.name) return;
+  try {
+    const last = readLast();
+    last[state.folder] = state.name;
+    localStorage.setItem(FOLDER_LAST_KEY, JSON.stringify(last));
+    localStorage.setItem(FOLDER_KEY, state.folder);
+  } catch { /* 覚えられなくても動く */ }
+}
 
 // ---- バージョンの記録（state.images[].versions。画像単位の項目は既定のバージョンの物） ----
 
@@ -337,7 +367,9 @@ const ctx = {
   },
   exportNow: () => exportNow(),
   setAutoExport: (on) => setAutoExport(on),
-  exportAll: () => exportAll({ force: state.batchForce, defaultOnly: state.batchDefaultOnly }),
+  exportAll: () => exportAll({ force: state.batchForce, defaultOnly: state.batchDefaultOnly,
+    allFolders: state.batchAllFolders }),
+  setBatchAllFolders: (on) => { state.batchAllFolders = !!on; },
   setBatchForce: (on) => { state.batchForce = !!on; },
   setBatchDefaultOnly: (on) => { state.batchDefaultOnly = !!on; },
   saveJSON: () => download(new Blob([JSON.stringify(state.params, null, 2) + '\n'], { type: 'application/json' }),
@@ -475,12 +507,13 @@ function postState() {
   fetch('api/state', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ current: state.remote ? state.name : null, version: state.remote ? state.version : '',
-      client: CLIENT_ID }),
+      folder: state.folder, client: CLIENT_ID }),
   }).catch(() => {});
 }
 
 /** 設定ファイルが外から書き換えられたときに読み直す（取り消し履歴にも1件として積む） */
 async function onExternalParams(ev) {
+  if (folderOf(ev) !== state.folder) return;      // 別の画像フォルダの物（一覧はいまのフォルダの分だけ持っている）
   const version = typeof ev.version === 'string' ? ev.version : '';
   // 設定が書き換わったので、いまの白黒版はもう最新ではない
   mark(ev.name, version, { hasParams: ev.rev !== null, exportFresh: false });
@@ -515,15 +548,16 @@ function connectEvents() {
     else if (ev.type === 'exported') onExported(ev);
     else if (ev.type === 'versions') onVersions(ev).catch((e) => console.warn(e));
     else if (batch.running && (ev.type === 'open' || ev.type === 'export')) return;   // 一括書き出しの最中は受けない
-    else if (ev.type === 'open') openByName(ev.name, ev.version);
-    else if (ev.type === 'export') openByName(ev.name, ev.version).then(() => exportNow()).catch((e) => console.warn(e));
-    else if (ev.type === 'export-all') exportAll({ force: !!ev.force, defaultOnly: !!ev.defaultOnly }).catch((e) => console.warn(e));
+    else if (ev.type === 'open') openByName(ev.name, ev.version, ev.folder).catch((e) => console.warn(e));
+    else if (ev.type === 'export') openByName(ev.name, ev.version, ev.folder).then(() => exportNow()).catch((e) => console.warn(e));
+    else if (ev.type === 'export-all') exportAll({ force: !!ev.force, defaultOnly: !!ev.defaultOnly, allFolders: !!ev.allFolders }).catch((e) => console.warn(e));
     else if (ev.type === 'export-all-abort') abortExportAll();
   };
 }
 
 /** どこかで（この画面・別のタブ・一括書き出し）白黒版が保存された。一覧の印とサムネイルを新しくする */
 function onExported(ev) {
+  if (folderOf(ev) !== state.folder) return;
   // version はバージョン名、stamp は PNG の更新時刻（古いサーバは version に更新時刻を入れていた）
   const version = typeof ev.version === 'string' ? ev.version : '';
   const stamp = ev.stamp || (typeof ev.version === 'number' ? ev.version : null);
@@ -549,7 +583,11 @@ function stepImage(delta) {
 }
 
 /** 画像（とバージョン）を開く。version が null / 未指定なら「指定なし」（その画像を開いていればそのまま、別の画像からなら既定） */
-async function openByName(name, version = null) {
+async function openByName(name, version = null, folder = null) {
+  if (folder && folder !== state.folder) {
+    await switchFolder(folder, name, version || '');       // 別の画像フォルダの画像（ctl open --folder など）
+    return;
+  }
   const same = state.remote && state.name === name;
   const want = version === null || version === undefined ? (same ? state.version : '') : version;
   if (same && want === state.version) return;
@@ -562,7 +600,7 @@ async function openByName(name, version = null) {
 }
 
 async function refreshImages() {
-  const list = await getJSON('api/images');
+  const list = await getJSON(`api/images${queryOf()}`);
   if (!list || !Array.isArray(list.images)) return;
   state.images = list.images;
   const sel = $('selImage');
@@ -577,6 +615,73 @@ async function refreshImages() {
   state.versionsOK = state.images.some((i) => Array.isArray(i.versions));
   if (gallery) gallery.refresh();
   updateVersionUI();
+}
+
+// ---- 画像フォルダ（プロジェクトは複数の画像フォルダを持てる） ----
+
+async function refreshFolders() {
+  const data = await getJSON('api/folders');       // 古いサーバには無い（そのときは既定のフォルダだけで動く）
+  state.folders = data && Array.isArray(data.folders) ? data.folders.filter((f) => !f.missing) : [];
+  showProject();
+  if (gallery) gallery.setFolders();
+  return state.folders;
+}
+
+/** ヘッダの「<プロジェクト名> / <フォルダ名>」 */
+function showProject() {
+  const parts = [];
+  if (state.project) parts.push(state.project.name);
+  if (multiFolder()) parts.push(folderLabel(state.folder));
+  $('projectName').textContent = parts.join(' / ');
+  $('projectName').title = [state.project ? `プロジェクト: ${state.project.path}` : '',
+    multiFolder() ? `画像フォルダ: ${folderLabel(state.folder)}` : ''].filter(Boolean).join('\n');
+  $('projectName').hidden = !parts.length;
+}
+
+/**
+ * 画像フォルダを切り替える。name を省くと、そのフォルダで最後に開いていた画像（無ければ先頭）を開く。
+ * open=false なら一覧を読むだけ（一括書き出し用）
+ */
+async function switchFolder(folder, name = null, version = '', { open = true } = {}) {
+  if (!state.server || folder === state.folder) {
+    if (open && name) await openByName(name, version);
+    return;
+  }
+  await flushSave();
+  await flushAutoExport();
+  await refreshFolders();
+  if (!state.folders.some((f) => f.name === folder)) {
+    showMessage(`画像フォルダ「${folder}」が見つかりません`, 'error');
+    return;
+  }
+  rememberLast();
+  state.folder = folder;
+  state.name = null;                   // いま出ている絵は前のフォルダの物（同じ名前の画像があっても別物として開く）
+  state.remote = false;
+  state.index = -1;
+  historyStash.clear();
+  showProject();
+  await refreshImages();
+  if (gallery) gallery.setFolders();
+  if (!open) return;
+  if (!state.images.length) {
+    showMessage(`画像フォルダ「${folderLabel(folder)}」に画像がありません`, 'error');
+    postState();
+    return;
+  }
+  const last = readLast()[folder];
+  let index = state.images.findIndex((i) => i.name === (name || last));
+  if (name && index < 0) showMessage(`指定の画像が見つかりません: ${name}`, 'error');
+  if (index < 0) index = 0;
+  // 設定の引き継ぎはフォルダをまたがない。そのフォルダで最後に開いていた画像に設定があれば、それを引き継ぎ元にする
+  let seed = defaultParams();
+  const from = state.images.find((i) => i.name === last);
+  if (from && from.hasParams && from.name !== state.images[index].name) {
+    const saved = await getJSON(apiPath('params', from.name));
+    if (saved) seed = normalize(saved).params;
+  }
+  state.params = seed;
+  await openIndex(index, name ? version : '');
 }
 
 // ---- バージョン（同じ画像から作る、設定の違う白黒版） ----
@@ -605,7 +710,7 @@ function updateVersionUI() {
 }
 
 async function versionRequest(method, body, query = '') {
-  const r = await fetch(`api/versions/${encodeURIComponent(state.name)}${query}`, {
+  const r = await fetch(`api/versions/${encodeURIComponent(state.name)}${queryOf('', state.folder, query)}`, {
     method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined,
   });
   const j = await r.json().catch(() => ({}));
@@ -670,7 +775,7 @@ async function deleteVersion(version) {
   if (!version) throw new Error('既定のバージョンは削除できません');
   const name = state.name;
   if (version === state.version) await dropPending();
-  await versionRequest('DELETE', null, `?version=${encodeURIComponent(version)}`);
+  await versionRequest('DELETE', null, `version=${encodeURIComponent(version)}`);
   historyStash.delete(version);
   await refreshImages();
   if (state.name === name && version === state.version) {
@@ -680,6 +785,7 @@ async function deleteVersion(version) {
 
 /** どこかで（別のタブ・ctl）バージョンが作られた・名前が変わった・消された */
 async function onVersions(ev) {
+  if (folderOf(ev) !== state.folder) return;
   const mine = state.remote && ev.name === state.name;
   if (mine && ev.action === 'rename') {
     if (historyStash.has(ev.version)) { historyStash.set(ev.to, historyStash.get(ev.version)); historyStash.delete(ev.version); }
@@ -825,6 +931,7 @@ async function openIndex(i, version = '') {
       if (JSON.stringify(state.params) !== JSON.stringify(defaultParams())) await saveNow();
     }
     historyStash.delete(version);
+    rememberLast();
     postState();
     renderNow();
     // 白黒版がまだ無い（または設定より古い）画像は、開いた時点で書き出しの対象にする
@@ -929,14 +1036,16 @@ async function encodeCurrent() {
 }
 
 /** PNG をサーバへ保存する（表示中の画像・バージョンの書き出しとして） */
-async function uploadExport(name, blob, version = '') {
-  const r = await fetch(apiPath('export', name, version), {
+async function uploadExport(name, blob, version = '', folder = state.folder) {
+  const r = await fetch(apiPath('export', name, version, folder), {
     method: 'POST', body: blob,
     headers: { 'Content-Type': 'image/png', ...(state.rev ? { 'X-Inkdeus-Rev': state.rev } : {}) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const j = await r.json();
-  mark(name, version, { hasExport: true, exportFresh: true, ...(j.mtime ? { exportVersion: Math.round(j.mtime * 1000) } : {}) });
+  if (folder === state.folder) {
+    mark(name, version, { hasExport: true, exportFresh: true, ...(j.mtime ? { exportVersion: Math.round(j.mtime * 1000) } : {}) });
+  }
   return { path: j.path, bytes: blob.size, version };
 }
 
@@ -1029,7 +1138,8 @@ function runAutoExport() {
   }
   const name = state.name;
   const version = state.version;
-  const here = () => state.name === name && state.version === version;
+  const folder = state.folder;
+  const here = () => state.name === name && state.version === version && state.folder === folder;
   setExportState('書き出し中…');
   autoExport.running = (async () => {
     try {
@@ -1040,7 +1150,7 @@ function runAutoExport() {
         autoExport.again = here();               // 途中で絵が変わった。保存せずにやり直す
         return;
       }
-      await uploadExport(name, blob, version);
+      await uploadExport(name, blob, version, folder);
       autoExport.count += 1;
       if (snap === JSON.stringify(state.params) && !autoExport.timer && !autoExport.again) {
         autoExport.dirty = false;
@@ -1104,7 +1214,7 @@ function batchReport(extra = {}) {
   const remaining = batch.exported > 0 && batch.running ? (elapsed / batch.exported) * left : null;
   return { running: batch.running, total: batch.total, done: batch.done, exported: batch.exported,
     skipped: batch.skipped, failed: batch.failed, current: batch.current, aborted: batch.abort, force: batch.force,
-    defaultOnly: !!batch.defaultOnly,
+    defaultOnly: !!batch.defaultOnly, allFolders: !!batch.allFolders,
     elapsed: Math.round(elapsed * 10) / 10, remaining: remaining === null ? null : Math.round(remaining),
     errors: batch.errors.slice(0, 20), ...extra };
 }
@@ -1139,7 +1249,7 @@ function abortExportAll() {
  * （その設定をその画像の設定として保存する）。
  * 書き出し済みで、設定・元画像がその後変わっていない物は飛ばす（force で作り直す）
  */
-async function exportAll({ force = false, defaultOnly = false } = {}) {
+async function exportAll({ force = false, defaultOnly = false, allFolders = false } = {}) {
   if (batch.running) return batchReport();
   if (!state.server) {
     showMessage('全画像の書き出しはサーバありのときだけ使えます', 'error');
@@ -1147,53 +1257,71 @@ async function exportAll({ force = false, defaultOnly = false } = {}) {
   }
   await flushSave();
   await flushAutoExport();
+  await refreshFolders();
   await refreshImages();
   const base = JSON.stringify(state.params);
+  const startFolder = state.folder;
   const startName = state.remote ? state.name : null;
   const startVersion = state.version;
-  const targets = [];
-  state.images.forEach((item, i) => {
-    verOf(item);
-    for (const rec of item.versions) {
-      if (!defaultOnly || rec.name === '') targets.push({ i, item, rec });
-    }
-  });
-  Object.assign(batch, { running: true, abort: false, total: targets.length, done: 0, exported: 0, skipped: 0,
-    failed: 0, current: null, startedAt: performance.now(), force: !!force, defaultOnly: !!defaultOnly, errors: [] });
+  // 対象の画像フォルダ（既定は、いまのフォルダだけ）。全体の件数を先に数える
+  const folders = allFolders && multiFolder() ? state.folders.map((f) => f.name) : [state.folder];
+  const targetsOf = (images) => {
+    const out = [];
+    images.forEach((item, i) => {
+      verOf(item);
+      for (const rec of item.versions) {
+        if (!defaultOnly || rec.name === '') out.push({ i, item, rec });
+      }
+    });
+    return out;
+  };
+  let total = 0;
+  for (const f of folders) {
+    const list = f === state.folder ? { images: state.images } : await getJSON(`api/images${queryOf('', f)}`);
+    total += targetsOf(list && Array.isArray(list.images) ? list.images : []).length;
+  }
+  Object.assign(batch, { running: true, abort: false, total, done: 0, exported: 0, skipped: 0,
+    failed: 0, current: null, startedAt: performance.now(), force: !!force, defaultOnly: !!defaultOnly,
+    allFolders: folders.length > 1, errors: [] });
   state.lastBatch = '';
   rebuild();
   await postBatch({ started: true });
   batchTicker = setInterval(() => showBatch(), 1000);
   try {
-    for (let t = 0; t < targets.length && !batch.abort; t++) {
-      const { i, item, rec } = targets[t];
-      const version = rec.name;
-      const label = version ? `${item.name} @${version}` : item.name;
-      batch.current = label;
-      // 設定の無い名前付きのバージョン（PNG だけが置いてある物）は、何で描くか決められないので飛ばす
-      if ((!force && rec.exportFresh) || (version && !rec.hasParams)) {
-        batch.skipped += 1;
-      } else {
-        try {
-          const hadParams = rec.hasParams;
-          if (!hadParams) state.params = JSON.parse(base);     // 設定の無い画像には、始めたときの設定を使う
-          await openIndex(i, version);
-          if (state.name !== item.name || state.version !== version || !state.remote) throw new Error('画像を開けませんでした');
-          if (!hadParams) await saveNow();
-          state.solo = null;
-          renderNow();
-          const blob = await encodeCurrent();
-          if (!blob) throw new Error('書き出しの途中で描き直しが入りました');
-          await uploadExport(item.name, blob, version);
-          batch.exported += 1;
-        } catch (e) {
-          batch.failed += 1;
-          batch.errors.push(`${label}: ${e.message}`);
+    for (const folder of folders) {
+      if (batch.abort) break;
+      if (folder !== state.folder) await switchFolder(folder, null, '', { open: false });
+      const targets = targetsOf(state.images);
+      for (let t = 0; t < targets.length && !batch.abort; t++) {
+        const { i, item, rec } = targets[t];
+        const version = rec.name;
+        const label = (folders.length > 1 ? `${folderLabel(folder)} / ` : '') + (version ? `${item.name} @${version}` : item.name);
+        batch.current = label;
+        // 設定の無い名前付きのバージョン（PNG だけが置いてある物）は、何で描くか決められないので飛ばす
+        if ((!force && rec.exportFresh) || (version && !rec.hasParams)) {
+          batch.skipped += 1;
+        } else {
+          try {
+            const hadParams = rec.hasParams;
+            if (!hadParams) state.params = JSON.parse(base);     // 設定の無い画像には、始めたときの設定を使う
+            await openIndex(i, version);
+            if (state.name !== item.name || state.version !== version || !state.remote) throw new Error('画像を開けませんでした');
+            if (!hadParams) await saveNow();
+            state.solo = null;
+            renderNow();
+            const blob = await encodeCurrent();
+            if (!blob) throw new Error('書き出しの途中で描き直しが入りました');
+            await uploadExport(item.name, blob, version, folder);
+            batch.exported += 1;
+          } catch (e) {
+            batch.failed += 1;
+            batch.errors.push(`${label}: ${e.message}`);
+          }
         }
+        batch.done += 1;
+        await postBatch();
+        await new Promise((resolve) => setTimeout(resolve, 0));  // 画面の更新と中止ボタンに順番を回す
       }
-      batch.done += 1;
-      await postBatch();
-      await new Promise((resolve) => setTimeout(resolve, 0));  // 画面の更新と中止ボタンに順番を回す
     }
   } finally {
     clearInterval(batchTicker);
@@ -1204,9 +1332,10 @@ async function exportAll({ force = false, defaultOnly = false } = {}) {
       + ` / 失敗 ${r.failed}（全 ${r.total} 件・${formatSpan(r.elapsed)}）`
       + (r.errors.length ? `\n${r.errors.join('\n')}` : '');
     await postBatch();
-    // 始める前に開いていた画像・バージョンへ戻る
+    // 始める前に開いていたフォルダ・画像・バージョンへ戻る
+    if (state.folder !== startFolder) await switchFolder(startFolder, null, '', { open: false });
     const back = startName ? state.images.findIndex((x) => x.name === startName) : -1;
-    if (back >= 0 && (state.name !== startName || state.version !== startVersion)) {
+    if (back >= 0 && (state.name !== startName || state.version !== startVersion || !state.remote)) {
       await openIndex(back, verOf(state.images[back], startVersion) ? startVersion : '');
     }
     autoExport.dirty = false;
@@ -1226,15 +1355,21 @@ async function init() {
     $('dropHint').hidden = true;
     throw e;
   }
-  const [config, list] = await Promise.all([getJSON('api/config'), getJSON('api/images')]);
+  const query = new URLSearchParams(location.search);
+  const [config, folderData] = await Promise.all([getJSON('api/config'), getJSON('api/folders')]);
+  state.folders = folderData && Array.isArray(folderData.folders) ? folderData.folders.filter((f) => !f.missing) : [];
+  // 始めに開く画像フォルダ: 直リンクの ?folder= → 最後に開いていたフォルダ → 既定
+  let stored = null;
+  try { stored = localStorage.getItem(FOLDER_KEY); } catch { /* 無くても動く */ }
+  const known = (name) => !!name && state.folders.some((f) => f.name === name);
+  const wantedFolder = query.get('folder');
+  if (wantedFolder && !known(wantedFolder)) showMessage(`指定の画像フォルダが見つかりません: ${wantedFolder}`, 'error');
+  state.folder = known(wantedFolder) ? wantedFolder : (multiFolder() && !query.get('image') && known(stored) ? stored : DEFAULT_FOLDER);
+  const list = await getJSON(`api/images${queryOf()}`);
   state.server = !!(list && Array.isArray(list.images));
   state.images = state.server ? list.images : [];
   state.project = state.server && config && config.project ? config.project : null;
-  if (state.project) {
-    $('projectName').textContent = state.project.name;
-    $('projectName').title = `プロジェクト: ${state.project.path}`;
-    $('projectName').hidden = false;
-  }
+  showProject();
   state.params = defaultParams();
   try { state.autoExport = localStorage.getItem(AUTO_EXPORT_KEY) !== '0'; } catch { state.autoExport = true; }
   $('btnBatchAbort').addEventListener('click', abortExportAll);
@@ -1256,15 +1391,20 @@ async function init() {
       current: () => (state.remote ? state.name : null),
       open: (name) => { if (name !== state.name || !state.remote) openIndex(state.images.findIndex((i) => i.name === name)); },
       locked: () => batch.running,
+      // 画像フォルダの切り替え（フォルダが1つだけなら出さない）と、そのフォルダの素材ソース名
+      folders: () => state.folders,
+      folder: () => state.folder,
+      setFolder: (name) => switchFolder(name).catch((e) => showMessage(e.message, 'error')),
+      assetSource: (kind) => (state.folder === DEFAULT_FOLDER ? kind : `${kind}@${state.folder}`),
     });
     await refreshImages();
     // /?image=<画像名>[&version=<バージョン>] で、その画像（のバージョン）を開いた状態で始める
     // （漫画の構成の画面の「調整」から来る）
-    const query = new URLSearchParams(location.search);
-    const wanted = query.get('image');
+    // 画像フォルダが複数あって画像の指定が無ければ、そのフォルダで最後に開いていた画像から始める
+    const wanted = query.get('image') || (multiFolder() ? readLast()[state.folder] : null);
     const index = wanted ? state.images.findIndex((i) => i.name === wanted) : 0;
-    if (wanted && index < 0) showMessage(`指定の画像が見つかりません: ${wanted}`, 'error');
-    await openIndex(Math.max(0, index), index >= 0 && wanted ? (query.get('version') || '') : '');
+    if (query.get('image') && index < 0) showMessage(`指定の画像が見つかりません: ${wanted}`, 'error');
+    await openIndex(Math.max(0, index), index >= 0 && query.get('image') ? (query.get('version') || '') : '');
   } else if (state.server) {
     showMessage('入力フォルダに画像がありません', 'error');
   }
@@ -1275,7 +1415,7 @@ const hooks = {
   ready: null,
   state,
   info: () => ({
-    server: state.server, name: state.name, version: state.version, width: renderer.W, height: renderer.H,
+    server: state.server, name: state.name, version: state.version, folder: state.folder, width: renderer.W, height: renderer.H,
     hasMask: state.hasMask, maxTextureSize: renderer.maxTextureSize,
     unit: effectiveUnit(state.params, renderer.W),
     renderer: (() => {
@@ -1300,10 +1440,16 @@ const hooks = {
     return { ms: r.ms, passes: r.passes, warnings };
   },
   render: () => renderNow(),
-  open: async (name, version = '') => {
-    await openIndex(state.images.findIndex((i) => i.name === name), version);
+  open: async (name, version = '', folder = null) => {
+    if (folder && folder !== state.folder) await switchFolder(folder, name, version);
+    else await openIndex(state.images.findIndex((i) => i.name === name), version);
     return hooks.info();
   },
+  // 画像フォルダ
+  folder: () => state.folder,
+  folders: () => state.folders.map((f) => f.name),
+  setFolder: async (name) => { await switchFolder(name); return hooks.info(); },
+  images: () => state.images.map((i) => i.name),
   // バージョン（同じ画像から作る、設定の違う白黒版）
   version: () => state.version,
   versions: () => { const item = currentItem(); verOf(item); return item ? JSON.parse(JSON.stringify(item.versions)) : []; },

@@ -91,6 +91,8 @@
     mangaDir: '',
     sources: [],
     source: null,                // 選択中のソース名
+    folder: 'default',           // 元画像・白黒のタブで見ている画像フォルダ
+    folders: [],                 // 画像フォルダの名前（元画像・白黒のソースから集める）
     q: '',
     items: [],
     total: 0,
@@ -181,13 +183,27 @@
         max: parseInt(u.searchParams.get('max'), 10) || 0 };
     } catch (e) { return null; }
   }
+  // 元画像・白黒のソースは画像フォルダごとにある（既定のフォルダは source / inked、追加のフォルダは source@<名前> / inked@<名前>）
+  const DEFAULT_FOLDER = 'default';
+  function kindOf(source) {
+    const name = String(source || '');
+    return name === 'source' || name.startsWith('source@') ? 'source'
+      : name === 'inked' || name.startsWith('inked@') ? 'inked' : '';
+  }
+  function folderOfSource(source) {
+    const at = String(source || '').indexOf('@');
+    return at < 0 ? DEFAULT_FOLDER : String(source).slice(at + 1);
+  }
+  function srcName(kind, folder) { return !folder || folder === DEFAULT_FOLDER ? kind : `${kind}@${folder}`; }
+  // 白黒版の更新時刻の表（state.inked.versions / changed）の見出し。既定のフォルダはファイル名のまま
+  function ikey(source, rel) { return source === 'inked' ? rel : `${source}//${rel}`; }
   function withVersion(url, version) {
     return version ? url + (url.includes('?') ? '&' : '?') + 'v=' + version : url;
   }
   // 実際に読み込む URL。開いてから書き出し直された白黒版は、古い物をブラウザが使い回さないよう v を付ける
   function loadUrlFor(source, rel, canonical) {
-    if (source === 'inked' && state.inked.changed.has(rel) && state.inked.versions) {
-      return withVersion(canonical, state.inked.versions[rel]);
+    if (kindOf(source) === 'inked' && state.inked.changed.has(ikey(source, rel)) && state.inked.versions) {
+      return withVersion(canonical, state.inked.versions[ikey(source, rel)]);
     }
     return canonical;
   }
@@ -223,6 +239,10 @@
     ui.resume = el('div', { class: 'ikb-resume', hidden: true });
     ui.projectName = el('span', { class: 'ikb-project-name' });
     ui.tabs = el('div', { class: 'ikb-tabs', role: 'tablist' });
+    // 画像フォルダが複数あるとき、元画像・白黒のタブで見るフォルダを選ぶ（タブをフォルダの数だけ増やさない）
+    ui.folder = el('select', { class: 'ikb-folder', 'aria-label': '画像フォルダ', title: '元画像・白黒のタブで見る画像フォルダ',
+      onchange: () => run(() => setFolder(ui.folder.value)) });
+    ui.folderRow = el('label', { class: 'ikb-row ikb-folder-row', hidden: true }, [el('span', { text: 'フォルダ:' }), ui.folder]);
     ui.search = el('input', { type: 'search', class: 'ikb-search', placeholder: '名前で絞り込み', 'aria-label': '名前で絞り込み' });
     ui.size = el('select', { class: 'ikb-size', title: 'コマへ渡す画像の大きさ', 'aria-label': 'コマへ渡す画像の大きさ' },
       SIZES.map(([value, label]) => el('option', { value: String(value), text: label })));
@@ -281,6 +301,7 @@
       ui.sel,
       el('div', { class: 'ikb-section ikb-assets' }, [
         ui.tabs,
+        ui.folderRow,
         el('div', { class: 'ikb-row' }, [ui.search, ui.size, ui.reload]),
         ui.preferRow,
         ui.autoSwapRow,
@@ -447,13 +468,37 @@
     }
   }
 
+  const KIND_LABELS = { source: '元画像', inked: '白黒' };
   function renderTabs() {
-    ui.tabs.replaceChildren(...state.sources.map((src) => el('button', {
+    // 元画像・白黒は、選んでいる画像フォルダの物だけをタブにする
+    const many = state.folders.length > 1;
+    const shown = state.sources.filter((src) => !src.kind || src.folder === state.folder);
+    ui.tabs.replaceChildren(...shown.map((src) => el('button', {
       type: 'button', role: 'tab', class: 'ikb-tab' + (src.name === state.source ? ' ikb-active' : ''),
-      'aria-selected': String(src.name === state.source),
+      'aria-selected': String(src.name === state.source), 'data-source': src.name,
       title: (src.mode === 'free' ? 'ページ上へ自由に置く素材' : 'コマにはめ込む画像') + (src.missing ? '（フォルダが見つかりません）' : ''),
       onclick: () => selectSource(src.name),
-    }, [src.label, el('span', { class: 'ikb-badge', text: String(src.count) })])));
+    }, [src.kind && many ? KIND_LABELS[src.kind] : src.label, el('span', { class: 'ikb-badge', text: String(src.count) })])));
+    ui.folder.replaceChildren(...state.folders.map((name) => el('option', {
+      value: name, text: name === DEFAULT_FOLDER ? '既定' : name })));
+    ui.folder.value = state.folder;
+    ui.folderRow.hidden = !(many && kindOf(state.source));
+  }
+
+  // 元画像・白黒のタブで見る画像フォルダを切り替える
+  async function setFolder(name) {
+    if (!state.folders.includes(name)) throw new Error(`画像フォルダが見つかりません: ${name}`);
+    const kind = kindOf(state.source);
+    state.folder = name;
+    store.set('folder', name);
+    if (kind) {
+      state.source = srcName(kind, name);
+      store.set('source', state.source);
+    }
+    renderTabs();
+    renderTarget();
+    await loadItems(false);
+    return state.source;
   }
 
   function currentSource() {
@@ -464,7 +509,7 @@
     const src = currentSource();
     const nodes = [];
     let group = null;
-    const inkedTab = !!src && src.builtin && src.name === 'inked';
+    const inkedTab = !!src && src.kind === 'inked';
     // 白黒のタブ: 同じ元画像のバージョンは隣り合って届く。何個あるかを先に数える
     const perBase = new Map();
     if (inkedTab) state.items.forEach((item) => { if (item.base) perBase.set(item.base, (perBase.get(item.base) || 0) + 1); });
@@ -481,11 +526,11 @@
       const img = el('img', { loading: 'lazy', decoding: 'async', alt: item.name, draggable: 'false',
         src: withVersion(thumbUrl(src.name, item.path), stamp) });
       // 白黒化の画面で開ける画像（元画像と、その白黒版）には「調整」を付ける
-      const editable = item.editable !== undefined ? item.editable : (src.name === 'source' ? item.path : null);
+      const editable = item.editable !== undefined ? item.editable : (src.kind === 'source' ? item.path : null);
       const adjust = src.builtin && editable ? el('button', {
         type: 'button', class: 'ikb-adjust', text: '調整',
         title: `白黒化の画面で ${editable}${version ? `（バージョン「${version}」）` : ''} を開く（別のタブ）`,
-        onclick: (e) => { e.stopPropagation(); openEditor(editable, version); },
+        onclick: (e) => { e.stopPropagation(); openEditor(editable, version, src.folder); },
         onkeydown: (e) => e.stopPropagation(),
       }) : null;
       const many = inkedTab && item.base && perBase.get(item.base) > 1;
@@ -503,7 +548,7 @@
         },
       }, [img, el('span', { class: 'ikb-caption', text: many ? stem(item.base) : item.name })]
         .concat(label ? [label] : []).concat(adjust ? [adjust] : []));
-      if (src.name === 'source' && item.inked) cell.classList.add('ikb-has-inked');
+      if (src.kind === 'source' && item.inked) cell.classList.add('ikb-has-inked');
       if (many) {
         if (!row || rowBase !== item.base) {
           rowBase = item.base;
@@ -520,11 +565,11 @@
     if (!state.items.length) {
       const empty = !src ? '' : src.missing ? 'このソースのフォルダが見つかりません'
         : state.q ? '当てはまる画像がありません'
-          : src.name === 'inked' ? 'まだ書き出した画像がありません（白黒化の画面で「PNG を書き出す」）' : '画像がありません';
+          : src.kind === 'inked' ? 'まだ書き出した画像がありません（白黒化の画面で「PNG を書き出す」）' : '画像がありません';
       nodes.push(el('div', { class: 'ikb-empty', text: empty }));
     }
     ui.grid.replaceChildren(...nodes);
-    ui.preferRow.hidden = !(src && src.builtin && src.name === 'source');
+    ui.preferRow.hidden = !(src && src.kind === 'source');
     ui.autoSwapRow.hidden = ui.preferRow.hidden;
     ui.more.hidden = state.items.length >= state.total;
     ui.count.textContent = state.total ? `${state.items.length} / ${state.total} 枚` : '';
@@ -574,10 +619,16 @@
 
   async function listSources() {
     const data = await api('GET', '/api/assets');
-    state.sources = data.sources || [];
-    if (!state.sources.some((s) => s.name === state.source)) {
+    // 古いサーバは kind / folder を返さない（そのときは既定のフォルダだけ）
+    state.sources = (data.sources || []).map((src) => Object.assign({}, src, {
+      kind: src.kind !== undefined ? src.kind : (src.builtin ? src.name : ''),
+      folder: src.folder || (src.builtin ? DEFAULT_FOLDER : null) }));
+    state.folders = state.sources.filter((src) => src.kind === 'source').map((src) => src.folder);
+    if (!state.sources.some((src) => src.name === state.source)) {
       state.source = state.sources.length ? state.sources[0].name : null;
     }
+    if (kindOf(state.source)) state.folder = folderOfSource(state.source);
+    else if (!state.folders.includes(state.folder)) state.folder = DEFAULT_FOLDER;
     renderTabs();
     return data;
   }
@@ -606,6 +657,7 @@
   async function selectSource(name) {
     state.source = name;
     store.set('source', name);
+    if (kindOf(name)) { state.folder = folderOfSource(name); store.set('folder', state.folder); }
     renderTabs();
     renderTarget();
     await loadItems(false);
@@ -669,12 +721,12 @@
     const canonical = assetUrl(source, rel, max);
     const url = loadUrlFor(source, rel, canonical);
     const img = await loadFabricImage(url);
-    if (url !== canonical) pinSrc(img, canonical, state.inked.versions[rel]);
+    if (url !== canonical) pinSrc(img, canonical, state.inked.versions[ikey(source, rel)]);
     return img;
   }
 
   function uiPlaceOptions(src) {
-    return src && src.builtin && src.name === 'source' && state.preferInked ? { inked: 'prefer' } : {};
+    return src && src.kind === 'source' && state.preferInked ? { inked: 'prefer' } : {};
   }
 
   function requireFeature(feature) {
@@ -750,10 +802,10 @@
     await waitIdle();
     say('画像を読み込んでいます…', 'work');
     let label = '';
-    if (o.inked === 'prefer' && source === 'source') {
+    if (o.inked === 'prefer' && kindOf(source) === 'source') {
       // 白黒版（書き出した PNG）があればそちらを入れる
-      const pair = await pairOf('source', rel).catch(() => null);
-      if (pair && pair.inked) { source = 'inked'; rel = pair.inked.path; label = '（白黒版）'; }
+      const pair = await pairOf(source, rel).catch(() => null);
+      if (pair && pair.inked) { source = pair.inkedName || 'inked'; rel = pair.inked.path; label = '（白黒版）'; }
     }
     const result = mode === 'free' ? await placeFree(source, rel, o) : await placeInPanel(source, rel, o);
     say(mode === 'free' ? `ページに置きました: ${stem(rel)}${label}`
@@ -789,9 +841,10 @@
 
   // ---- 白黒化の画面との行き来（別のタブで調整 → 書き出しの通知を受けて、使っている白黒版を差し替える） ----
 
-  function openEditor(name, version) {
+  function openEditor(name, version, folder) {
     // 同じ名前のタブを使い回す（既に開いていれば、そのタブの画像が切り替わる）
-    const win = window.open('/?image=' + encodeURIComponent(name)
+    const win = window.open('/?' + (folder && folder !== DEFAULT_FOLDER ? 'folder=' + encodeURIComponent(folder) + '&' : '')
+      + 'image=' + encodeURIComponent(name)
       + (version ? '&version=' + encodeURIComponent(version) : ''), EDITOR_TAB);
     say(win ? `白黒化の画面で開きました: ${name}${version ? `（バージョン「${version}」）` : ''}（調整すると、ここで使っている白黒版も替わります）`
       : 'タブを開けませんでした（ポップアップがブロックされていないか確かめてください）', win ? 'info' : 'error');
@@ -820,7 +873,7 @@
     if (!has('canvas')) return [];
     return canvas.getObjects().filter((o) => o && o.type === 'image')
       .map((o) => ({ obj: o, ref: parseAssetUrl(optional(() => o.getSrc())) }))
-      .filter((x) => x.ref && (x.ref.source === 'source' || x.ref.source === 'inked'));
+      .filter((x) => x.ref && kindOf(x.ref.source));
   }
 
   // オブジェクトの絵だけを入れ替える。位置・角度・切り抜き・コマとの紐づけ・重なり順はそのままにし、
@@ -858,25 +911,26 @@
     const lost = [];
     for (const { obj, ref } of assetImages()) {
       try {
-        if (ref.source === 'inked') {
-          const version = state.inked.versions[ref.rel];
+        const changedAt = (src, path, stamp) => (state.inked.changed.has(ikey(src, path)) ? stamp : null);
+        if (kindOf(ref.source) === 'inked') {
+          const version = state.inked.versions[ikey(ref.source, ref.rel)];
           if (!version) {
             // その白黒版が無い（消された・名前の変わったバージョン）。既定のバージョン、無ければ元画像へ切り替える
-            const pair = await pairOf('inked', ref.rel).catch(() => null);
+            const pair = await pairOf(ref.source, ref.rel).catch(() => null);
             if (pair && pair.missing) {
               const done = pair.default
-                ? await replaceElement(obj, 'inked', pair.default.path,
-                  state.inked.changed.has(pair.default.path) ? pair.default.version : null)
-                : pair.source ? await replaceElement(obj, 'source', pair.source.path, null) : false;
+                ? await replaceElement(obj, ref.source, pair.default.path, changedAt(ref.source, pair.default.path, pair.default.version))
+                : pair.source ? await replaceElement(obj, pair.sourceName || 'source', pair.source.path, null) : false;
               if (done) lost.push(`${stem(pair.name)}「${verLabel(pair.version)}」→ ${pair.default ? '既定' : '元画像'}`);
             }
-          } else if (state.inked.changed.has(ref.rel) && obj.__ikbVersion !== version) {
-            if (await replaceElement(obj, 'inked', ref.rel, version)) refreshed += 1;
+          } else if (state.inked.changed.has(ikey(ref.source, ref.rel)) && obj.__ikbVersion !== version) {
+            if (await replaceElement(obj, ref.source, ref.rel, version)) refreshed += 1;
           }
         } else if (state.autoSwap) {
-          const pair = await pairOf('source', ref.rel);
-          if (pair && pair.inked && await replaceElement(obj, 'inked', pair.inked.path,
-            state.inked.changed.has(pair.inked.path) ? pair.inked.version : null)) swapped += 1;
+          const pair = await pairOf(ref.source, ref.rel);
+          const inkedSrc = pair && (pair.inkedName || 'inked');
+          if (pair && pair.inked && await replaceElement(obj, inkedSrc, pair.inked.path,
+            changedAt(inkedSrc, pair.inked.path, pair.inked.version))) swapped += 1;
         }
       } catch (e) {
         console.error('[inkdeus]', e);
@@ -912,16 +966,23 @@
 
   // 白黒版の更新時刻を読み直す。前に読んだ時から変わっていた物は「開いてから変わった物」に加える
   async function refreshVersions() {
-    let data;
-    try {
-      data = await api('GET', '/api/assets/inked/versions');
-    } catch (e) {
-      return false;                                           // 古いサーバ（この API が無い）。差し替えは行わない
+    // 白黒のソースは画像フォルダごとにある。全部の更新時刻を1つの表にまとめる
+    const names = state.sources.filter((x) => x.kind === 'inked').map((x) => x.name);
+    if (!names.includes('inked')) names.unshift('inked');
+    const now = {};
+    for (const name of names) {
+      let data;
+      try {
+        data = await api('GET', `/api/assets/${encodeURIComponent(name)}/versions`);
+      } catch (e) {
+        if (name === 'inked') return false;                     // 古いサーバ（この API が無い）。差し替えは行わない
+        continue;
+      }
+      Object.entries(data.versions || {}).forEach(([rel, stamp]) => { now[ikey(name, rel)] = stamp; });
     }
     const old = state.inked.versions;
-    const now = data.versions || {};
     if (old) {
-      Object.keys(now).forEach((rel) => { if (old[rel] !== now[rel]) state.inked.changed.add(rel); });
+      Object.keys(now).forEach((key) => { if (old[key] !== now[key]) state.inked.changed.add(key); });
     }
     state.inked.versions = now;
     return true;
@@ -933,10 +994,11 @@
     state.events.received += 1;
     if (!state.inked.versions) state.inked.versions = {};
     // stamp が PNG の更新時刻（古いサーバは version に入れていた。いまの version はバージョン名）
-    state.inked.versions[ev.file] = ev.stamp || (typeof ev.version === 'number' ? ev.version : Date.now());
-    state.inked.changed.add(ev.file);
+    const key = ikey(ev.source || 'inked', ev.file);          // source = その画像フォルダの白黒のソース名
+    state.inked.versions[key] = ev.stamp || (typeof ev.version === 'number' ? ev.version : Date.now());
+    state.inked.changed.add(key);
     state.inked.pairs.clear();
-    const viewing = state.source === 'inked' || state.source === 'source';
+    const viewing = !!kindOf(state.source);
     listSources().then(() => (viewing ? loadItems(false) : null)).catch(() => {});
     const result = await queueSync(0);
     if (result.refreshed || result.swapped) {
@@ -952,11 +1014,12 @@
     state.events.received += 1;
     await refreshVersions();
     state.inked.pairs.clear();
+    const inkedSrc = srcName('inked', ev.folder);
     if (ev.action === 'rename' && ev.file && ev.toFile && has('canvas')) {
       // 開いているページで使っている絵を、新しい名前のファイルへ付け替える
       let moved = 0;
       for (const { obj, ref } of assetImages()) {
-        if (ref.source === 'inked' && ref.rel === ev.file && await replaceElement(obj, 'inked', ev.toFile, null)) moved += 1;
+        if (ref.source === inkedSrc && ref.rel === ev.file && await replaceElement(obj, inkedSrc, ev.toFile, null)) moved += 1;
       }
       if (moved) {
         canvas.requestRenderAll();
@@ -966,7 +1029,7 @@
       }
     }
     await queueSync(0);                                         // 消されたバージョンを使っている絵は既定へ
-    const viewing = state.source === 'inked' || state.source === 'source';
+    const viewing = !!kindOf(state.source);
     listSources().then(() => (viewing ? loadItems(false) : null)).catch(() => {});
     renderSelection(true);
   }
@@ -1004,7 +1067,7 @@
     const obj = canvas.getActiveObject();
     if (!obj || obj.type !== 'image') return null;
     const ref = parseAssetUrl(optional(() => obj.getSrc()));
-    return ref && (ref.source === 'source' || ref.source === 'inked') ? { obj, ref } : null;
+    return ref && kindOf(ref.source) ? { obj, ref } : null;
   }
 
   let selKey = '';
@@ -1015,9 +1078,12 @@
     selKey = key;
     ui.sel.hidden = !sel;
     if (!sel) return;
-    ui.selName.textContent = `選択中の画像: ${stem(sel.ref.rel)}（${sel.ref.source === 'inked' ? '白黒版' : '元画像'}）`;
-    ui.btnToInked.hidden = sel.ref.source !== 'source';
-    ui.btnToSource.hidden = sel.ref.source !== 'inked';
+    const selKind = kindOf(sel.ref.source);
+    const selFolder = folderOfSource(sel.ref.source);
+    ui.selName.textContent = `選択中の画像: ${stem(sel.ref.rel)}（${selKind === 'inked' ? '白黒版' : '元画像'}`
+      + `${selFolder === DEFAULT_FOLDER ? '' : '・' + selFolder}）`;
+    ui.btnToInked.hidden = selKind !== 'source';
+    ui.btnToSource.hidden = selKind !== 'inked';
     ui.btnAdjust.disabled = false;
     ui.btnToSource.disabled = false;
     ui.selVer.hidden = true;
@@ -1029,7 +1095,7 @@
       ui.btnToSource.disabled = !pair.source;
       if (pair.name) ui.selName.title = pair.name;
       // バージョン: いま置いてある物の名前と、同じ元画像の別バージョンへ切り替えるボタン
-      const inked = sel.ref.source === 'inked' && Array.isArray(pair.versions);     // 古いサーバには versions が無い
+      const inked = selKind === 'inked' && Array.isArray(pair.versions);     // 古いサーバには versions が無い
       const others = inked ? pair.versions.filter((v) => v.path !== sel.ref.rel) : [];
       ui.selVer.hidden = !inked;
       ui.selVer.textContent = `バージョン: ${verLabel(pair.version)}`;
@@ -1048,12 +1114,12 @@
     if (!sel) throw new Error('inkdeus の画像が選ばれていません');
     const pair = await pairOf(sel.ref.source, sel.ref.rel);
     if (!pair.name) throw new Error('この白黒版の元画像が見つかりません');
-    return openEditor(pair.name, sel.ref.source === 'inked' ? (pair.version || '') : '');
+    return openEditor(pair.name, kindOf(sel.ref.source) === 'inked' ? (pair.version || '') : '', pair.folder);
   }
 
   function selectedInked() {
     const sel = selectedAsset();
-    if (!sel || sel.ref.source !== 'inked') throw new Error('白黒版の画像が選ばれていません');
+    if (!sel || kindOf(sel.ref.source) !== 'inked') throw new Error('白黒版の画像が選ばれていません');
     return sel;
   }
 
@@ -1062,13 +1128,13 @@
     requireFeature('place');
     const sel = selectedInked();
     await waitIdle();
-    state.inked.pairs.delete('inked|' + sel.ref.rel);
-    const pair = await pairOf('inked', sel.ref.rel);
+    state.inked.pairs.delete(sel.ref.source + '|' + sel.ref.rel);
+    const pair = await pairOf(sel.ref.source, sel.ref.rel);
     const target = (pair.versions || []).find((v) => v.name === (version || ''));
     if (!target) throw new Error(`バージョン「${verLabel(version)}」の白黒版がありません（白黒化の画面で開くと書き出されます）`);
     if (target.path === sel.ref.rel) return { ok: true, changed: false, version: target.name, src: sel.obj.getSrc() };
-    const done = await replaceElement(sel.obj, 'inked', target.path,
-      state.inked.changed.has(target.path) ? target.version : null);
+    const done = await replaceElement(sel.obj, sel.ref.source, target.path,
+      state.inked.changed.has(ikey(sel.ref.source, target.path)) ? target.version : null);
     if (done) {
       canvas.requestRenderAll();
       updateLayerPanel();
@@ -1083,7 +1149,7 @@
   async function newVersionAndAdjust(name, opts) {
     requireFeature('place');
     const sel = selectedInked();
-    const pair = await pairOf('inked', sel.ref.rel);
+    const pair = await pairOf(sel.ref.source, sel.ref.rel);
     if (!pair.name || !Array.isArray(pair.versions)) throw new Error('この白黒版の元画像が見つかりません');
     let version = name;
     if (version === undefined) {
@@ -1094,19 +1160,20 @@
     version = String(version).trim();
     if (!VERSION_RE.test(version)) throw new Error('バージョン名に使えるのは英数字・かな漢字・_ - だけです（1〜32 文字）');
     await waitIdle();
-    const made = await api('POST', '/api/versions/' + encodeURIComponent(pair.name),
+    const made = await api('POST', '/api/versions/' + encodeURIComponent(pair.name)
+      + (pair.folder && pair.folder !== DEFAULT_FOLDER ? '?folder=' + encodeURIComponent(pair.folder) : ''),
       JSON.stringify({ version, copyFrom: pair.version || '', copyExport: true }));
     await refreshVersions();
     state.inked.pairs.clear();
     if (!made.copiedExport) throw new Error('複製元の白黒版が見つからないため、絵は切り替えていません（バージョンは作りました）');
-    const done = await replaceElement(sel.obj, 'inked', made.file, null);
+    const done = await replaceElement(sel.obj, sel.ref.source, made.file, null);
     if (done) {
       canvas.requestRenderAll();
       updateLayerPanel();
       saveStateByManual();
     }
     renderSelection(true);
-    const opened = (opts && opts.open === false) ? false : openEditor(pair.name, version);
+    const opened = (opts && opts.open === false) ? false : openEditor(pair.name, version, pair.folder);
     return { ok: !!done, version, file: made.file, opened, src: sel.obj.getSrc() };
   }
 
@@ -1119,18 +1186,19 @@
     const pair = await pairOf(sel.ref.source, sel.ref.rel);
     let done;
     if (to === 'inked') {
-      if (sel.ref.source === 'inked') return { ok: true, changed: false };
+      if (kindOf(sel.ref.source) === 'inked') return { ok: true, changed: false };
       if (!pair.inked) {
         const err = new Error('白黒版がまだありません。「白黒を調整」で白黒化の画面を開くと、自動で書き出されます');
         err.code = 'no-inked';
         throw err;
       }
-      done = await replaceElement(sel.obj, 'inked', pair.inked.path,
-        state.inked.changed.has(pair.inked.path) ? pair.inked.version : null);
+      const inkedSrc = pair.inkedName || 'inked';
+      done = await replaceElement(sel.obj, inkedSrc, pair.inked.path,
+        state.inked.changed.has(ikey(inkedSrc, pair.inked.path)) ? pair.inked.version : null);
     } else {
-      if (sel.ref.source === 'source') return { ok: true, changed: false };
+      if (kindOf(sel.ref.source) === 'source') return { ok: true, changed: false };
       if (!pair.source) throw new Error('元画像が見つかりません');
-      done = await replaceElement(sel.obj, 'source', pair.source.path, null);
+      done = await replaceElement(sel.obj, pair.sourceName || 'source', pair.source.path, null);
     }
     if (done) {
       canvas.requestRenderAll();
@@ -1575,6 +1643,7 @@
       fail(e, 'inkdeus のサーバに接続できません');
     }
     state.source = store.get('source', null);
+    state.folder = store.get('folder', DEFAULT_FOLDER) || DEFAULT_FOLDER;
     refresh().catch((e) => fail(e, '素材の一覧を読めません'));
     renderStatus();
 
@@ -1622,7 +1691,8 @@
     ready: init(),
     status: () => ({ ready: state.ready, busy: state.busy, features: Object.assign({}, state.features),
       missing: Object.assign({}, state.missing), project: state.project, mangaDir: state.mangaDir,
-      name: state.name, source: state.source, imageMax: state.imageMax,
+      name: state.name, source: state.source, folder: state.folder, folders: state.folders.slice(),
+      imageMax: state.imageMax,
       width: state.width, float: !!state.float, preferInked: state.preferInked, autoSwap: state.autoSwap,
       events: Object.assign({}, state.events), hot: Object.assign({}, state.hot),
       inkedFiles: Object.keys(state.inked.versions || {}),
@@ -1631,7 +1701,7 @@
       autosave: { enabled: state.autosave.enabled, seconds: state.autosave.seconds,
         dirty: !!state.autosave.dirtySince, lastAt: state.autosave.lastAt } }),
     // 素材
-    listSources, listAssets, refresh, selectSource, assetUrl,
+    listSources, listAssets, refresh, selectSource, setFolder, assetUrl,
     placeAsset, placeInPanel, placeFree,
     // コマ
     getTargetPanel: () => describe(getTargetPanel()),

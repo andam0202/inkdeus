@@ -61,8 +61,11 @@ export function createGallery(root, host) {
   const chips = el('div', { class: 'gal-chips', role: 'group', 'aria-label': '状態で絞り込み' });
   const count = el('div', { class: 'gal-count' });
   const grid = el('div', { class: 'gal-grid' });
+  // 画像フォルダの切り替え（フォルダが1つだけなら出さない）
+  const folderSel = el('select', { class: 'gal-folder', title: '画像フォルダ（画像セット）を切り替える', 'aria-label': '画像フォルダ' });
+  const folderRow = el('div', { class: 'gal-row gal-folder-row', hidden: true }, el('span', { class: 'gal-folder-label' }, 'フォルダ'), folderSel);
   const body = el('div', { class: 'gal-body' },
-    el('div', { class: 'gal-row' }, search, kind), chips, count, grid);
+    folderRow, el('div', { class: 'gal-row' }, search, kind), chips, count, grid);
   const resize = el('div', { class: 'gal-resize', role: 'separator', 'aria-orientation': 'vertical',
     title: 'ドラッグで幅を変える（ダブルクリックで既定の幅）' });
   const toggle = el('button', { type: 'button', class: 'gal-toggle', title: '画像の一覧を開く／閉じる' }, el('span', {}, '画像'));
@@ -126,13 +129,27 @@ export function createGallery(root, host) {
 
   // ---- 中身 ----
 
+  const sourceOf = (kindName) => (host.assetSource ? host.assetSource(kindName) : kindName);
+
+  /** 画像フォルダの選択欄を作り直す（各フォルダ名に枚数） */
+  function setFolders() {
+    const folders = host.folders ? host.folders() : [];
+    folderRow.hidden = folders.length < 2;
+    folderSel.replaceChildren(...folders.map((f) => el('option', { value: f.name },
+      `${f.label || f.name}（${f.counts ? f.counts.images : 0}）`)));
+    folderSel.value = host.folder ? host.folder() : '';
+    folderSel.disabled = host.locked();
+  }
+  folderSel.addEventListener('change', () => { if (!host.locked() && host.setFolder) host.setFolder(folderSel.value); });
+
   function thumbOf(item) {
     if (view.kind === 'inked' && item.hasExport && item.exportFile) {
       // 白黒版は書き出しのたびに中身が替わるので、更新時刻を付けて古い物を使い回させない
-      return { src: `api/assets/inked/thumb/${encodePath(item.exportFile)}?h=${THUMB_H}&v=${item.exportVersion || 0}`,
+      return { src: `api/assets/${encodeURIComponent(sourceOf('inked'))}/thumb/${encodePath(item.exportFile)}?h=${THUMB_H}&v=${item.exportVersion || 0}`,
         missing: false };
     }
-    return { src: `api/assets/source/thumb/${encodePath(item.name)}?h=${THUMB_H}`, missing: view.kind === 'inked' };
+    return { src: `api/assets/${encodeURIComponent(sourceOf('source'))}/thumb/${encodePath(item.name)}?h=${THUMB_H}`,
+      missing: view.kind === 'inked' };
   }
 
   function paint(cell, item) {
@@ -233,8 +250,9 @@ export function createGallery(root, host) {
   });
 
   applyLayout();
+  setFolders();
   refresh();
-  return { refresh, update, setCurrent: showCurrent, visibleNames, setOpen, setWidth,
+  return { refresh, update, setCurrent: showCurrent, visibleNames, setOpen, setWidth, setFolders,
     state: () => ({ open: view.open, width: view.width === null ? WIDTH.def : view.width, kind: view.kind,
       filter: view.filter, q: view.q }) };
 }

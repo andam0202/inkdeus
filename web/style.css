@@ -162,3 +162,8 @@ body.batching .gal-item { pointer-events: none; }             /* 一括書き出
 /* 一括書き出しの間は、設定や画像の切り替えを触れないようにする（中止ボタンだけ押せる） */
 body.batching #panel, body.batching #topbar { pointer-events: none; opacity: 0.55; }
 .navlink:hover { border-color: var(--dim); }
+
+/* 画像一覧パネルの、画像フォルダの切り替え */
+.gal-folder-row { align-items: center; gap: 4px; }
+.gal-folder-label { flex: none; color: var(--dim); font-size: 11px; }
+.gal-folder { flex: 1; min-width: 0; }
