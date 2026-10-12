@@ -167,3 +167,28 @@ body.batching #panel, body.batching #topbar { pointer-events: none; opacity: 0.5
 .gal-folder-row { align-items: center; gap: 4px; }
 .gal-folder-label { flex: none; color: var(--dim); font-size: 11px; }
 .gal-folder { flex: 1; min-width: 0; }
+
+/* ---- ツールバー（手のひら / 消しゴム / ペン）と、筆の大きさを示す円 ---- */
+#toolbar {
+  position: absolute; left: 0; right: 0; top: 0; min-height: 34px; z-index: 3;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 4px 8px; font-size: 12px;
+  background: rgba(28, 28, 32, 0.88); border-bottom: 1px solid var(--line);
+}
+#toolbar button, #toolbar select { padding: 2px 8px; }
+.tool-group { display: inline-flex; gap: 2px; }
+.tool-opts { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.tool-slider { display: inline-flex; align-items: center; gap: 4px; user-select: none; }
+.tool-slider input[type="range"] { width: 64px; accent-color: var(--accent); }
+.tool-slider input[type="number"] { width: 48px; background: var(--bg); border: 1px solid var(--line); border-radius: 3px; padding: 1px 3px; }
+.tool-note { color: var(--dim); }
+.tool-note.warn { color: #f2b56b; }
+.tool-mark, .erased { color: #f2b56b; border: 1px solid #f2b56b; border-radius: 3px; padding: 0 5px; font-size: 11px; white-space: nowrap; }
+.erased { align-self: flex-start; }
+#brushCursor {
+  position: absolute; z-index: 2; box-sizing: border-box; pointer-events: none;
+  border: 1px solid #fff; outline: 1px solid rgba(0, 0, 0, 0.7); border-radius: 50%;
+}
+#gl.painting { cursor: crosshair; }
+#messages { top: 44px; }
+.layer.selected { box-shadow: inset 3px 0 0 #6fb1ff; border-color: #6fb1ff; }
+body.batching #toolbar { pointer-events: none; opacity: 0.55; }

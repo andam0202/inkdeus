@@ -96,11 +96,14 @@ def browser():
         b.close()
 
 
-def open_page(browser, url: str, auto_export: bool = False):
+def open_page(browser, url: str, auto_export: bool = False, prepare=None):
     """白黒化の画面を開く。自動書き出しは、それを確かめるテスト以外では切っておく
-    （描画の検証の途中で、頼んでいない書き出しが走らないように）"""
+    （描画の検証の途中で、頼んでいない書き出しが走らないように）。
+    prepare(page) は、読み込む前にページへ手を入れるための物（通信の差し替えなど）"""
     page = browser.new_page(viewport={"width": 1200, "height": 800})
     page.set_default_timeout(600_000)
+    if prepare is not None:
+        prepare(page)
     if not auto_export:
         page.add_init_script("try { if (localStorage.getItem('inkdeus.autoExport') === null) "
                              "localStorage.setItem('inkdeus.autoExport', '0'); } catch (e) {}")

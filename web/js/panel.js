@@ -153,12 +153,21 @@ function inputSection(ctx) {
 
 function simpleSection(ctx, key, defaultOpen = true) {
   const { params } = ctx.state;
-  return section(key, Object.entries(SECTIONS[key]).map(([k, f]) => fieldRow(ctx, f, params[key], k)), defaultOpen);
+  return section(key, [
+    ...Object.entries(SECTIONS[key]).map(([k, f]) => fieldRow(ctx, f, params[key], k)),
+    key === 'lines' ? erasedMark(ctx, 'lines', '線画には、消しゴムで消した所があります') : null,
+  ], defaultOpen);
+}
+
+/** 消しゴムで消した所があることを示す小さな印 */
+function erasedMark(ctx, target, title) {
+  return ctx.painted(target) ? el('span', { class: 'erased', 'data-erased': target, title }, '消しあり') : null;
 }
 
 function layerCard(ctx, region, layers, layer, index) {
-  const { solo } = ctx.state;
+  const { solo, selLayer } = ctx.state;
   const isSolo = !!solo && solo.region === region && solo.index === index;
+  const isSelected = !!selLayer && selLayer.id === layer.id;
   const change = (fn) => (e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -177,6 +186,7 @@ function layerCard(ctx, region, layers, layer, index) {
   const summary = el('summary', {},
     enabled,
     el('span', { class: 'title' }, `層${index + 1}  <${layer.threshold.toFixed(2)}  ${layer.angle}°`),
+    erasedMark(ctx, `layer-${layer.id}`, 'この層には、消しゴムで消した所があります'),
     soloBtn,
     el('button', { title: '上へ', disabled: index === 0,
       onclick: change(() => layers.splice(index - 1, 0, layers.splice(index, 1)[0])) }, '↑'),
@@ -189,9 +199,15 @@ function layerCard(ctx, region, layers, layer, index) {
     Object.entries(LAYER_FIELDS)
       .filter(([k]) => k !== 'enabled' && k !== 'type')
       .map(([k, f]) => fieldRow(ctx, f, layer, k)));
-  const cls = ['layer', layer.enabled ? '' : 'off', isSolo ? 'solo' : ''].join(' ');
+  // 行をクリックすると、消しゴムを当てる「選択中の層」になる（ボタン・チェックは除く。ソロ表示とは別）
+  summary.title = 'クリックで、消しゴムを当てる層として選ぶ';
+  summary.addEventListener('click', (e) => {
+    if (!e.target.closest('button, input')) ctx.selectLayer(region, layer.id);
+  });
+  const cls = ['layer', layer.enabled ? '' : 'off', isSolo ? 'solo' : '', isSelected ? 'selected' : ''].join(' ');
   const card = fold(`layer:${region}:${index}`, summary, body, cls, index === 0);
   card.dataset.layer = index;
+  card.dataset.id = layer.id;
   return card;
 }
 
@@ -228,7 +244,8 @@ function regionTone(ctx, region, target) {
   return [
     levels,
     el('div', { 'data-group': 'solid', class: 'body' },
-      Object.entries(SOLID_FIELDS).map(([k, f]) => fieldRow(ctx, f, target.solid, k))),
+      Object.entries(SOLID_FIELDS).map(([k, f]) => fieldRow(ctx, f, target.solid, k)),
+      erasedMark(ctx, `solid-${region}`, `${REGION_LABELS[region]}のベタには、消しゴムで消した所があります`)),
     el('div', { class: 'buttons' }, add, el('span', { class: 'note' }, `${layers.length} / ${MAX_LAYERS} 層`)),
     el('div', { class: 'note' }, '平滑化した輝度がしきい値未満の所に線を引きます。暗い所ほど多くの層が重なります。'),
     solo && solo.region === region

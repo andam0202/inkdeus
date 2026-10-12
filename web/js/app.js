@@ -4,9 +4,11 @@ import { Renderer } from './renderer.js';
 import { encodeGrayPNG } from './png.js';
 import { buildPanel } from './panel.js';
 import { createGallery } from './gallery.js';
+import { createTools } from './tools.js';
+import { layerTarget, isTarget, unionRect } from './paint.js';
 import {
   SCHEMA, normalize, defaultParams, applyStyle, effectiveUnit, effectiveWatermark, STYLES,
-  withoutIds, inheritIds,
+  withoutIds, inheritIds, layerIds,
 } from './schema.js';
 
 const $ = (id) => document.getElementById(id);
@@ -18,6 +20,10 @@ const AUTO_EXPORT_KEY = 'inkdeus.autoExport';
 // このブラウザ画面の ID。自分の保存で出たイベントを「外部からの変更」と取り違えないために使う
 const CLIENT_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 const HISTORY_MAX = 200;
+const PAINT_SAVE_DELAY_MS = 1000;                  // 筆を置き終えてから、この時間が経ったら消しゴム・ペンを保存する
+const PAINT_HISTORY_BYTES = 256 * 1024 * 1024;     // 筆の取り消し用に持つ画素の上限（超えたら古い履歴から捨てる）
+const STROKE_SLOW_MS = 40;                         // 筆の最中の合成がこれより遅い環境では、合成の頻度を落とす
+const REGION_LABELS = { person: '人物', background: '背景' };
 const ZOOM_MIN = 0.02;
 const ZOOM_MAX = 32;
 
@@ -37,6 +43,7 @@ const state = {
   rev: null,            // 表示中の設定に対応する設定ファイルの版（未保存の変更があるときは古い）
   hasMask: false,
   solo: null,           // { region, index } でその層だけ表示
+  selLayer: null,       // { region, id } 消しゴムを当てる「選択中の層」（層の行をクリックして選ぶ。ソロとは別）
   tab: 'person',        // トーンのパネルで開いているタブ
   project: null,
   lastExport: '',
@@ -53,9 +60,11 @@ const state = {
 
 let renderer = null;
 let gallery = null;                     // 画像一覧パネル（サーバありのときだけ）
+let tools = null;                       // プレビューの上のツールバー（手のひら / 消しゴム / ペン）
 let history = [];
+let hsteps = [];                        // history と同じ並び。その状態へ進むときの筆（消しゴム・ペンの1筆）の記録。筆でなければ null
 let hpos = -1;
-const historyStash = new Map();         // バージョン名 → { history, hpos }（表示中の画像の、ほかのバージョンの履歴）
+const historyStash = new Map();         // バージョン名 → { history, hsteps, hpos }（表示中の画像の、ほかのバージョンの履歴）
 let saveTimer = null;
 let saving = false;
 let statsTimer = null;
@@ -237,12 +246,15 @@ function resizeCanvas() {
 function fitView() {
   if (!renderer || !renderer.W) return;
   const canvas = $('gl');
-  const barPx = 34 * (window.devicePixelRatio || 1);
-  const zoom = Math.min(canvas.width / renderer.W, Math.max(1, canvas.height - barPx) / renderer.H) * 0.98;
+  const dpr = window.devicePixelRatio || 1;
+  const barPx = 34 * dpr;
+  // 上のツールバー（折り返すと高くなる）と下の表示バーの分を空ける
+  const topPx = Math.max(34, $('toolbar').offsetHeight || 0) * dpr;
+  const zoom = Math.min(canvas.width / renderer.W, Math.max(1, canvas.height - topPx - barPx) / renderer.H) * 0.98;
   state.view = {
     zoom: Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, zoom)),
     cx: renderer.W / 2,
-    cy: renderer.H / 2 + (barPx / 2) / zoom,
+    cy: renderer.H / 2 + ((barPx - topPx) / 2) / zoom,
   };
   requestDraw();
 }
@@ -258,6 +270,7 @@ function zoomAt(newZoom, px, py) {
   v.cy += dy / v.zoom - dy / z;
   v.zoom = z;
   requestDraw();
+  if (tools) tools.placeCursor();                      // 筆の大きさを示す円も、表示倍率に合わせる
 }
 
 function canvasPoint(e) {
@@ -266,6 +279,23 @@ function canvasPoint(e) {
   const sx = canvas.width / Math.max(1, rect.width);
   const sy = canvas.height / Math.max(1, rect.height);
   return [(e.clientX - rect.left) * sx, (e.clientY - rect.top) * sy];
+}
+
+/** ポインタの位置 → 画像の座標（px。画像の外も返す） */
+function imagePoint(e) {
+  const canvas = $('gl');
+  const [px, py] = canvasPoint(e);
+  const v = state.view;
+  return [(px - canvas.width / 2) / v.zoom + v.cx, (py - canvas.height / 2) / v.zoom + v.cy];
+}
+
+/** 画像の座標 → 画面（ビューポート）の座標 */
+function clientPoint(x, y) {
+  const canvas = $('gl');
+  const rect = canvas.getBoundingClientRect();
+  const v = state.view;
+  return [rect.left + ((x - v.cx) * v.zoom + canvas.width / 2) * (rect.width / Math.max(1, canvas.width)),
+    rect.top + ((y - v.cy) * v.zoom + canvas.height / 2) * (rect.height / Math.max(1, canvas.height))];
 }
 
 function wireViewer() {
@@ -280,20 +310,24 @@ function wireViewer() {
   let drag = null;
   canvas.addEventListener('pointerdown', (e) => {
     if (e.button !== 0 && e.button !== 1) return;
-    canvas.setPointerCapture(e.pointerId);
+    try { canvas.setPointerCapture(e.pointerId); } catch { /* 取れなくても動く */ }
+    // 消しゴム・ペンの最中は、左ドラッグは筆。移動は中ボタンか、スペースを押しながらのドラッグ
+    if (tools && tools.pointerDown(e)) return;
     drag = { p: canvasPoint(e), cx: state.view.cx, cy: state.view.cy };
     canvas.classList.add('dragging');
   });
   canvas.addEventListener('pointermove', (e) => {
+    if (tools && tools.pointerMove(e)) return;
     if (!drag) return;
     const [px, py] = canvasPoint(e);
     state.view.cx = drag.cx - (px - drag.p[0]) / state.view.zoom;
     state.view.cy = drag.cy - (py - drag.p[1]) / state.view.zoom;
     requestDraw();
   });
-  const end = () => { drag = null; canvas.classList.remove('dragging'); };
+  const end = () => { if (tools) tools.pointerUp(); drag = null; canvas.classList.remove('dragging'); };
   canvas.addEventListener('pointerup', end);
   canvas.addEventListener('pointercancel', end);
+  canvas.addEventListener('pointerleave', () => { if (tools) tools.pointerLeave(); });
 
   const handle = $('splitHandle');
   let splitting = false;
@@ -326,13 +360,25 @@ function wireViewer() {
   }
   const typing = (t) => t && (t.tagName === 'TEXTAREA' || t.tagName === 'SELECT'
     || (t.tagName === 'INPUT' && ['text', 'number', 'search'].includes(t.type)));
+  const plain = (e) => !typing(e.target) && !e.ctrlKey && !e.metaKey && !e.altKey;
   window.addEventListener('keydown', (e) => {
     if (e.code === 'Space' && !typing(e.target)) {
+      e.preventDefault();
+      // 消しゴム・ペンの最中のスペースは「一時的に手のひら」。手のひらのときは従来どおり元画像を表示
+      if (!e.repeat && !(tools && tools.setSpace(true))) showOriginal(true);
+      return;
+    }
+    if (e.code === 'KeyO' && plain(e)) {                         // O: 押している間だけ元画像（どのツールでも）
       e.preventDefault();
       if (!e.repeat) showOriginal(true);
       return;
     }
-    if ((e.key === '[' || e.key === ']') && !typing(e.target) && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    // E 消しゴム / B ペン / H 手のひら / X 切り替え。消しゴム・ペンの最中の [ ] は太さ
+    if (tools && !batch.running && tools.keyDown(e)) {
+      e.preventDefault();
+      return;
+    }
+    if ((e.key === '[' || e.key === ']') && plain(e)) {
       e.preventDefault();
       if (!e.repeat) stepImage(e.key === ']' ? 1 : -1);        // 前後の画像（絞り込み中はその中で）
       return;
@@ -344,9 +390,20 @@ function wireViewer() {
     else if (k === 'y' || (k === 'z' && e.shiftKey)) { e.preventDefault(); redo(); }
   });
   window.addEventListener('keyup', (e) => {
-    if (e.code === 'Space' && !typing(e.target)) { e.preventDefault(); showOriginal(false); }
+    if (e.code === 'Space' && !typing(e.target)) {
+      e.preventDefault();
+      if (tools) tools.setSpace(false);
+      showOriginal(false);
+    } else if (e.code === 'KeyO') showOriginal(false);
   });
-  window.addEventListener('blur', () => showOriginal(false));
+  window.addEventListener('blur', () => {
+    showOriginal(false);
+    if (tools) { tools.setSpace(false); tools.pointerUp(); }
+  });
+  // タブを離れる・閉じるときは、待ち時間を待たずに保存を済ませる（設定と、消しゴム・ペン）
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && !batch.running) flushSave().catch((e) => console.warn(e));
+  });
   new ResizeObserver(resizeCanvas).observe($('viewer'));
 }
 
@@ -363,6 +420,8 @@ const ctx = {
     if (redraw) { requestRender(); rebuild(); }
   },
   setTab: (tab) => { state.tab = tab; rebuild(); },
+  selectLayer: (region, id) => selectLayer(region, id),
+  painted: (target) => !!renderer && renderer.paint.has(target),
   style: (key, region) => {
     state.params = applyStyle(state.params, key, region);
     state.solo = null;
@@ -385,36 +444,65 @@ function rebuild() {
   buildPanel($('panel'), ctx);
   $('btnUndo').disabled = hpos <= 0;
   $('btnRedo').disabled = hpos >= history.length - 1;
+  usedKey = renderer ? renderer.paint.targets().join() : '';
+  if (tools) tools.refresh();
 }
 
 function resetHistory() {
   history = [JSON.stringify(state.params)];
+  hsteps = [null];
   hpos = 0;
+}
+
+const historyBytes = () => hsteps.reduce((n, step) => n + (step ? step.bytes : 0), 0);
+
+/** 履歴が上限（件数・筆の画素の量）を超えたら、古い物から捨てる */
+function trimHistory() {
+  while (history.length > 1 && (history.length > HISTORY_MAX || historyBytes() > PAINT_HISTORY_BYTES)) {
+    history.shift();
+    hsteps.shift();
+    hsteps[0] = null;                 // 先頭になった状態より前へは戻れない
+    hpos -= 1;
+  }
+}
+
+/** いまの状態を履歴の末尾に積む（step は、その状態へ進むときの筆の記録） */
+function pushHistory(snap, step) {
+  history.length = hpos + 1;
+  hsteps.length = hpos + 1;
+  history.push(snap);
+  hsteps.push(step);
+  hpos = history.length - 1;
+  trimHistory();
+  $('btnUndo').disabled = hpos <= 0;
+  $('btnRedo').disabled = true;
 }
 
 /** いまの設定を履歴に積む。save=false は「すでにファイルと同じ内容」のとき（外部からの更新） */
 function commit(save = true) {
   const snap = JSON.stringify(state.params);
   if (snap === history[hpos]) return;
-  history.length = hpos + 1;
-  history.push(snap);
-  if (history.length > HISTORY_MAX) history.shift();
-  hpos = history.length - 1;
-  $('btnUndo').disabled = hpos <= 0;
-  $('btnRedo').disabled = true;
+  pushHistory(snap, null);
   if (save) scheduleSave();
   touchAutoExport();
+  touchPaint();                       // 層が消えた・戻った・入れ替わったら、その層の消しゴムの保存も合わせる
 }
 
+/** 取り消し・やり直し。スライダーなどの設定の変更と、消しゴム・ペンの1筆が、行った順に戻る */
 function stepHistory(delta) {
   const next = hpos + delta;
-  if (next < 0 || next >= history.length) return;
+  if (next < 0 || next >= history.length || (tools && tools.stroking())) return;
+  // 筆の記録は「その状態へ進むとき」の物。戻るときは今の状態の記録を、進むときは次の状態の記録を当てる
+  const step = hsteps[delta < 0 ? hpos : next];
+  if (step) renderer.paint.swap(step);
+  const before = history[hpos];
   hpos = next;
   state.params = JSON.parse(history[hpos]);
   state.solo = null;
   rebuild();
   requestRender();
-  scheduleSave();
+  if (history[hpos] !== before) scheduleSave();
+  touchPaint();
   touchAutoExport();
 }
 const undo = () => stepHistory(-1);
@@ -476,11 +564,267 @@ async function saveNow({ idsOnly = false } = {}) {
   }
 }
 
+/** 待っている保存（設定と、消しゴム・ペン）を、いますぐ済ませる */
 async function flushSave() {
-  if (!saveTimer) return;
-  clearTimeout(saveTimer);
-  saveTimer = null;
-  await saveNow();
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    await saveNow();
+  }
+  await flushPaint();
+}
+
+// ---- 消しゴム・ペン（人が画面で描く物）: 筆・履歴・保存 ----
+
+const paintSync = {
+  timer: null, running: null, again: false, loading: false,
+  onServer: new Set(),                // サーバに保存してある対象
+  saved: new Map(),                   // 対象 → 保存してある版（renderer.paint.rev）
+};
+let usedKey = '';                     // パネルに出している「消しあり」の印の元（変わったらパネルを作り直す）
+let strokeDirty = null;               // 筆の最中に変わった範囲（まだ合成し直していない分）
+let strokePending = false;
+let lastStrokeMs = 0;
+
+/** 消しゴム・ペンをサーバへ保存できるか（できなければメモリ上だけで働く。書き出しには反映される） */
+const paintPersistent = () => state.paintOK && canAutoSave();
+
+/** その対象が、いまの設定から参照されているか（消された層・入れ替わった層のマスクは保存しない） */
+function paintReferenced(target) {
+  return !target.startsWith('layer-') || layerIds(state.params).has(target.slice(6));
+}
+
+const paintURL = (name, target, version, folder, extra = '') => `api/paint/${encodeURIComponent(name)}`
+  + (target ? `/${encodeURIComponent(target)}` : '') + queryOf(version, folder, extra);
+
+function resetPaintSync() {
+  clearTimeout(paintSync.timer);
+  paintSync.timer = null;
+  paintSync.again = false;
+  paintSync.onServer.clear();
+  paintSync.saved.clear();
+  strokeDirty = null;
+}
+
+/** 表示中の画像・バージョンの消しゴム・ペンを読み込む（別の画像の物は引き継がない） */
+async function loadPaint() {
+  resetPaintSync();
+  if (!paintPersistent()) return;
+  const name = state.name;
+  const version = state.version;
+  const folder = state.folder;
+  const list = await getJSON(paintURL(name, '', version, folder));
+  for (const row of (list && Array.isArray(list.targets) ? list.targets : [])) {
+    if (!isTarget(row.target)) continue;
+    try {
+      const r = await fetch(paintURL(name, row.target, version, folder, `v=${row.stamp || 0}`), { cache: 'no-store' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const bitmap = await createImageBitmap(await r.blob(), BITMAP_OPTS);
+      try {
+        paintSync.saved.set(row.target, renderer.paint.load(row.target, bitmap));
+      } finally {
+        bitmap.close();
+      }
+      paintSync.onServer.add(row.target);
+    } catch (e) {
+      showMessage(`消しゴム・ペンを読み込めませんでした（${row.target}）: ${e.message}`, 'error');
+    }
+  }
+}
+
+/** 消しゴム・ペンが変わったときに呼ぶ。少し待ってから、変わった対象だけ保存する */
+function touchPaint() {
+  if (!paintPersistent() || !renderer) return;
+  if (!renderer.paint.info.size && !paintSync.onServer.size) return;
+  setSaveState('未保存');
+  clearTimeout(paintSync.timer);
+  paintSync.timer = setTimeout(() => { paintSync.timer = null; savePaint(); }, PAINT_SAVE_DELAY_MS);
+}
+
+/** 変わった対象を保存し、無くなった対象（空になった・層が消えた）をサーバからも消す */
+function savePaint() {
+  if (!paintPersistent()) return Promise.resolve();
+  if (paintSync.running) {
+    paintSync.again = true;
+    return paintSync.running;
+  }
+  if (tools && tools.stroking()) {      // 筆の最中には保存しない
+    touchPaint();
+    return Promise.resolve();
+  }
+  const name = state.name;
+  const version = state.version;
+  const folder = state.folder;
+  const here = () => state.remote && state.name === name && state.version === version && state.folder === folder;
+  const headers = { 'X-Inkdeus-Client': CLIENT_ID };
+  const { paint } = renderer;
+  paintSync.running = (async () => {
+    let changed = false;
+    try {
+      for (let round = 0; round < 4; round++) {
+        paintSync.again = false;
+        for (const target of new Set([...paint.info.keys(), ...paintSync.onServer])) {
+          if (!here()) return;
+          if (paint.has(target) && paintReferenced(target)) {
+            if (paintSync.onServer.has(target) && paintSync.saved.get(target) === paint.rev(target)) continue;
+            const made = await paint.encode(target);
+            if (!here()) return;
+            if (made && made.stale) {           // 保存の途中で筆が入った。あとでやり直す
+              paintSync.again = true;
+              continue;
+            }
+            if (made) {
+              const r = await fetch(paintURL(name, target, version, folder), {
+                method: 'PUT', body: made.blob, headers: { ...headers, 'Content-Type': 'image/png' } });
+              if (!r.ok) throw new Error(`HTTP ${r.status}`);
+              paintSync.saved.set(target, made.rev);
+              paintSync.onServer.add(target);
+              changed = true;
+              continue;
+            }
+          }
+          if (paintSync.onServer.has(target)) {
+            const r = await fetch(paintURL(name, target, version, folder), { method: 'DELETE', headers });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            paintSync.onServer.delete(target);
+            paintSync.saved.delete(target);
+            changed = true;
+          }
+        }
+        if (!paintSync.again) break;
+      }
+      if (changed && here()) mark(name, version, { exportFresh: false });      // いまの白黒版は、もう最新ではない
+      if (!saveTimer && !paintSync.timer && here()) setSaveState('保存済み');
+      if (usedKey !== paint.targets().join()) rebuild();      // 「戻す」で空になった対象の印を消す
+    } catch (e) {
+      setSaveState('保存に失敗');
+      showMessage(`消しゴム・ペンを保存できませんでした: ${e.message}`, 'error');
+    } finally {
+      paintSync.running = null;
+    }
+  })();
+  return paintSync.running;
+}
+
+async function flushPaint() {
+  if (paintSync.timer) {
+    clearTimeout(paintSync.timer);
+    paintSync.timer = null;
+    await savePaint();
+  }
+  if (paintSync.running) await paintSync.running;
+}
+
+/** 消しゴムの対象（'layer' | 'solid' | 'lines' | 'all'）から、実際のマスクの名前と表示名を決める */
+function eraseTargetOf(kind) {
+  if (kind === 'lines') return { target: 'lines', label: '線画' };
+  if (kind === 'all') return { target: 'all', label: 'トーン・ベタ・線画をまとめて' };
+  if (kind === 'solid') {
+    // ベタは人物・背景それぞれにマスクがある。開いているタブの側を消す（マスクの無い画像は全体が人物）
+    const region = state.hasMask && state.tab === 'background' ? 'background' : 'person';
+    return { target: `solid-${region}`, label: state.hasMask ? `${REGION_LABELS[region]}のベタ（タブで切り替え）` : 'ベタ' };
+  }
+  const sel = state.selLayer;
+  const layers = sel && state.params ? state.params.regions[sel.region].layers : [];
+  const index = sel ? layers.findIndex((l) => l.id === sel.id) : -1;
+  if (index < 0) return { error: '消す層を、右のパネルの層の行をクリックして選んでください' };
+  return { target: layerTarget(sel.id), label: `${REGION_LABELS[sel.region]}の層${index + 1}`, region: sel.region, index };
+}
+
+/** 消しゴムを当てる層を選ぶ（層の行のクリック。パネルは作り直さず、強調だけ付け替える） */
+function selectLayer(region, id) {
+  state.selLayer = id ? { region, id } : null;
+  for (const card of document.querySelectorAll('#panel .layer')) {
+    card.classList.toggle('selected', !!id && card.dataset.id === id);
+  }
+  if (tools) tools.refresh();
+}
+
+function beginStroke(target, brush) {
+  if (!renderer || !renderer.W || batch.running) return false;
+  try {
+    renderer.paint.beginStroke(target, brush);
+    return true;
+  } catch (e) {
+    showMessage(e.message, 'error');
+    return false;
+  }
+}
+
+/** 筆の最中の画面の更新: 変わった範囲だけを合成し直す（前段のパスは作り直さない） */
+function strokeRender() {
+  strokePending = false;
+  if (!strokeDirty || !renderer) return;
+  const rect = strokeDirty;
+  strokeDirty = null;
+  try {
+    renderSeq += 1;
+    lastStrokeMs = renderer.render(state.params, { solo: state.solo, rect }).ms;
+  } catch (e) {
+    showMessage(`描画に失敗しました: ${e.message}`, 'error');
+  }
+  drawNow();
+}
+
+function stampStroke(x, y, radius) {
+  strokeDirty = unionRect(strokeDirty, renderer.paint.stamp(x, y, radius));
+  if (strokePending || !strokeDirty) return;
+  strokePending = true;
+  // 合成が重い環境では頻度を落とす（筆そのものは GPU 上で即座に打たれている）
+  if (lastStrokeMs > STROKE_SLOW_MS) setTimeout(() => requestAnimationFrame(strokeRender), Math.min(250, lastStrokeMs * 2));
+  else requestAnimationFrame(strokeRender);
+}
+
+/** 1筆を終える: 履歴に1件として積み、正規の合成をして、保存と自動書き出しを予約する */
+function endStroke() {
+  const step = renderer.paint.endStroke();
+  strokeDirty = null;
+  if (step) pushHistory(JSON.stringify(state.params), step);
+  renderNow();
+  if (!step) return;
+  touchPaint();
+  touchAutoExport();
+  if (usedKey !== renderer.paint.targets().join()) rebuild();
+}
+
+/** 対象に描いた物を全部消す（取り消せる） */
+function clearTarget(target) {
+  if (!renderer || !renderer.W || batch.running || (tools && tools.stroking())) return false;
+  const step = renderer.paint.clear(target);
+  if (step) pushHistory(JSON.stringify(state.params), step);
+  rebuild();
+  renderNow();
+  touchPaint();
+  touchAutoExport();
+  return !!step;
+}
+
+/** どこかで（ctl・別のタブ）消しゴム・ペンが変わった。開いている物なら読み直す */
+async function onPaintEvent(ev) {
+  if (folderOf(ev) !== state.folder) return;
+  const version = typeof ev.version === 'string' ? ev.version : '';
+  if (ev.source === CLIENT_ID) return;                 // この画面自身の保存（印は保存したときに付けてある）
+  mark(ev.name, version, { exportFresh: false });
+  if (!state.remote || ev.name !== state.name) return;
+  if (version !== state.version) {
+    historyStash.delete(version);     // そのバージョンの筆の履歴は、もう当てはまらない
+    return;
+  }
+  if (batch.running) return;
+  if (tools) tools.pointerUp();
+  paintSync.loading = true;
+  try {
+    if (paintSync.running) await paintSync.running.catch(() => {});
+    renderer.paint.clearAll();
+    await loadPaint();
+  } finally {
+    paintSync.loading = false;
+  }
+  resetHistory();                     // 筆の履歴は、読み直した絵には当てはまらない
+  rebuild();
+  renderNow();
+  touchAutoExport();
+  showMessage('消しゴム・ペンが外部から変更されました（取り消しの履歴は消えます）');
 }
 
 // ---- 外部との連携（統計の送信・設定ファイルの外部変更・指示の受け取り） ----
@@ -561,6 +905,7 @@ function connectEvents() {
     if (ev.type === 'params') onExternalParams(ev).catch((e) => console.warn(e));
     else if (ev.type === 'exported') onExported(ev);
     else if (ev.type === 'versions') onVersions(ev).catch((e) => console.warn(e));
+    else if (ev.type === 'paint') onPaintEvent(ev).catch((e) => console.warn(e));
     else if (batch.running && (ev.type === 'open' || ev.type === 'export')) return;   // 一括書き出しの最中は受けない
     else if (ev.type === 'open') openByName(ev.name, ev.version, ev.folder).catch((e) => console.warn(e));
     else if (ev.type === 'export') openByName(ev.name, ev.version, ev.folder).then(() => exportNow()).catch((e) => console.warn(e));
@@ -781,19 +1126,28 @@ async function dropPending() {
   autoExport.timer = null;
   autoExport.again = false;
   autoExport.dirty = false;
+  resetPaintSync();
+  if (paintSync.running) await paintSync.running.catch(() => {});
   if (autoExport.running) await autoExport.running.catch(() => {});
 }
+
+const ownDeletes = new Set();            // この画面が削除している最中のバージョン（通知が来ても、開き直しを重ねない）
 
 async function deleteVersion(version) {
   needVersions();
   if (!version) throw new Error('既定のバージョンは削除できません');
   const name = state.name;
   if (version === state.version) await dropPending();
-  await versionRequest('DELETE', null, `version=${encodeURIComponent(version)}`);
-  historyStash.delete(version);
-  await refreshImages();
-  if (state.name === name && version === state.version) {
-    await openIndex(state.images.findIndex((i) => i.name === name), '');
+  ownDeletes.add(version);
+  try {
+    await versionRequest('DELETE', null, `version=${encodeURIComponent(version)}`);
+    historyStash.delete(version);
+    await refreshImages();
+    if (state.name === name && version === state.version) {
+      await openIndex(state.images.findIndex((i) => i.name === name), '');
+    }
+  } finally {
+    ownDeletes.delete(version);
   }
 }
 
@@ -805,7 +1159,7 @@ async function onVersions(ev) {
     if (historyStash.has(ev.version)) { historyStash.set(ev.to, historyStash.get(ev.version)); historyStash.delete(ev.version); }
     followRename(ev.version, ev.to);
   }
-  const gone = mine && ev.action === 'delete' && ev.version === state.version;
+  const gone = mine && ev.action === 'delete' && ev.version === state.version && !ownDeletes.has(ev.version);
   if (gone) await dropPending();
   await refreshImages();
   if (gone && state.name === ev.name && state.version === ev.version && !batch.running) {
@@ -898,7 +1252,9 @@ async function openIndex(i, version = '') {
   }
   // 同じ画像のバージョンを切り替えるだけなら、画像とマスクは読み直さない。取り消し履歴はバージョンごとに取っておく
   const sameImage = state.remote && state.name === item.name && renderer.W > 0;
-  if (sameImage) historyStash.set(state.version, { history, hpos });
+  // 筆の履歴は、保存してある絵を読み直せるときだけ取っておける（メモリ上だけの絵は、離れると消える）
+  if (sameImage && (paintPersistent() || !hsteps.some(Boolean))) historyStash.set(state.version, { history, hsteps, hpos });
+  else if (sameImage) historyStash.delete(state.version);
   else historyStash.clear();
   setBusy(true);
   try {
@@ -931,6 +1287,7 @@ async function openIndex(i, version = '') {
       const kept = sameImage ? historyStash.get(version) : null;
       if (kept && sig(JSON.parse(kept.history[kept.hpos])) === sig(state.params)) {
         history = kept.history;
+        hsteps = kept.hsteps;
         hpos = kept.hpos;
         state.params = JSON.parse(history[hpos]);
         rebuild();
@@ -948,6 +1305,10 @@ async function openIndex(i, version = '') {
       if (sig(state.params) !== sig(defaultParams())) await saveNow();
     }
     historyStash.delete(version);
+    // 消しゴム・ペンは画像・バージョンごと（直前の設定を引き継ぐときも、これは引き継がない）
+    if (sameImage) renderer.paint.clearAll();
+    await loadPaint();
+    rebuild();
     rememberLast();
     postState();
     renderNow();
@@ -972,6 +1333,7 @@ async function openLocalImage(file) {
   setBusy(true);
   try {
     await setImageBlob(file, file.name, false);
+    resetPaintSync();
     historyStash.clear();
     updateVersionUI();
     postState();
@@ -1148,8 +1510,8 @@ function runAutoExport() {
     autoExport.again = true;                    // 書き出し中に来た変更は、終わってから1回だけやり直す（溜めない）
     return autoExport.running;
   }
-  if (state.solo || renderPending) {
-    // ソロ表示の間は書き出さない（その層だけの絵になってしまう）。戻るのを待つ
+  if (state.solo || renderPending || (tools && tools.stroking())) {
+    // ソロ表示の間は書き出さない（その層だけの絵になってしまう）。戻るのを待つ（筆の最中も待つ）
     autoExport.timer = setTimeout(runAutoExport, 500);
     return Promise.resolve();
   }
@@ -1399,6 +1761,20 @@ async function init() {
   $('modeBadge').textContent = state.server ? 'サーバ' : 'サーバなし';
   $('linkManga').hidden = !state.server;          // 漫画の構成（/manga/）は inkdeus のサーバが配信する
 
+  tools = createTools($('toolbar'), $('brushCursor'), {
+    canvas: $('gl'),
+    hasImage: () => !!renderer && renderer.W > 0,
+    locked: () => batch.running,
+    unit: () => effectiveUnit(state.params, renderer.W),
+    zoom: () => state.view.zoom,
+    imagePoint: (e) => imagePoint(e),
+    eraseTarget: (kind) => eraseTargetOf(kind),
+    used: (target) => !!target && renderer.paint.has(target),
+    usedTargets: () => renderer.paint.targets(),
+    persistent: () => paintPersistent(),
+    beginStroke, stamp: stampStroke, endStroke, clearTarget,
+    message: (text, kind) => showMessage(text, kind),
+  });
   wireViewer();
   wireFiles();
   wireVersions();
@@ -1478,6 +1854,33 @@ const hooks = {
   openVersion: async (version) => { await openIndex(state.index, version); return state.version; },
   createVersion, renameVersion, deleteVersion,
   historyInfo: () => ({ length: history.length, pos: hpos }),
+  // 消しゴム・ペン
+  paint: {
+    state: () => ({ ...tools.state(), selected: state.selLayer, targets: renderer.paint.targets(),
+      persistent: paintPersistent(), maskSize: [renderer.paint.mw, renderer.paint.mh],
+      saving: !!paintSync.timer || !!paintSync.running, loading: paintSync.loading,
+      onServer: [...paintSync.onServer].sort(),
+      historyBytes: historyBytes(), steps: hsteps.filter(Boolean).length }),
+    setTool: (tool) => tools.setTool(tool),
+    set: (tool, values) => tools.set(tool, values),
+    setEraseTarget: (kind) => tools.setEraseTarget(kind),
+    toggle: () => tools.toggleMode(),
+    /** region の index 番目の層を「選択中の層」にする */
+    select: (region, index) => selectLayer(region, state.params.regions[region].layers[index].id),
+    target: (kind) => eraseTargetOf(kind),
+    used: (target) => renderer.paint.has(target),
+    clear: (target) => clearTarget(target),
+    flush: () => flushPaint(),
+    /** 画像の座標 → 画面の座標（ポインタ操作を合成するため） */
+    clientPoint: (x, y) => clientPoint(x, y),
+    /** 筆を1本、座標の並び [[x, y, 半径(画像px)], …] で直接描く（履歴・保存は画面の操作と同じ道を通る） */
+    stroke: (target, brush, points) => {
+      if (!beginStroke(target, brush)) return false;
+      for (const [x, y, r] of points) stampStroke(x, y, r);
+      endStroke();
+      return true;
+    },
+  },
   save: async () => { clearTimeout(saveTimer); saveTimer = null; await saveNow(); },
   readPixels: (x, y, w, h) => renderer.readPixels(x, y, w, h),
   readPixelsBase64: (x, y, w, h) => {
@@ -1496,7 +1899,9 @@ const hooks = {
   abortExportAll,
   gallery: () => (gallery ? { ...gallery.state(), visible: gallery.visibleNames() } : null),
   batch: () => batchReport(),
-  undo, redo,
+  // 取り消し・やり直し（結果をすぐ読めるよう、その場で描画まで済ませる）
+  undo: () => { undo(); renderNow(); },
+  redo: () => { redo(); renderNow(); },
 };
 window.inkdeus = hooks;
 hooks.ready = init();
