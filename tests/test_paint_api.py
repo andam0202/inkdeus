@@ -256,6 +256,11 @@ def test_external_layer_changes_prune_masks(env):
     send(client, "POST", "/api/style/scene.png", {"style": "hatch1", "region": "person"})
     assert targets(client) == ["pen", "solid-person"]
     assert [e["type"] for e in iter(lambda: q.get_nowait() if not q.empty() else None, None)] == ["params"]
+    # 層の id が抜けた設定を読んで id を補うだけのときは、片付けない
+    client.put("/api/paint/scene.png/layer-abcd1234", data=png_bytes())
+    (out / "scene.inkdeus.json").write_text('{"version": 2}', encoding="utf-8")
+    client.get("/api/params/scene.png?resolve=1")
+    assert "id" in (out / "scene.inkdeus.json").read_text(encoding="utf-8") and "layer-abcd1234" in targets(client)
 
 
 # ---- ctl paint ----

@@ -457,7 +457,8 @@ class Session:
                 os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
             rev = rev_of(data)
             self.remember(path, entry, version, rev)
-            if source is None:
+            if source is None and not keep_mtime:
+                # （id を補うだけの保存では片付けない。手で書いた設定から id が抜けていただけかもしれない）
                 self.prune_paint(entry, params, version)
         self.hub.publish({"type": "params", "folder": self.folder, "name": entry.name, "version": version,
                           "rev": rev, "source": source, **({"idsOnly": True} if keep_mtime else {})})

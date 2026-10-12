@@ -661,6 +661,14 @@ function savePaint() {
   paintSync.running = (async () => {
     let changed = false;
     try {
+      // 設定がまだ保存されていない画像なら、先に設定を保存する（層の消しゴムは、設定に書かれた層の id と結び付くため）
+      const wanted = [...paint.info.keys()].some((t) => paint.has(t));
+      if (wanted && !(verOf(state.images.find((i) => i.name === name), version) || {}).hasParams) {
+        clearTimeout(saveTimer);
+        saveTimer = null;
+        await saveNow();
+        if (!here()) return;
+      }
       for (let round = 0; round < 4; round++) {
         paintSync.again = false;
         for (const target of new Set([...paint.info.keys(), ...paintSync.onServer])) {

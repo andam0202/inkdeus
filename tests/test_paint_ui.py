@@ -546,6 +546,24 @@ def test_saved_after_a_short_wait_and_reloaded_identically(live):
     assert page.errors == [] and again.errors == []
 
 
+def test_drawing_on_an_unsaved_image_saves_its_settings_too(live):
+    page = live["open"]("?image=other.png")                     # 設定がまだ保存されていない画像（既定の設定で出ている）
+    out = live["out"]
+    assert not (out / "other.inkdeus.json").exists()
+    eraser(page, "layer")
+    page.locator('.layer[data-layer="0"] > summary .title').click()
+    drag(page, ACROSS)
+    drawn = pixels(page)
+    page.evaluate("() => window.inkdeus.paint.flush()")
+    # 層の消しゴムは層の id と結び付くので、設定（id を含む）も一緒に保存される
+    saved = json.loads((out / "other.inkdeus.json").read_text(encoding="utf-8"))
+    first = saved["regions"]["person"]["layers"][0]["id"]
+    assert sorted(p.name for p in (out / "other.paint").glob("*.png")) == [f"layer-{first}.png"]
+    again = live["open"]("?image=other.png")
+    assert (pixels(again) == drawn).all() and paint(again)["targets"] == [f"layer-{first}"]
+    assert page.errors == [] and again.errors == []
+
+
 def test_versions_and_folders_keep_their_own_paint(live):
     page = live["open"]()
     base = show(page, MIX)
