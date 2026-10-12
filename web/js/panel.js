@@ -217,7 +217,25 @@ function styleSelect(ctx, region) {
     // 部分には、背景向けの意味を持つスタイル（白・線だけ）は出さない（「白抜き」を使う）
     Object.entries(STYLES).filter(([, st]) => !(part && st.backgroundOnly))
       .map(([value, st]) => el('option', { value, title: st.description }, st.label)));
-  sel.addEventListener('change', () => { if (sel.value) ctx.style(sel.value, region); });
+  // 自分用スタイル（サーバが対応しているときだけ）: 組み込みの下に「自分用」「このプロジェクト」の見出しで並べる
+  const mine = ctx.userStyles ? ctx.userStyles(region) : null;
+  if (mine) {
+    for (const [origin, label] of [['user', '自分用'], ['project', 'このプロジェクト']]) {
+      const items = mine.filter((r) => r.origin === origin);
+      if (!items.length) continue;
+      sel.append(el('optgroup', { label, 'data-origin': origin }, items.map((r) => el('option', {
+        value: `@${origin}:${r.name}`, title: r.description || null,
+      }, `${r.name}${r.includeLevels ? '（明るさ補正つき）' : ''}`))));
+    }
+    sel.append(el('optgroup', { label: '自分用スタイル', 'data-origin': 'actions' },
+      el('option', { value: '@save' }, 'いまの設定をスタイルとして保存…'),
+      el('option', { value: '@manage' }, '自分用スタイルを管理…')));
+  }
+  sel.addEventListener('change', () => {
+    const value = sel.value;
+    sel.value = '';                   // 選んだままにしない（ダイアログを開く項目もあるため）
+    if (value) ctx.style(value, region);
+  });
   return sel;
 }
 

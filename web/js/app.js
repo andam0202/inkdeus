@@ -5,6 +5,7 @@ import { encodeGrayPNG } from './png.js';
 import { buildPanel } from './panel.js';
 import { createGallery } from './gallery.js';
 import { createTools } from './tools.js';
+import { createStyleUI, customOf } from './styles.js';
 import { layerTarget, isTarget, unionRect } from './paint.js';
 import {
   SCHEMA, normalize, defaultParams, applyStyle, effectiveUnit, effectiveWatermark, STYLES,
@@ -41,6 +42,7 @@ const state = {
   parts: [],            // 表示中の画像にマスクのある部分名（部分マップに入っている順）
   partNames: [],        // いまの画像フォルダの部分名（部分マスクの置き場にある部分）
   highlight: null,      // 強調表示している領域（'person' | 'background' | 部分名）
+  userStylesOK: false,  // サーバが自分用スタイル（名前を付けて保存したスタイル）に対応しているか
   remote: false,        // 表示中の画像がサーバの一覧のものか（ドロップした画像は false）
   params: null,
   rev: null,            // 表示中の設定に対応する設定ファイルの版（未保存の変更があるときは古い）
@@ -64,6 +66,7 @@ const state = {
 let renderer = null;
 let gallery = null;                     // 画像一覧パネル（サーバありのときだけ）
 let tools = null;                       // プレビューの上のツールバー（手のひら / 消しゴム / ペン）
+let styleUI = null;                     // 自分用スタイル（一覧・保存・管理のダイアログ）
 let history = [];
 let hsteps = [];                        // history と同じ並び。その状態へ進むときの筆（消しゴム・ペンの1筆）の記録。筆でなければ null
 let hpos = -1;
@@ -485,11 +488,9 @@ const ctx = {
   highlight: (region) => setHighlight(region),
   selectLayer: (region, id) => selectLayer(region, id),
   painted: (target) => !!renderer && renderer.paint.has(target),
-  style: (key, region) => {
-    state.params = applyStyle(state.params, key, region);
-    state.solo = null;
-    commit(); rebuild(); requestRender();
-  },
+  style: (key, region) => applyStyleTo(key, region),
+  // 自分用スタイル（その領域の選択欄に出す物）。サーバが対応していなければ null（選択欄に何も足さない）
+  userStyles: (region) => (state.userStylesOK && styleUI ? styleUI.listFor(region) : null),
   exportNow: () => exportNow(),
   setAutoExport: (on) => setAutoExport(on),
   exportAll: () => exportAll({ force: state.batchForce, defaultOnly: state.batchDefaultOnly,
@@ -502,6 +503,46 @@ const ctx = {
   openJSON: () => $('fileParams').click(),
   openMask: () => $('fileMask').click(),
 };
+
+/**
+ * スタイルを領域に当てる（組み込みも自分用も同じ経路。取り消せる）。
+ * key は組み込みのスタイルのキー、または @user:<名前> / @project:<名前>（自分用）、@save / @manage（ダイアログを開く）
+ */
+function applyStyleTo(key, region) {
+  if (key === '@save' || key === '@manage') {
+    if (styleUI && state.userStylesOK) (key === '@save' ? styleUI.openSave : styleUI.openManage)(region);
+    return false;
+  }
+  const mine = /^@(user|project):(.*)$/.exec(key);
+  let custom = null;
+  if (mine) {
+    const row = styleUI ? styleUI.find(mine[1], mine[2]) : null;
+    if (!row) {
+      showMessage(`スタイルが見つかりません: ${mine[2]}`, 'error');
+      return false;
+    }
+    custom = customOf(row);
+  }
+  state.params = applyStyle(state.params, key, region, custom);
+  state.solo = null;
+  commit(); rebuild(); requestRender();
+  return true;
+}
+
+/** いまの設定の、その領域の中身（自分用スタイルとして保存する形）。人物と同じ設定で描いている背景・部分は、人物の物 */
+function regionData(region, withLevels) {
+  const regions = state.params.regions;
+  const own = regions[region] || regions.person;
+  const tone = own.linked === true ? regions.person : own;
+  const data = { solid: { ...tone.solid }, layers: tone.layers.map(({ id, ...rest }) => rest) };
+  if (withLevels) data.levels = { ...tone.levels };
+  let target = 'any';
+  if (region === 'background') {
+    data.mode = own.mode;
+    if (own.mode !== 'keep') target = 'background';     // 「白」「線だけ」は背景にしか意味が無い
+  }
+  return { data, target };
+}
 
 function rebuild() {
   buildPanel($('panel'), ctx);
@@ -994,6 +1035,7 @@ function connectEvents() {
     else if (ev.type === 'exported') onExported(ev);
     else if (ev.type === 'versions') onVersions(ev).catch((e) => console.warn(e));
     else if (ev.type === 'paint') onPaintEvent(ev).catch((e) => console.warn(e));
+    else if (ev.type === 'styles') { if (styleUI && ev.source !== CLIENT_ID) styleUI.refresh(); }   // 自分用スタイルが外で変わった
     else if (batch.running && (ev.type === 'open' || ev.type === 'export')) return;   // 一括書き出しの最中は受けない
     else if (ev.type === 'open') openByName(ev.name, ev.version, ev.folder).catch((e) => console.warn(e));
     else if (ev.type === 'export') openByName(ev.name, ev.version, ev.folder).then(() => exportNow()).catch((e) => console.warn(e));
@@ -1877,6 +1919,17 @@ async function init() {
   // 部分（regions.<部分名>）と solid.lineKnockout。サーバなしのときは、画面だけで使える（部分マスクはサーバから読む）
   state.partsOK = !state.server || features.includes('parts');
   state.partNames = state.partsOK && list && Array.isArray(list.parts) ? list.parts.filter(isPartName) : [];
+  state.userStylesOK = features.includes('userStyles');
+  styleUI = createStyleUI({
+    enabled: () => state.userStylesOK,
+    hasProject: () => !!state.project,
+    clientId: CLIENT_ID,
+    regionData: (region, withLevels) => regionData(region, withLevels),
+    apply: (row, region) => applyStyleTo(`@${row.origin}:${row.name}`, region),
+    changed: () => { if (history.length) rebuild(); },
+    message: (text, kind) => showMessage(text, kind),
+  });
+  if (state.userStylesOK) await styleUI.refresh();
   showProject();
   state.params = defaultParams();
   try { state.autoExport = localStorage.getItem(AUTO_EXPORT_KEY) !== '0'; } catch { state.autoExport = true; }
@@ -1978,6 +2031,19 @@ const hooks = {
   openVersion: async (version) => { await openIndex(state.index, version); return state.version; },
   createVersion, renameVersion, deleteVersion,
   historyInfo: () => ({ length: history.length, pos: hpos }),
+  // 自分用スタイル（名前を付けて保存したスタイル）
+  userStyles: {
+    ok: () => state.userStylesOK,
+    list: () => (styleUI ? styleUI.list() : []),
+    refresh: () => styleUI.refresh(),
+    /** いまの設定の、その領域の中身を保存する。opts = { name, description, scope, includeLevels } */
+    save: (opts, region = 'person') => styleUI.save(opts, region),
+    remove: (origin, name) => styleUI.remove(origin, name),
+    rename: (origin, name, to) => styleUI.rename(origin, name, to),
+    overwrite: (origin, name, region = 'person') => styleUI.overwrite(origin, name, region),
+    /** スタイルを領域に当てる（選択欄で選ぶのと同じ経路）。当てたら true */
+    apply: (origin, name, region = 'person') => { const ok = applyStyleTo(`@${origin}:${name}`, region); renderNow(); return ok; },
+  },
   // 部分（髪・肌・服など）と領域
   parts: () => state.parts.slice(),
   partsInfo: () => ({ ok: state.partsOK, parts: state.parts.slice(), names: state.partNames.slice(), tab: state.tab,

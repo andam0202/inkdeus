@@ -193,3 +193,20 @@ body.batching #panel, body.batching #topbar { pointer-events: none; opacity: 0.5
 #messages { top: 44px; }
 .layer.selected { box-shadow: inset 3px 0 0 #6fb1ff; border-color: #6fb1ff; }
 body.batching #toolbar { pointer-events: none; opacity: 0.55; }
+
+/* 自分用スタイル（保存・管理のダイアログ） */
+.style-dialog { background: var(--bg2); color: var(--fg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 14px 16px; width: min(520px, 92vw); max-height: 86vh; overflow: auto; }
+.style-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
+.style-dialog h3 { margin: 0 0 10px; font-size: 14px; }
+.style-dialog input[type="text"] { background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 3px 6px; width: 100%; }
+.style-form { display: grid; grid-template-columns: max-content 1fr; gap: 8px 10px; align-items: center; }
+.style-form > .note { grid-column: 1 / 3; min-height: 1.5em; }
+.style-scopes { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.style-dialog-buttons { justify-content: flex-end; margin-top: 12px; }
+.style-list { display: flex; flex-direction: column; gap: 8px; }
+.style-row { border: 1px solid var(--line); border-radius: 5px; padding: 6px 8px; display: flex; flex-direction: column; gap: 4px; }
+.style-row-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+.style-row-name { font-weight: 700; }
+.style-origin { font-size: 11px; border: 1px solid var(--line); border-radius: 3px; padding: 0 5px; color: #9ec5ff; }
+.style-origin[data-origin="project"] { color: #a8d8a0; }
