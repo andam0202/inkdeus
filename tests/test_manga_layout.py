@@ -641,3 +641,282 @@ def test_merge_keeps_both_images_and_remove_handles_images(lay):
     L(lay, "remove", 1)
     assert panels(lay) == [] and info(lay)["layout"] is None and len(linked(lay)) == 2
 
+
+# ---- 間隔・余白、断ち切り、自由変形、画像の追従、取り込み、外部操作 ----
+
+def slide(page, selector: str, value: float, commit: bool = True) -> None:
+    """スライダーを動かす（input）。commit で離す（change）"""
+    page.evaluate("""([sel, value, commit]) => { const node = document.querySelector(sel); node.value = String(value);
+        node.dispatchEvent(new Event('input', {bubbles: true}));
+        if (commit) node.dispatchEvent(new Event('change', {bubbles: true})); }""", [selector, value, commit])
+    page.wait_for_timeout(40)
+
+
+def test_gutter_and_margin_sliders_recompute_the_whole_page(lay):
+    made = grid(lay, "2,2", gutter={"v": 0.03, "h": 0.02})
+    open_section(lay)
+    lay.wait_for_function("() => document.querySelector('#ikl-gutter-v').value === '3'")
+    assert lay.input_value("#ikl-gutter-h") == "2" and lay.input_value("#ikl-margin-top") == "5"
+    page_w, page_h = made["page"]["width"], made["page"]["height"]
+    short = min(page_w, page_h)
+    history = depth(lay)
+    slide(lay, "#ikl-gutter-v", 4, commit=False)                    # 動かしている間は軽い描き直しだけ（履歴には積まない）
+    slide(lay, "#ikl-gutter-v", 6, commit=False)
+    assert matches_layout(lay) is False and lay.evaluate("() => stateStack.length") == history
+    live = {p["guid"]: p["pts"] for p in panels(lay)}
+    slide(lay, "#ikl-gutter-v", 8)                                  # 離したときに 1 件だけ確定
+    after = info(lay)
+    assert after["layout"]["gutter"] == {"v": 0.08, "h": 0.02} and matches_layout(lay) and depth(lay) == history + 1
+    assert live != {p["guid"]: p["pts"] for p in panels(lay)}
+    b = boxes(after["cells"])
+    assert (b[3][1] - b[1][3]) * page_h == pytest.approx(0.08 * short, abs=0.5)
+    assert lay.inner_text("#ikl-gutter-v + .ikl-value") == "8%"
+    slide(lay, "#ikl-gutter-h", 5)
+    b = boxes(info(lay)["cells"])
+    assert (b[1][0] - b[2][2]) * page_w == pytest.approx(0.05 * short, abs=0.5) and matches_layout(lay)
+    slide(lay, "#ikl-margin-v", 10)
+    slide(lay, "#ikl-margin-h", 2)
+    after = info(lay)
+    assert after["layout"]["margin"] == {"top": 0.1, "right": 0.02, "bottom": 0.1, "left": 0.02}
+    b = boxes(after["cells"])
+    assert b[1][1] * page_h == pytest.approx(0.1 * short, abs=0.5) and (1 - b[1][2]) * page_w == pytest.approx(0.02 * short, abs=0.5)
+    assert matches_layout(lay) and depth(lay) == history + 4
+    # 個別の余白
+    lay.fill("#ikl-margin-left", "12")
+    lay.press("#ikl-margin-left", "Tab")
+    lay.wait_for_function("() => window.inkdeusBridge.layout.get().layout.margin.left === 0.12")
+    after = info(lay)
+    assert after["layout"]["margin"]["right"] == 0.02 and matches_layout(lay)
+    assert boxes(after["cells"])[2][0] * page_w == pytest.approx(0.12 * short, abs=0.5)
+    # 取り消し 1 回で 1 つ前の値へ
+    undo(lay)
+    assert info(lay)["layout"]["margin"]["left"] == 0.02 and matches_layout(lay)
+    lay.wait_for_function("() => document.querySelector('#ikl-margin-left').value === '2'")
+
+
+def test_bleed_extends_the_edges_that_touch_the_page(lay):
+    made = grid(lay, "2,1")
+    enter(lay)
+    open_section(lay)
+    top_right = made["cells"][0]
+    center = screen(lay)["cells"][top_right["id"]]["center"]
+    lay.mouse.click(center["x"], center["y"])
+    lay.wait_for_selector(".ikl-bleed:not([hidden])")
+    shown = lay.evaluate("() => ['top', 'right', 'bottom', 'left'].map(s => !document.getElementById('ikl-bleed-' + s).parentNode.hidden)")
+    assert shown == [True, True, False, False]                      # ページの端に接している辺だけ
+    assert top_right["edges"] == {"top": True, "right": True, "bottom": False, "left": False}
+    lay.check("#ikl-bleed-top")
+    lay.wait_for_function("(id) => window.inkdeusBridge.layout.get().cells.find(c => c.id === id).rect.y === 0", arg=top_right["id"])
+    lay.check("#ikl-bleed-right")
+    after = info(lay)
+    cell = next(c for c in after["cells"] if c["id"] == top_right["id"])
+    assert cell["rect"]["y"] == 0 and cell["rect"]["x"] + cell["rect"]["w"] == pytest.approx(1)
+    assert cell["rect"]["x"] == pytest.approx(top_right["rect"]["x"]) and matches_layout(lay)
+    assert near(boxes(after["cells"])[2], boxes(made["cells"])[2], tol=1e-9)
+    lay.uncheck("#ikl-bleed-top")
+    lay.wait_for_function("(id) => window.inkdeusBridge.layout.get().cells.find(c => c.id === id).rect.y > 0", arg=top_right["id"])
+    assert matches_layout(lay)
+    with pytest.raises(Exception, match="top / right / bottom / left"):
+        L(lay, "bleed", 1, "middle", True)
+
+
+def test_free_transform_unlinks_a_panel_and_can_be_relinked(lay):
+    made = grid(lay, "1,1", gutter={"v": 0.04, "h": 0.03})
+    enter(lay)
+    open_section(lay)
+    first, second = made["cells"]
+    spots = screen(lay)
+    lay.mouse.click(spots["cells"][first["id"]]["center"]["x"], spots["cells"][first["id"]]["center"]["y"])
+    lay.wait_for_function("() => window.inkdeusBridge.layout.get().selected.length === 1")
+    history = depth(lay)
+    corner = screen(lay)["cells"][first["id"]]["points"][2]         # 右下の頂点を掴んで動かす
+    drag(lay, corner, -60, -40)
+    after = info(lay)
+    cell = next(c for c in after["cells"] if c["id"] == first["id"])
+    assert cell["free"] is True and depth(lay) == history + 1
+    scale = spots["scale"]
+    assert cell["points"][2][0] == pytest.approx(first["points"][2][0] - 60 / scale / after["page"]["width"], abs=0.003)
+    assert cell["points"][2][1] == pytest.approx(first["points"][2][1] - 40 / scale / after["page"]["height"], abs=0.003)
+    assert near([cell["points"][i] for i in (0, 1, 3)], [first["points"][i] for i in (0, 1, 3)], tol=1e-9)
+    assert matches_layout(lay) and "連動から外れています" in lay.inner_text(".ikl-sel-name") and lay.is_visible("#ikl-unfree")
+    # 連動から外れたコマは、間隔のスライダーや境界線のドラッグでは動かない
+    shape = cell["points"]
+    L(lay, "gutter", 0.1, 0.03)
+    L(lay, "moveBoundary", after["bounds"][0]["key"], 0.05)
+    now = info(lay)
+    assert near(next(c for c in now["cells"] if c["id"] == first["id"])["points"], shape, tol=1e-9)
+    assert not near(boxes(now["cells"])[2], boxes(made["cells"])[2], tol=1e-4) and matches_layout(lay)
+    # 辺のドラッグは 2 頂点を同時に動かす
+    pts = screen(lay)["cells"][first["id"]]["points"]
+    drag(lay, {"x": (pts[0]["x"] + pts[1]["x"]) / 2, "y": (pts[0]["y"] + pts[1]["y"]) / 2}, 0, 25)
+    edge = next(c for c in info(lay)["cells"] if c["id"] == first["id"])["points"]
+    assert edge[0][1] - shape[0][1] == pytest.approx(edge[1][1] - shape[1][1], abs=1e-9) and edge[0][1] > shape[0][1] + 0.01
+    assert near(edge[2:], shape[2:], tol=1e-9) and matches_layout(lay)
+    # 「連動に戻す」で元の長方形へ
+    lay.click("#ikl-unfree")
+    lay.wait_for_function("(id) => !window.inkdeusBridge.layout.get().cells.find(c => c.id === id).free", arg=first["id"])
+    back = next(c for c in info(lay)["cells"] if c["id"] == first["id"])
+    assert back["points"][0][1] == pytest.approx(back["points"][1][1]) and back["points"][2][1] == pytest.approx(back["points"][3][1])
+    assert matches_layout(lay)
+    # 漫画エディタ側の操作でコマを動かしたときも、その形のまま連動から外れる
+    lay.keyboard.press("Escape")
+    lay.evaluate("""(g) => { const p = canvas.getObjects().find(o => o.guid === g); p.left += 30; p.setCoords();
+        saveInitialState(p); canvas.fire('object:modified', {target: p}); }""", second["guid"])
+    moved = next(c for c in info(lay)["cells"] if c["id"] == second["id"])
+    assert moved["free"] is True and matches_layout(lay)
+    L(lay, "unfree", second["id"])
+    assert matches_layout(lay) and not any(c["free"] for c in info(lay)["cells"])
+
+
+@pytest.mark.parametrize("mode", ["keep", "none", "cover"])
+def test_images_follow_the_panel_in_three_ways(lay, mode):
+    made = grid(lay, "1,1", gutter={"v": 0.04, "h": 0.03})
+    target = made["cells"][0]
+    image = place(lay, target["guid"])
+    # 絵を少し小さくして左上へ寄せる（コマに対する位置と大きさが分かるように）
+    lay.evaluate("""(g) => { const o = canvas.getObjects().find(x => x.guid === g); o.scaleX *= 0.6; o.scaleY *= 0.6;
+        o.left -= 20; o.top -= 10; o.setCoords(); saveInitialState(o); }""", image["guid"])
+    assert L(lay, "setFollow", mode) == mode and lay.input_value("#ikl-follow") == mode
+    before = picture(lay, image["guid"])
+    old = panel_box(lay, target["guid"])
+    L(lay, "moveBoundary", made["bounds"][0]["key"], 0.15)           # 上のコマを縦に伸ばす
+    now = picture(lay, image["guid"])
+    new = panel_box(lay, target["guid"])
+    assert new[3] > old[3] + 20 and now["panel"] == target["guid"]
+    assert near(now["clip"], new, tol=4)                             # 切り抜きは、どの場合も新しい形
+    if mode == "none":
+        assert near((now["cx"], now["cy"], now["w"], now["h"]), (before["cx"], before["cy"], before["w"], before["h"]), tol=1e-6)
+    elif mode == "keep":
+        k = ((new[3] - new[1]) / (old[3] - old[1])) ** 0.5           # 等倍率（コマの面積の比の平方根）
+        assert now["w"] == pytest.approx(before["w"] * k, rel=1e-6) and now["h"] == pytest.approx(before["h"] * k, rel=1e-6)
+        fx, fy = (before["cx"] - old[0]) / (old[2] - old[0]), (before["cy"] - old[1]) / (old[3] - old[1])
+        assert (now["cx"] - new[0]) / (new[2] - new[0]) == pytest.approx(fx, abs=1e-6)       # 中心の相対位置を保つ
+        assert (now["cy"] - new[1]) / (new[3] - new[1]) == pytest.approx(fy, abs=1e-6)
+    else:
+        assert_covers(lay, now, target["guid"])
+        assert near((now["cx"], now["cy"]), ((new[0] + new[2]) / 2, (new[1] + new[3]) / 2), tol=0.01)
+        assert min(now["w"] / (new[2] - new[0]), now["h"] / (new[3] - new[1])) == pytest.approx(1, abs=1e-6)
+    # 画面に合わせ直しても（上流の再フィット）、絵は巻き戻らない
+    lay.evaluate("() => forcedAdjustCanvasSize()")
+    assert near(picture(lay, image["guid"]), now, tol=1e-6)
+    # 境界を戻すと、絵も元へ戻る（行って戻っても、ずれが溜まらない）
+    L(lay, "moveBoundary", made["bounds"][0]["key"], -0.15)
+    back = picture(lay, image["guid"])
+    if mode != "cover":
+        assert near((back["cx"], back["cy"], back["w"], back["h"]), (before["cx"], before["cy"], before["w"], before["h"]), tol=1e-4)
+    L(lay, "setFollow", "keep")
+
+
+def test_follow_during_a_drag_is_computed_from_the_start(lay):
+    """ドラッグの途中で行き過ぎて戻しても、絵の大きさは最後の位置だけで決まる"""
+    made = grid(lay, "1,1", gutter={"v": 0.04, "h": 0.03})
+    image = place(lay, made["cells"][0]["guid"])
+    before = picture(lay, image["guid"])
+    enter(lay)
+    start = screen(lay)["bounds"][made["bounds"][0]["key"]]["mid"]
+    lay.mouse.move(start["x"], start["y"])
+    lay.mouse.down()
+    for dy in (40, 120, 200, 120, 40, 0, -60, 0, 10, 1, 0):
+        lay.mouse.move(start["x"], start["y"] + dy)
+    lay.mouse.up()
+    lay.wait_for_timeout(60)
+    assert near(picture(lay, image["guid"]), before, tol=0.05) and matches_layout(lay)
+
+
+def apply_upstream_template(page) -> None:
+    """上流のコマのひな形を 1 つ適用する（新しいページができる）"""
+    page.wait_for_function("() => typeof MangaPanelsImage_Vertical !== 'undefined' && MangaPanelsImage_Vertical.length > 2")
+    page.evaluate("""async () => { if (btmShouldSaveCurrentPage()) await btmSaveProjectFile();
+        setCanvasGUID(); loadSVGPlusReset(MangaPanelsImage_Vertical[2].svg); }""")
+    page.wait_for_function("() => { const p = window.inkdeusBridge.panels();"
+                           " return p.length >= 2 && p.every((x) => !!x.guid) && !isProjectBusy(); }")
+    page.evaluate("async () => { flushHistory(); await btmSaveProjectFile(null, false); }")
+
+
+def test_import_existing_panels_into_a_layout(lay):
+    apply_upstream_template(lay)
+    count = len(panels(lay))
+    assert count >= 2 and info(lay)["layout"] is None and info(lay)["unmanaged"] == count
+    open_section(lay)
+    lay.wait_for_function("() => document.querySelector('.ikl-info').textContent.includes('まだレイアウトに入っていません')")
+    before = {p["guid"]: p["pts"] for p in panels(lay)}
+    target = panels(lay)[0]["guid"]
+    image = place(lay, target)
+    history = depth(lay)
+    lay.click("#ikl-import")
+    lay.wait_for_function("() => !!window.inkdeusBridge.layout.get().layout")
+    got = info(lay)
+    rectangles = lay.evaluate("""() => canvas.getObjects().filter(o => o.isPanel).filter(p => p.points && p.points.length === 4).length""")
+    assert len(got["cells"]) + got["unmanaged"] == count and len(got["cells"]) >= 2 and len(got["cells"]) <= rectangles
+    assert f"コマ {len(got['cells'])} 個を取り込みました" in lay.inner_text(".ikb-msg")
+    assert matches_layout(lay) and depth(lay) == history + 1
+    short = min(got["page"]["width"], got["page"]["height"])
+    for cell in got["cells"]:                                       # 取り込んでも、コマはほとんど動かない
+        xs, ys = [p[0] for p in before[cell["guid"]]], [p[1] for p in before[cell["guid"]]]
+        assert near((cell["rect"]["x"] * got["page"]["width"], cell["rect"]["y"] * got["page"]["height"]), (min(xs), min(ys)), tol=short * 0.03)
+    assert picture(lay, image["guid"])["panel"] == target
+    # 取り込んだあとは、ほかのコマ割りと同じように操作できる
+    key = got["bounds"][0]["key"]
+    moved = L(lay, "moveBoundary", key, 0.03)
+    assert matches_layout(lay) and not near(boxes(moved["cells"]), boxes(got["cells"]), tol=1e-4)
+    after = L(lay, "split", 1, "h")
+    assert len(after["cells"]) == len(got["cells"]) + 1 and matches_layout(lay)
+    undo(lay)
+    undo(lay)
+    undo(lay)
+    assert info(lay)["layout"] is None and near({p["guid"]: p["pts"] for p in panels(lay)}, before, tol=0.01)
+    # 行と列に分けられない配置・長方形でないコマは取り込めない
+    lay.evaluate("""() => canvas.getObjects().filter(o => o.isPanel).forEach((p, i) => {
+        p.points = [{x: 0, y: 0}, {x: 60, y: 10}, {x: 30, y: 80}]; p._setPositionDimensions({}); p.setCoords(); })""")
+    with pytest.raises(Exception, match="取り込めるコマ"):
+        L(lay, "importPanels")
+
+
+def test_deleting_a_panel_with_the_editor_leaves_a_hole_until_removed(lay):
+    made = grid(lay, "1,1,1")
+    middle = made["cells"][1]
+    lay.evaluate("(g) => { canvas.remove(canvas.getObjects().find(o => o.guid === g)); flushHistory(); }", middle["guid"])
+    after = info(lay)
+    assert [c["missing"] for c in after["cells"]] == [False, True, False] and len(panels(lay)) == 2
+    assert near(boxes(after["cells"]), boxes(made["cells"]), tol=1e-9)          # ほかのコマは勝手に動かない
+    removed = L(lay, "remove", 2)                                    # 空いた場所を消すと、隣が埋める
+    assert len(removed["cells"]) == 2 and matches_layout(lay)
+    assert removed["cells"][1]["rect"]["y"] < made["cells"][2]["rect"]["y"] - 0.05
+
+
+def test_ctl_manga_layout(lay, env):
+    from test_manga_pdf_ui import run_ctl
+
+    empty = run_ctl(lay, env, "manga", "layout", "get")
+    assert empty["code"] == 0 and empty["layout"] is None and empty["cells"] == []
+    assert "レイアウトがありません" in run_ctl(lay, env, "manga", "layout", "gutter", "3%", "2%")["error"]
+    made = run_ctl(lay, env, "manga", "layout", "grid", "2,1,3")
+    assert made["code"] == 0 and [c["number"] for c in made["cells"]] == [1, 2, 3, 4, 5, 6]
+    assert all(c["guid"] and set(c["rect"]) == {"x", "y", "w", "h"} for c in made["cells"]) and matches_layout(lay)
+    assert "コマ数" in run_ctl(lay, env, "manga", "layout", "grid", "2,x")["error"]
+    spaced = run_ctl(lay, env, "manga", "layout", "gutter", "6%", "0.04")
+    assert spaced["layout"]["gutter"] == {"v": 0.06, "h": 0.04} and matches_layout(lay)
+    edged = run_ctl(lay, env, "manga", "layout", "margin", "8%", "2%", "8%", "0.02")
+    assert edged["layout"]["margin"] == {"top": 0.08, "right": 0.02, "bottom": 0.08, "left": 0.02} and matches_layout(lay)
+    assert "範囲" in run_ctl(lay, env, "manga", "layout", "gutter", "90%", "2%")["error"]
+    # set: 葉がいまのコマをそのまま指していれば、形だけが変わる（コマは作り直されない）
+    import json
+
+    layout = run_ctl(lay, env, "manga", "layout", "get")["layout"]
+    layout["root"]["ratios"] = [0.5, 0.2, 0.3]
+    layout["gutter"]["v"] = 0.02
+    guids = sorted(p["guid"] for p in panels(lay))
+    reshaped = run_ctl(lay, env, "manga", "layout", "set", json.dumps(layout))
+    assert reshaped["code"] == 0 and sorted(p["guid"] for p in panels(lay)) == guids and matches_layout(lay)
+    heights = sorted({round(c["rect"]["h"], 4) for c in reshaped["cells"]})
+    assert len(heights) == 3 and heights[2] / heights[0] == pytest.approx(2.5, rel=0.01)
+    # 木を書き換えると、作り直す
+    rebuilt = run_ctl(lay, env, "manga", "layout", "set",
+                      json.dumps({"gutter": {"v": 0.03, "h": 0.03}, "root": {"dir": "h", "ratios": [1, 2], "children": [
+                          {}, {"dir": "v", "children": [{}, {}]}]}}))
+    assert rebuilt["code"] == 0 and len(rebuilt["cells"]) == 3 and len(panels(lay)) == 3 and matches_layout(lay)
+    assert not set(guids) & {p["guid"] for p in panels(lay)}
+    wide = [c for c in rebuilt["cells"] if c["rect"]["h"] > 0.6]
+    assert len(wide) == 1 and wide[0]["number"] == 3                 # 左の縦長のコマは、右綴じでは最後に読む
+    assert "dir" in run_ctl(lay, env, "manga", "layout", "set", '{"root": {"dir": "x", "children": [{}]}}')["error"]
+    assert "JSON" in run_ctl(lay, env, "manga", "layout", "set", "{broken")["error"]

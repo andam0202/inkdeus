@@ -363,6 +363,34 @@ def cmd_manga_pdf(c: Client, args) -> dict:
     return _manga_command(c, "pdf", payload, args.wait, args.timeout)
 
 
+def _ratio(text: str, label: str) -> float:
+    """短辺に対する割合。0.03 のような割合か、3% のような百分率で書ける"""
+    try:
+        return float(text[:-1]) / 100.0 if text.endswith("%") else float(text)
+    except ValueError as e:
+        raise CtlError(f"{label}は 0.03 のような割合か、3% のような百分率で指定してください: {text}") from e
+
+
+def cmd_manga_layout(c: Client, args) -> dict:
+    """いまのページのコマ割り（レイアウト）を読む・変える"""
+    body: dict = {"action": args.layout_action}
+    if args.layout_action == "grid":
+        body["counts"] = args.counts
+    elif args.layout_action == "set":
+        try:
+            text = sys.stdin.read() if args.layout == "-" else args.layout
+            body["layout"] = json.loads(text)
+        except ValueError as e:
+            raise CtlError(f"レイアウトが JSON として読めません: {e}") from e
+        if not isinstance(body["layout"], dict):
+            raise CtlError("レイアウトは JSON オブジェクトである必要があります")
+    elif args.layout_action == "gutter":
+        body.update(v=_ratio(args.v, "間隔（縦）"), h=_ratio(args.h, "間隔（横）"))
+    elif args.layout_action == "margin":
+        body["margin"] = {side: _ratio(getattr(args, side), "余白") for side in ("top", "right", "bottom", "left")}
+    return _manga_command(c, "layout", body, True, args.timeout)
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="inkdeus ctl",
@@ -470,7 +498,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--abort", action="store_true", help="進行中の一括書き出しを中止する")
     p.add_argument("--timeout", type=float, default=7200.0)
     p = add("manga", None, "漫画の構成の画面（/manga/ を開いているブラウザ）への指示")
-    msub = p.add_subparsers(dest="action", required=True, metavar="<pdf>")
+    msub = p.add_subparsers(dest="action", required=True, metavar="<pdf|layout>")
     q = msub.add_parser("pdf", parents=[target],
                         help="全ページ（または範囲）を、印刷向けの PDF 1つにまとめる。保存先を返す")
     q.set_defaults(func=cmd_manga_pdf)
@@ -494,6 +522,28 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--wait", action="store_true", help="終わるまで待って保存先を返す")
     q.add_argument("--abort", action="store_true", help="進行中の PDF の書き出しを中止する")
     q.add_argument("--timeout", type=float, default=3600.0)
+    q = msub.add_parser("layout", parents=[target],
+                        help="いまのページのコマ割り（行と列の構成・間隔・余白）を読む・変える。結果はコマの一覧")
+    lsub = q.add_subparsers(dest="layout_action", required=True, metavar="<get|grid|set|gutter|margin>")
+
+    def layout(name, text):
+        r = lsub.add_parser(name, parents=[target], help=text.replace('%', '%%'), description=text)
+        r.set_defaults(func=cmd_manga_layout)
+        r.add_argument("--timeout", type=float, default=60.0)
+        return r
+
+    layout("get", "いまのページのレイアウト（木と設定）と、コマの一覧（番号・guid・ページ比の外接矩形）")
+    r = layout("grid", "格子を作る（いまのページのコマを置き換える。画像は読む順に引き継ぐ）")
+    r.add_argument("counts", metavar="<行ごとのコマ数>", help="例: 2,1,3（上の行から 2 コマ・1 コマ・3 コマ）")
+    r = layout("set", "木と設定をまとめて置き換える。葉がいまのコマ（guid）をそのまま指していれば形だけを変え、"
+                      "そうでなければ作り直す")
+    r.add_argument("layout", metavar="<JSON>", help='layout get の "layout" と同じ形の JSON（- で標準入力から読む）')
+    r = layout("gutter", "コマの間隔（ページの短辺に対する割合。0.03 か 3%）")
+    r.add_argument("v", metavar="<縦>", help="行と行の間隔")
+    r.add_argument("h", metavar="<横>", help="列と列の間隔")
+    r = layout("margin", "外周の余白（ページの短辺に対する割合。0.05 か 5%）")
+    for side, label in (("top", "上"), ("right", "右"), ("bottom", "下"), ("left", "左")):
+        r.add_argument(side, metavar=f"<{label}>")
     return ap
 
 
