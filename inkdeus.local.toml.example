@@ -4,5 +4,13 @@
 # プロジェクトの置き場（既定は ~/inkdeus-projects。環境変数 INKDEUS_PROJECTS でも変えられる）
 # projects_root = "~/inkdeus-projects"
 
+# 漫画の構成（/manga/）の素材パネルに、全プロジェクト共通の素材ソースを足す（何個でも書ける）。
+# mode: "panel" = コマにはめ込む画像 / "free" = ページ上へ自由に置く素材（擬音など）
+# [[assets]]
+# name = "擬音"
+# path = "~/manga-assets/sfx"
+# mode = "free"
+# recursive = true
+
 # 以前の版にあった `owner = true`（所有者モード）は廃止しました。書いてあっても無視されます。
 # 透かしは画面の「透かしを入れる」スイッチ（設定JSON の watermark.enabled）で切り替えます。

@@ -39,6 +39,31 @@ uv run inkdeus open <名前>
 
 起動できたかは `uv run inkdeus ctl state` で確かめる（`clients` が 1 以上ならブラウザが開いている。`current` がいま開いている画像）。
 
+### 漫画の構成（コマ割り・吹き出し）も使うとき
+
+書き出した画像をページに組む画面（`/manga/`）は、別プロジェクトの漫画エディタ（Manga Editor Desu! Pro Edition、GPL-3.0）を
+利用者のPCへ取得して使う。inkdeus のリポジトリには含まれていない。
+
+```bash
+uv run inkdeus manga status            # 導入済みか確かめる
+uv run inkdeus manga install           # 未導入なら取得（初回だけ。git とネットワークが要る）
+uv run inkdeus open <名前>             # 起動（既に起動中ならそのままでよい）
+```
+
+起動後、`http://127.0.0.1:8770/manga/`（別ポートならその番号）を利用者に開いてもらう。白黒化の画面のヘッダの「漫画を構成」からも行ける。
+右端の「素材」パネルで、元画像・白黒（書き出した PNG）をコマへ入れ、プロジェクトの `manga/` へ保存・書き出しできる。
+
+擬音などの素材フォルダを使いたいと言われたら、素材ソースとして登録する（稼働中でもよい。登録後、素材パネルの「↻」を押してもらう）。
+
+```bash
+uv run inkdeus assets add <名前> --name <ソース名> --path <フォルダ> --mode free --recursive
+uv run inkdeus assets list <名前>
+uv run inkdeus assets remove <名前> --name <ソース名>
+```
+
+`--mode panel`（既定）はコマにはめ込む画像、`--mode free` はコマにはめずページ上へ自由に置く素材。`--recursive` はサブフォルダも含める。
+`/manga/` の画面の操作（コマ割り・画像の配置・吹き出し）は、いまは利用者が画面で行う（`ctl` からの操作には未対応）。
+
 ## 2. 依頼を受けたときの進め方
 
 1. **対象を確かめる**: `uv run inkdeus ctl state` → `current`（いま開いている画像）。別の画像なら `ctl open <画像名>`。
