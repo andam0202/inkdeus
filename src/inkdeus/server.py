@@ -10,6 +10,8 @@ import hashlib
 import json
 import os
 import queue
+import re
+import struct
 import threading
 import time
 import tomllib
@@ -17,9 +19,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from flask import Flask, Response, abort, jsonify, request, send_file, send_from_directory
+from flask import Flask, Response, abort, jsonify, redirect, request, send_file, send_from_directory
 from PIL import Image
 
+from . import assets as assets_mod
+from . import manga as manga_mod
 from . import schema
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
@@ -30,6 +34,9 @@ LOCAL_CONFIG_NAME = "inkdeus.local.toml"
 PARAMS_SUFFIX = ".inkdeus.json"
 WATCH_INTERVAL = 0.5
 HEARTBEAT_SECONDS = 3.0
+MANGA_NAME_RE = re.compile(r"[\w\-]{1,64}")           # 漫画データの名前（パス区切りや . を含められない）
+MANGA_AUTOSAVE = "autosave"                            # 自動保存用の予約名
+MANGA_SUFFIX = ".lz4"
 
 
 def find_web_dir() -> Path:
@@ -285,19 +292,46 @@ class Session:
         self._stop.set()
 
 
+def looks_like_manga_data(data: bytes) -> bool:
+    """漫画エディタの保存形式（先頭4バイト = 見出しの長さ、続いて JSON の見出し、残りが圧縮データ）か"""
+    if len(data) < 6:
+        return False
+    (size,) = struct.unpack("<I", data[:4])
+    if size < 2 or size > len(data) - 4:
+        return False
+    try:
+        header = json.loads(data[4:4 + size].decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    return isinstance(header, list) and all(isinstance(f, dict) and "name" in f and "size" in f for f in header)
+
+
 def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
                out_dir: Path | str | None = None,
-               project: dict | None = None, watch: bool = True) -> Flask:
-    """アプリを作る。project はプロジェクトの情報（任意）"""
+               project: dict | None = None, watch: bool = True,
+               local_config: Path | str | None = None,
+               cache_root: Path | str | None = None) -> Flask:
+    """アプリを作る。project はプロジェクトの情報（任意）。
+    local_config は共通設定ファイル（省略時はリポジトリ直下の inkdeus.local.toml）、
+    cache_root は漫画エディタのキャッシュ置き場（省略時は INKDEUS_CACHE か既定の場所）"""
     lib = Library(Path(input_path), Path(mask_dir) if mask_dir else None,
                   Path(out_dir) if out_dir else None)
     web = find_web_dir()
     session = Session(lib)
+    project_dir = Path(project["path"]) if project and project.get("path") else None
+    catalog = assets_mod.Catalog(
+        lib,
+        project_file=project_dir / "inkdeus.project.toml" if project_dir else None,
+        local_file=Path(local_config) if local_config else default_local_config())
+    manga_dir = (project_dir / "manga") if project_dir else lib.out_dir / "manga"
+    manga_site = manga_mod.MangaSite(Path(cache_root) if cache_root else None)
     app = Flask(__name__, static_folder=str(web), static_url_path="")
     app.config["MAX_CONTENT_LENGTH"] = MAX_EXPORT_BYTES
     app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
     app.config["INKDEUS_LIBRARY"] = lib
     app.config["INKDEUS_SESSION"] = session
+    app.config["INKDEUS_ASSETS"] = catalog
+    app.config["INKDEUS_MANGA_DIR"] = manga_dir
     if watch:
         session.start_watching()
 
@@ -325,6 +359,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
             "source": str(lib.folder),
             "masks": str(lib.mask_dir) if lib.mask_dir else None,
             "out": str(lib.out_dir),
+            "manga": str(manga_dir),
         }
 
     @app.errorhandler(400)
@@ -341,8 +376,13 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
 
     @app.after_request
     def _no_store(resp):
-        if request.path.startswith("/api/"):
+        path = request.path
+        if path.startswith("/api/assets/") and ("/image/" in path or "/thumb/" in path):
+            resp.headers["Cache-Control"] = "no-cache"      # 毎回確かめるが、変わっていなければ再送しない
+        elif path.startswith("/api/"):
             resp.headers["Cache-Control"] = "no-store"
+        elif path.startswith("/manga"):
+            resp.headers["Cache-Control"] = "no-cache"
         return resp
 
     @app.get("/")
@@ -352,6 +392,148 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
     @app.get("/api/config")
     def api_config():
         return jsonify({"project": project})
+
+    @app.get("/api/manga/status")
+    def api_manga_status():
+        base = manga_site.dir()
+        return jsonify({"installed": base is not None, "commit": base.name if base else None,
+                        "pinned": manga_mod.PINNED_COMMIT, "dir": str(manga_dir), "project": project})
+
+    # ---- 漫画の構成: 取得済みの漫画エディタの配信（/manga/）----
+
+    @app.get("/manga")
+    def manga_redirect():
+        return redirect("/manga/", code=308)
+
+    @app.get("/manga/")
+    @app.get("/manga/index.html")
+    def manga_index():
+        html = manga_site.index()
+        if html is None:
+            return Response(manga_mod.NOT_INSTALLED_HTML, mimetype="text/html")
+        return Response(html, mimetype="text/html")
+
+    @app.get("/manga/service-worker.js")
+    def manga_service_worker():
+        # 以前に登録された service worker を片付けるための物（上流の物は配信しない）
+        return Response(manga_mod.SW_KILL_SCRIPT, mimetype="text/javascript")
+
+    @app.get("/manga/<path:sub>")
+    def manga_file(sub: str):
+        path = manga_site.file(sub)
+        if path is None:
+            abort(404)
+        return send_file(path, conditional=True)
+
+    # ---- 漫画の構成: 素材（ソースごとの画像の一覧と縮小画像）----
+
+    def asset_source(name: str) -> assets_mod.Source:
+        src = catalog.source(name)
+        if src is None:
+            abort(404)
+        return src
+
+    def asset_item(source: str, rel: str) -> assets_mod.Item:
+        item = catalog.find(asset_source(source), rel)
+        if item is None:
+            abort(404)
+        return item
+
+    def int_arg(name: str, default: int | None, lo: int, hi: int) -> int | None:
+        raw = request.args.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            abort(400, description=f"{name} は整数で指定してください")
+        if not lo <= value <= hi:
+            abort(400, description=f"{name} は {lo}〜{hi} の範囲で指定してください")
+        return value
+
+    @app.get("/api/assets")
+    def api_assets():
+        return jsonify(catalog.summary())
+
+    @app.get("/api/assets/<source>")
+    def api_assets_list(source: str):
+        src = asset_source(source)
+        offset = int_arg("offset", 0, 0, 10 ** 9)
+        limit = int_arg("limit", assets_mod.DEFAULT_LIMIT, 1, assets_mod.MAX_LIMIT)
+        return jsonify(catalog.listing(src, request.args.get("q", ""), offset, limit))
+
+    def send_derived(item: assets_mod.Item, kind: str, value: int):
+        try:
+            path, mime = catalog.derived(item, kind, value)
+        except (assets_mod.AssetError, OSError) as e:
+            abort(400, description=str(e))
+        return send_file(path, mimetype=mime, conditional=True)
+
+    @app.get("/api/assets/<source>/image/<path:rel>")
+    def api_assets_image(source: str, rel: str):
+        item = asset_item(source, rel)
+        limit = int_arg("max", None, *assets_mod.MAX_SIDE_RANGE)
+        if limit is None:
+            return send_file(item.path, conditional=True)
+        return send_derived(item, "max", limit)
+
+    @app.get("/api/assets/<source>/thumb/<path:rel>")
+    def api_assets_thumb(source: str, rel: str):
+        item = asset_item(source, rel)
+        return send_derived(item, "thumb", int_arg("h", 160, *assets_mod.THUMB_RANGE))
+
+    # ---- 漫画の構成: 漫画データ（漫画エディタの保存形式のまま）と書き出したページ ----
+
+    def manga_name(name: str) -> str:
+        if MANGA_NAME_RE.fullmatch(name) is None:
+            abort(400, description="名前に使えるのは英数字・かな漢字・_ - だけです（64 文字まで）")
+        return name
+
+    @app.get("/api/manga/projects")
+    def api_manga_projects():
+        rows = []
+        if manga_dir.is_dir():
+            for p in sorted(manga_dir.iterdir()):
+                if p.suffix == MANGA_SUFFIX and p.is_file() and MANGA_NAME_RE.fullmatch(p.stem):
+                    st = p.stat()
+                    rows.append({"name": p.stem, "bytes": st.st_size, "mtime": st.st_mtime,
+                                 "autosave": p.stem == MANGA_AUTOSAVE})
+        return jsonify({"dir": str(manga_dir), "autosaveName": MANGA_AUTOSAVE, "projects": rows})
+
+    @app.route("/api/manga/project/<name>", methods=["GET", "PUT"])
+    def api_manga_project(name: str):
+        path = manga_dir / (manga_name(name) + MANGA_SUFFIX)
+        if request.method == "GET":
+            if not path.is_file():
+                abort(404)
+            return send_file(path, mimetype="application/octet-stream")
+        data = request.get_data(cache=False)
+        if not looks_like_manga_data(data):
+            abort(400, description="漫画データとして読めません")
+        _atomic_write(path, data)
+        return jsonify({"name": name, "path": str(path), "bytes": len(data), "mtime": path.stat().st_mtime})
+
+    @app.get("/api/manga/pages/<name>")
+    def api_manga_pages(name: str):
+        folder = manga_dir / "pages" / manga_name(name)
+        rows = []
+        if folder.is_dir():
+            for p in sorted(folder.glob("*.png")):
+                if p.stem.isdigit():
+                    st = p.stat()
+                    rows.append({"number": int(p.stem), "file": p.name, "bytes": st.st_size, "mtime": st.st_mtime})
+        return jsonify({"name": name, "dir": str(folder), "pages": rows})
+
+    @app.post("/api/manga/pages/<name>/<int:number>.png")
+    def api_manga_page(name: str, number: int):
+        if not 1 <= number <= 9999:
+            abort(400, description="ページ番号は 1〜9999 です")
+        data = request.get_data(cache=False)
+        if not data.startswith(PNG_SIGNATURE):
+            abort(400, description="PNG ではありません")
+        path = manga_dir / "pages" / manga_name(name) / f"{number:03d}.png"
+        _atomic_write(path, data)
+        return jsonify({"name": name, "number": number, "path": str(path), "bytes": len(data)})
 
     # ---- 画像・マスク ----
 

@@ -704,6 +704,7 @@ async function init() {
   state.params = defaultParams();
   resetHistory();
   $('modeBadge').textContent = state.server ? 'サーバ' : 'サーバなし';
+  $('linkManga').hidden = !state.server;          // 漫画の構成（/manga/）は inkdeus のサーバが配信する
 
   wireViewer();
   wireFiles();

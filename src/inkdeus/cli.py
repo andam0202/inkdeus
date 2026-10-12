@@ -5,20 +5,27 @@
     inkdeus projects                                    プロジェクトの一覧
     inkdeus run <画像 or フォルダ>                      プロジェクトなしで直接起動（inkdeus <path> でも可）
     inkdeus ctl …                                       稼働中のサーバを操作
+    inkdeus manga install | status                      漫画の構成に使う漫画エディタを取得する（inkdeus manga --help）
+    inkdeus assets add | list | remove <プロジェクト>   漫画の構成で使う素材ソース（画像フォルダ）を登録する
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 
-from . import ctl
-from .projects import ProjectError, create_project, list_projects, load_project, projects_root
-from .server import create_app
+from . import ctl, manga
+from .assets import BUILTIN as BUILTIN_ASSETS
+from .assets import MODES as ASSET_MODES
+from .assets import Catalog, read_toml_assets
+from .projects import (ProjectError, add_asset_source, create_project, list_projects, load_project,
+                       projects_root, remove_asset_source)
+from .server import create_app, default_local_config
 
-COMMANDS = ("run", "new", "open", "projects", "ctl")
+COMMANDS = ("run", "new", "open", "projects", "ctl", "manga", "assets")
 
 
 def _server_options(p: argparse.ArgumentParser) -> None:
@@ -56,6 +63,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="JSON で出力")
 
     sub.add_parser("ctl", help="稼働中のサーバを操作する（inkdeus ctl --help）", add_help=False)
+    sub.add_parser("manga", help="漫画の構成に使う漫画エディタを取得する（inkdeus manga --help）", add_help=False)
+
+    p = sub.add_parser("assets", help="漫画の構成で使う素材ソース（画像フォルダ）をプロジェクトに登録する")
+    asub = p.add_subparsers(dest="assets_command", required=True, metavar="<command>")
+    a = asub.add_parser("add", help="素材ソースを登録する（同じ名前があれば置き換える）")
+    a.add_argument("project", help="プロジェクト名、またはプロジェクトのフォルダ")
+    a.add_argument("--name", required=True, help="ソース名（素材パネルのタブ名になる）")
+    a.add_argument("--path", required=True, help="画像の入ったフォルダ")
+    a.add_argument("--mode", choices=ASSET_MODES, default="panel",
+                   help="panel = コマにはめ込む画像（既定） / free = ページ上へ自由に置く素材（擬音など）")
+    a.add_argument("--recursive", action="store_true", help="サブフォルダも含める（フォルダ名で見出し分けされる）")
+    a = asub.add_parser("list", help="素材ソースの一覧")
+    a.add_argument("project", help="プロジェクト名、またはプロジェクトのフォルダ")
+    a.add_argument("--json", action="store_true", help="JSON で出力")
+    a = asub.add_parser("remove", help="素材ソースの登録を外す（フォルダの中身には触らない）")
+    a.add_argument("project", help="プロジェクト名、またはプロジェクトのフォルダ")
+    a.add_argument("--name", required=True, help="ソース名")
     return ap
 
 
@@ -70,7 +94,15 @@ def serve(app, host: str, port: int, project=None) -> int:
         print(f"  マスク: {lib.mask_dir}")
     if host not in ("127.0.0.1", "localhost", "::1"):
         print("  注意: ループバック以外で待ち受けます（同じネットワークから読み書きできます）")
+    print(f"  漫画の構成: http://{host}:{port}/manga/" + ("" if manga.installed_dir() else
+                                                              "（未導入。inkdeus manga install で取得）"))
     sys.stdout.flush()
+    logger = logging.getLogger("inkdeus")                 # /manga/ の書き換えの記録などを端末に出す
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
     app.run(host=host, port=port, threaded=True)
     return 0
 
@@ -127,16 +159,63 @@ def cmd_projects(args) -> int:
     return 0
 
 
+def cmd_assets(args) -> int:
+    project = load_project(args.project, check=False)
+    if args.assets_command == "add":
+        entry = add_asset_source(project, args.name, args.path, args.mode, args.recursive)
+        print(f"素材ソースを登録しました: {entry['name']}（{project.name}）")
+        print(f"  場所: {entry['path']} / mode: {entry['mode']}"
+              f"{' / サブフォルダも含める' if entry['recursive'] else ''}")
+        return 0
+    if args.assets_command == "remove":
+        remove_asset_source(project, args.name)
+        print(f"素材ソースの登録を外しました: {args.name}（{project.name}）")
+        return 0
+    local_file = default_local_config()
+    rows = []
+    for name, label in BUILTIN_ASSETS.items():
+        rows.append({"name": name, "label": label, "mode": "panel", "recursive": False, "origin": "builtin",
+                     "path": str(project.source if name == "source" else project.out)})
+    seen = set(BUILTIN_ASSETS)
+    problems: list[str] = []
+    for path, origin in ((project.config, "project"), (local_file, "local")):
+        found, bad = read_toml_assets(path, origin)
+        problems += bad
+        for src in found:
+            if src.name in seen:
+                continue
+            seen.add(src.name)
+            count = len(Catalog._scan(src.root, src.recursive))
+            rows.append({"name": src.name, "label": src.label, "mode": src.mode, "recursive": src.recursive,
+                         "origin": origin, "path": str(src.root), "missing": not src.root.is_dir(), "count": count})
+    if args.json:
+        print(json.dumps({"project": project.name, "sources": rows, "problems": problems},
+                         ensure_ascii=False, indent=2))
+        return 0
+    origins = {"builtin": "既定", "project": "プロジェクト", "local": "共通（inkdeus.local.toml）"}
+    print(f"素材ソース（{project.name}）:")
+    for r in rows:
+        extra = "" if "count" not in r else ("・フォルダが見つかりません" if r["missing"] else f"・{r['count']} 枚")
+        print(f"  {r['name']}: {r['mode']}{'・サブフォルダも含める' if r['recursive'] else ''}"
+              f"・{origins[r['origin']]}{extra}  {r['path']}")
+    for msg in problems:
+        print(f"  注意: {msg}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "ctl":
         return ctl.main(argv[1:])
+    if argv and argv[0] == "manga":
+        return manga.main(argv[1:])
     # inkdeus <path> は、path が実在するときだけ run の省略形として扱う
     if argv and argv[0] not in COMMANDS and not argv[0].startswith("-") and Path(argv[0]).exists():
         argv = ["run", *argv]
     args = build_parser().parse_args(argv)
     try:
-        return {"run": cmd_run, "new": cmd_new, "open": cmd_open, "projects": cmd_projects}[args.command](args)
+        return {"run": cmd_run, "new": cmd_new, "open": cmd_open, "projects": cmd_projects,
+                "assets": cmd_assets}[args.command](args)
     except ProjectError as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1

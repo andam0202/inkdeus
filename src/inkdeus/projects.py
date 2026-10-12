@@ -13,6 +13,9 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from .assets import MODES as ASSET_MODES
+from .assets import AssetError
+from .assets import validate_name as validate_asset_name
 from .server import PARAMS_SUFFIX, is_image, read_local_config
 
 PROJECT_FILE = "inkdeus.project.toml"
@@ -32,6 +35,15 @@ class Project:
     out: Path
     created: str
     note: str
+
+    @property
+    def config(self) -> Path:
+        return self.path / PROJECT_FILE
+
+    @property
+    def manga(self) -> Path:
+        """漫画の構成データ（保存した漫画・書き出したページ）の置き場"""
+        return self.path / "manga"
 
     def info(self) -> dict:
         return {"name": self.name, "path": str(self.path)}
@@ -59,8 +71,8 @@ def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)        # TOML の基本文字列は JSON と同じエスケープで書ける
 
 
-def _write_config(path: Path, name: str, created: str, source: Path, masks: Path | None,
-                  out: str, note: str) -> None:
+def _write_config(path: Path, name: str, created: str, source: Path | str, masks: Path | str | None,
+                  out: str, note: str, assets: list[dict] | None = None) -> None:
     lines = [
         f"name = {_toml_string(name)}",
         f"created = {_toml_string(created)}",
@@ -71,7 +83,16 @@ def _write_config(path: Path, name: str, created: str, source: Path, masks: Path
     lines.append(f"out = {_toml_string(out)}")
     if note:
         lines.append(f"note = {_toml_string(note)}")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    for entry in assets or []:                             # 漫画の構成で使う追加の素材ソース
+        lines += ["", "[[assets]]"]
+        for key in ("name", "path", "mode"):
+            if isinstance(entry.get(key), str):
+                lines.append(f"{key} = {_toml_string(entry[key])}")
+        if isinstance(entry.get("recursive"), bool):
+            lines.append(f"recursive = {'true' if entry['recursive'] else 'false'}")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    os.replace(tmp, path)
 
 
 def _copy_images(src: Path, dst: Path, only_png_masks: bool = False) -> None:
@@ -102,12 +123,15 @@ def create_project(name: str, images: Path | str, masks: Path | str | None = Non
     path = root / name
     config = path / PROJECT_FILE
     created = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    assets: list[dict] = []
     if config.exists():
         if not force:
             raise ProjectError(f"プロジェクトは既にあります: {name}（設定だけ更新するなら --force）")
         try:
             with open(config, "rb") as f:
-                created = str(tomllib.load(f).get("created", created))     # 作成日時は引き継ぐ
+                old = tomllib.load(f)
+            created = str(old.get("created", created))                    # 作成日時は引き継ぐ
+            assets = _raw_assets(old)                                      # 追加の素材ソースも引き継ぐ
         except (OSError, tomllib.TOMLDecodeError):
             pass
     path.mkdir(parents=True, exist_ok=True)
@@ -121,12 +145,61 @@ def create_project(name: str, images: Path | str, masks: Path | str | None = Non
             _copy_images(masks_dir, path / "masks", only_png_masks=True)
             mask_ref = Path("masks")
     (path / "out").mkdir(exist_ok=True)
-    _write_config(config, name, created, source, mask_ref, "out", note)
+    _write_config(config, name, created, source, mask_ref, "out", note, assets)
 
     with_mask = sum(1 for p in files if masks_dir is not None and (masks_dir / f"{p.stem}.png").is_file())
     summary = {"name": name, "path": str(path), "images": len(files),
                "masks": with_mask if masks_dir is not None else None, "copied": copy}
     return load_project(str(path), root=root, check=True), summary
+
+
+def _raw_assets(data: dict) -> list[dict]:
+    raw = data.get("assets")
+    return [dict(e) for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+
+
+def _read_raw(project: Project) -> dict:
+    try:
+        with open(project.config, "rb") as f:
+            return tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise ProjectError(f"{project.config} を読めません: {e}") from e
+
+
+def _rewrite_assets(project: Project, data: dict, assets: list[dict]) -> None:
+    """設定ファイルを、素材ソースだけ差し替えて書き直す（他の項目は書かれている値のまま）"""
+    _write_config(project.config, str(data.get("name") or project.name), str(data.get("created", "")),
+                  data["source"], data.get("masks") if isinstance(data.get("masks"), str) else None,
+                  str(data.get("out") or "out"), str(data.get("note", "")), assets)
+
+
+def add_asset_source(project: Project, name: str, path: Path | str, mode: str = "panel",
+                     recursive: bool = False) -> dict:
+    """プロジェクトに素材ソースを登録する（同じ名前があれば置き換える）"""
+    try:
+        validate_asset_name(name)
+    except AssetError as e:
+        raise ProjectError(str(e)) from e
+    if mode not in ASSET_MODES:
+        raise ProjectError(f"mode は {' / '.join(ASSET_MODES)} のどちらかです: {mode!r}")
+    folder = Path(path).expanduser().resolve()
+    if not folder.is_dir():
+        raise ProjectError(f"素材のフォルダが見つかりません: {folder}")
+    data = _read_raw(project)
+    entry = {"name": name, "path": str(folder), "mode": mode, "recursive": bool(recursive)}
+    assets = [e for e in _raw_assets(data) if e.get("name") != name] + [entry]
+    _rewrite_assets(project, data, assets)
+    return entry
+
+
+def remove_asset_source(project: Project, name: str) -> None:
+    data = _read_raw(project)
+    assets = _raw_assets(data)
+    kept = [e for e in assets if e.get("name") != name]
+    if len(kept) == len(assets):
+        known = ", ".join(str(e.get("name")) for e in assets) or "なし"
+        raise ProjectError(f"その名前の素材ソースはありません: {name}（登録済み: {known}）")
+    _rewrite_assets(project, data, kept)
 
 
 def _resolve_dir(base: Path, value: str) -> Path:
