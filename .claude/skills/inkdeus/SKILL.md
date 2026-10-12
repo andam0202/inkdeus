@@ -1,6 +1,6 @@
 ---
 name: inkdeus
-description: inkdeus（カラーイラストを白黒の漫画原稿風にするエディタ）を起動し、開いている画像の線画・ベタ・ハッチングを言葉の依頼どおりに調整する。「inkdeus を起動して」「背景の黒が多い」「背景はハッチ(1)、人物はクロスハッチ極細に」などの依頼で使う。
+description: inkdeus（カラーイラストを白黒の漫画原稿風にするエディタ）を起動し、開いている画像の線画・ベタ・ハッチングを言葉の依頼どおりに調整する。「inkdeus を起動して」「背景の黒が多い」「背景はハッチ(1)、人物はクロスハッチ極細に」「髪はベタに」などの依頼で使う。
 ---
 
 # inkdeus を起動して、依頼どおりに調整する
@@ -8,11 +8,11 @@ description: inkdeus（カラーイラストを白黒の漫画原稿風にする
 inkdeus はブラウザで動くエディタで、設定ファイルを書き換えると開いている画面にすぐ反映される。
 ここでは `inkdeus ctl` で設定を変え、**描画結果の統計（数値）**で結果を確かめながら調整する。
 
-前提: 高画質化（拡大）や人物マスクの作成は inkdeus の外で済ませた物を渡す。inkdeus 自体はそれらを行わない。
+前提: 高画質化（拡大）や人物マスク・部分マスク（髪・肌・服など）の作成は inkdeus の外で済ませた物を渡す。inkdeus 自体はそれらを行わない。
 
 ## 守ること
 
-- **画像そのものは開いて見ない**（入力画像・マスク・書き出した PNG・消しゴムやペンの PNG のどれも）。判断は `ctl stats` の数値で行い、見た目の良し悪しは利用者が画面で確かめる。
+- **画像そのものは開いて見ない**（入力画像・マスク・部分マスク・書き出した PNG・消しゴムやペンの PNG のどれも）。判断は `ctl stats` の数値で行い、見た目の良し悪しは利用者が画面で確かめる。
 - **消しゴム・ペンは人が画面で行う物**。Claude Code は画像を見て描かない（`ctl` に描く操作は無い。できるのは、保存されている対象の一覧と消去だけ）。
 - サーバの停止に `pkill -f` は使わない。`ss -ltnp | grep :8770` で PID を調べて `kill <PID>`。
 - 設定の全体を書き直さない。変えたい項目だけを `ctl preset` / `ctl set` / `ctl patch` で変える。
@@ -29,7 +29,7 @@ uv run inkdeus projects
 - 画像フォルダを示された → プロジェクトを作ってから開く
 
 ```bash
-uv run inkdeus new <名前> --images <画像フォルダ> [--masks <マスクフォルダ>]
+uv run inkdeus new <名前> --images <画像フォルダ> [--masks <マスクフォルダ>] [--parts <部分マスクの置き場>]
 uv run inkdeus open <名前>
 ```
 
@@ -122,6 +122,42 @@ uv run inkdeus ctl version delete bg-white               # 設定と PNG を消�
 - `/manga/` では各バージョンが別の素材として並ぶ。名前を変える・削除すると、漫画のページで使っている絵に影響する
   （削除 → 既定へ切り替わる。名前の変更 → 開いているページだけ追従）ので、利用者に確かめてから行う。
 
+### 部分ごとの塗り分け（「髪はベタに」「肌は白く」など）
+
+髪・肌・服などの部分ごとに、別の層やベタを当てられる。前提は**部分マスク**で、これは inkdeus の外で作った物を登録する
+（inkdeus も Claude Code も作らない。無ければ、利用者に用意してもらう）。置き方は `<置き場>/<部分名>/<画像と同じ名前>.png`
+（8bit・元画像と同じ縦横・255 = その部分）。部分名は置き場の直下のフォルダ名（6 個まで。`person` / `background` / `all` は使えない）。
+
+```bash
+uv run inkdeus parts set <プロジェクト> [--folder <フォルダ名>] --path <置き場>   # 登録（稼働中でもよい。画面は読み込み直してもらう）
+uv run inkdeus parts list <プロジェクト> [--folder <フォルダ名>]                  # 部分名と、マスクのある画像の数
+uv run inkdeus ctl folders                                                       # partNames = そのフォルダの部分名
+```
+
+その画像にマスクのある部分は、`ctl stats` の `stats.parts` と `GET /api/images` の各画像の `parts` で分かる。
+部分は最初は人物と同じ設定で描かれ（`regions.<部分名>` が無い、または `linked` が `true`）、スタイルを当てるか `linked` を `false` にすると、
+その部分だけの levels / solid / layers が有効になる。
+
+例: 「髪はベタに」
+
+```bash
+uv run inkdeus ctl stats                                      # stats.parts に hair があること、output.hair の現状を見る
+uv run inkdeus ctl preset ベタ --region hair                  # 髪を全面ベタに（その部分は人物との連動が切れる）
+uv run inkdeus ctl set regions.hair.solid.lineKnockout 0.8    # ベタの中の線画を白で残す（髪の流れの線がつぶれないように）
+uv run inkdeus ctl stats --wait                               # output.hair.solidRatio ≈ 1、blackRatio（白抜きの分だけ 1 より下がる）を確かめる
+```
+
+- 「肌は白く」→ `ctl preset 白抜き --region skin`（層もベタも無し。線画だけ残る）。少しだけ影を残すなら、スタイルは当てずに
+  `ctl set regions.skin.linked false` のあと `regions.skin.levels.brightness` を上げる・`regions.skin.solid.enabled` を `false` にする。
+- 部分に別の層を当てる → `ctl preset "ハッチ(1)" --region clothes` など。細かい値は `ctl set regions.clothes.layers.0.angle 20`。
+- `ctl set regions.<部分名>.…` は、`linked` が `true` の間は絵に効かない（人物と同じ設定で描かれている）。先に `ctl preset` か
+  `ctl set regions.<部分名>.linked false`（まだ設定の無い部分なら、いまの人物の設定を写した項目ができる）。
+- 元へ戻す → `ctl set regions.<部分名>.linked true`。
+- 部分名の打ち間違い（部分マスクの置き場に無い名前）は非0終了になり、何も変わらない。
+- 部分マスクの出来（はみ出し・欠け）は数値では分からない。利用者に、部分のタブの「この領域を強調表示」で確かめてもらう
+  （プレビューの Alt+クリックで、その場所の領域のタブへ切り替わる）。
+- `lineKnockout` を上げると、ベタの輪郭のすぐ内側にも白い線が出ることがある。気になると言われたら値を下げる。
+
 ### 消しゴム・ペン（利用者が画面で手を入れた所）
 
 利用者は、プレビューの上のツールバーで、消しゴム（層ごと・ベタ・線画・すべて）とペン（黒・白）を使って仕上げる。これは**利用者が画面で行う作業**で、
@@ -133,7 +169,7 @@ uv run inkdeus ctl paint clear lines               # その対象の消しゴム
 uv run inkdeus ctl paint clear all-targets         # 全部消す
 ```
 
-- 対象は `layer-<層の id>`（id は `ctl get` の `regions.<領域>.layers[].id`）/ `solid-person` / `solid-background` / `lines` / `all`（その場所を白にする）/ `pen`。
+- 対象は `layer-<層の id>`（id は `ctl get` の `regions.<領域>.layers[].id`）/ `solid-person` / `solid-background` / `solid-<部分名>` / `lines` / `all`（その場所を白にする）/ `pen`。
 - 消すのは利用者の手作業を捨てる操作なので、**頼まれたときだけ**行う（消す前に `paint list` で何があるかを伝える）。
 - `ctl stats` の数値は、消しゴム・ペンを反映した最終出力に対する物。`stats.paint.targets` / `penUsed` が空でなければ、
   設定を変えても数値が思ったほど動かないことがある（その場所が手で消されている・描き足されている）。
@@ -165,7 +201,7 @@ uv run inkdeus ctl open <画像名> --folder <名前>           # ブラウザ�
 uv run inkdeus ctl state                       # 現在の画像・プロジェクト・フォルダ
 uv run inkdeus ctl get                         # 設定JSON（params）と rev
 uv run inkdeus ctl presets                     # 名前付きスタイルの一覧
-uv run inkdeus ctl preset <スタイル> --region person|background|both
+uv run inkdeus ctl preset <スタイル> --region person|background|both|<部分名>
 uv run inkdeus ctl set <ドット区切りのキー> <値>   # 例: regions.background.levels.brightness 0.25
 uv run inkdeus ctl patch '<JSON Merge Patch>'  # 複数項目をまとめて。配列(layers)は丸ごと置換になる
 uv run inkdeus ctl stats --wait                # 統計
@@ -190,19 +226,24 @@ uv run inkdeus ctl paint list / paint clear <対象|all-targets>   # 消しゴ�
 | `crosshatch-ultrafine` | クロスハッチ極細 | 間隔 1.0 |
 | `lines-only` | 線だけ | トーンとベタ無し（背景に当てると「線だけ」） |
 | `white` | 白 | 背景に当てると完全な白 |
+| `solid-black` | ベタ、黒ベタ、塗りつぶし | その領域を全面ベタ（真っ黒）に。層なし |
+| `blank` | 白抜き（人物・部分に当てる「白」「白抜き」はこれ） | 層もベタも無し。線画だけ残る |
 
 スタイルは**層とベタ**（背景なら描き方も）を差し替える。明るさ補正（levels）は変えない。
-背景にスタイルを当てると、背景は人物との連動（`linked`）が切れて独自の設定になる。
+背景・部分にスタイルを当てると、その領域は人物との連動（`linked`）が切れて独自の設定になる。
+「白」「白抜き」は、背景に当てると `white`（完全な白）、人物・部分に当てると `blank`（線画だけ残す）になる。
 
 ## 3. 用語と設定キーの対応
 
 設定は「人物」（`regions.person`。マスクの内側。マスクが無い画像は全体）と「背景」（`regions.background`）で別々に持てる。
+部分マスクのある画像では、部分（`regions.hair` など）も別々に持てる（上の「部分ごとの塗り分け」）。
 背景は `regions.background.linked` が `true` の間は人物と同じ設定で描かれる。**背景だけ変えるには `linked` を `false` にする**（背景へ `ctl preset` すると自動で切れる）。長さの値は「基準px」（画像の幅 1280px 相当での px）。
 
 | 言い方 | キー | 向き |
 | --- | --- | --- |
 | 背景/人物が暗い・黒が多い | `regions.<領域>.levels.brightness`（-1〜1）、`gamma`（0.2〜5） | 上げると明るくなり、ベタと層の面積が減る |
-| ベタ（真っ黒）が多い | `regions.<領域>.solid.threshold`（0〜1） | 下げるとベタが減る。`solid.enabled` を `false` で無し |
+| ベタ（真っ黒）が多い | `regions.<領域>.solid.threshold`（0〜1） | 下げるとベタが減る。`solid.enabled` を `false` で無し。1 で全面ベタ |
+| ベタの中の線がつぶれる | `regions.<領域>.solid.lineKnockout`（0〜1） | 上げると、ベタで塗られた所の線画を白で描く |
 | 影のメリハリ | `regions.<領域>.levels.contrast`（0〜3） | 上げると明暗がはっきり分かれる |
 | ハッチの範囲が広い/狭い | `regions.<領域>.layers.<番号>.threshold` | 下げるとその層が描かれる範囲が狭くなる |
 | 線が細い/太い（ハッチ） | `layers.<番号>.width` | 基準px |
@@ -247,6 +288,9 @@ uv run inkdeus ctl stats --wait                 # 目標に届くまで調整を
   - `layers[]`: 各トーン層が描かれている範囲の割合（`layer` は設定上の層番号）
   - `areaRatio`: その領域が画像に占める割合
 - `input.<領域>.luminance`: 入力の輝度（0=黒、1=白）の `mean` / `median` / `p10` / `p25` / `p75` / `p90`。`adjusted` は明るさ補正後。
+- `parts`: その画像にマスクのある部分名。部分ごとに `output.<部分名>` / `input.<部分名>` がある（中身は人物・背景と同じ項目＋
+  `linked` = 人物と同じ設定で描いているか）。別の設定にした部分は `output.person` の集計から外れる（`person` = 人物の設定で描かれている所）。
+  `droppedParts` があれば、層の数が多すぎて人物と同じ設定で描かれた部分（部分や層を減らす）。
 - `backgroundMode`、`hasMask`、`renderMs`（1回の再描画にかかった時間）。
 - `paint.targets`（消しゴム・ペンで手が入っている対象）と `paint.penUsed`。上の数値は、それらを反映した最終出力に対する物。
 
