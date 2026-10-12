@@ -3,6 +3,7 @@
 
 import * as S from './shaders.js';
 import { effectiveUnit, effectiveRegions, effectiveWatermark, MAX_LAYERS } from './schema.js';
+import { Paint, layerTarget } from './paint.js';
 
 const MAX_SMOOTH_RADIUS = 64;
 const MAX_BLUR_RADIUS = 128;
@@ -44,6 +45,7 @@ export class Renderer {
     this.level = null;        // 自動レベル補正の [lo, hi]（幅が無い画像は null）
     this.wmRect = null;
     this.lastPasses = [];
+    this.paint = new Paint(this);     // 消しゴムのマスクとペンの絵（人が画面で描く物）
   }
 
   // ---- 低レベルの補助 ----
@@ -140,6 +142,7 @@ export class Renderer {
     gl.generateMipmap(gl.TEXTURE_2D);
     this.tex.out = this.createTexture(gl.R8, width, height, { mips: true });
     this.level = this.measureLevel();
+    this.paint.reset();               // 消しゴム・ペンは画像ごと（引き継がない）
   }
 
   /** 縮小した輝度のヒストグラムから 1〜99 パーセンタイルを求める */
@@ -415,6 +418,14 @@ export class Renderer {
       solid.set([set.solidOn ? 1 : 0, set.solid.threshold, set.solid.soft, 0], r * 4);
     });
 
+    // 消しゴム: 各層（詰めた番号）・ベタ・線画・すべて の消去マスクのスロット（描いた物が無ければ -1）
+    const paint = this.paint;
+    const layerSlots = new Int32Array(MAX_LAYERS * 2).fill(-1);
+    sets.forEach((set, r) => set.layers.forEach(({ l }, k) => {
+      if (l.id) layerSlots[r * MAX_LAYERS + k] = paint.slotOf(layerTarget(l.id));
+    }));
+    const miscSlots = ['solid-person', 'solid-background', 'lines', 'all'].map((t) => paint.slotOf(t));
+
     const gl = this.gl;
     const apply = (p, statMode, sw, sh) => {
       this.sampler(p, 'uLum', tone);
@@ -437,11 +448,15 @@ export class Renderer {
       gl.uniform1i(p.loc('uMode'), statMode);
       gl.uniform2f(p.loc('uSampleScale'), statMode ? W / sw : 1, statMode ? H / sh : 1);
       gl.uniform2i(p.loc('uSize'), W, H);
+      paint.bind(p, layerSlots, miscSlots, !soloing);     // ソロ表示の間は、ペンの絵は隠す
     };
     return { apply, unit, sets, mode };
   }
 
-  /** 設定どおりに出力テクスチャを作り直す */
+  /**
+   * 設定どおりに出力テクスチャを作り直す。
+   * opts.rect = { x, y, w, h }（画像の px）を渡すと、その範囲だけ合成し直す（筆の最中の更新用）
+   */
   render(params, opts = {}) {
     if (!this.W) return { ms: 0, passes: [] };
     const gl = this.gl;
@@ -449,7 +464,15 @@ export class Renderer {
     this.lastPasses = [];
     const { W, H } = this;
     const prep = this.prepare(params, opts);
-    this.pass('composite', S.FS_COMPOSITE, this.tex.out, W, H, (p) => prep.apply(p, 0, W, H));
+    if (opts.rect) {
+      gl.enable(gl.SCISSOR_TEST);
+      gl.scissor(opts.rect.x, opts.rect.y, opts.rect.w, opts.rect.h);
+    }
+    try {
+      this.pass('composite', S.FS_COMPOSITE, this.tex.out, W, H, (p) => prep.apply(p, 0, W, H));
+    } finally {
+      gl.disable(gl.SCISSOR_TEST);
+    }
     this.lastPasses.push('composite');
     // 1画素読んで GPU の完了を待つ（所要時間を正しく測るため）
     gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
@@ -541,6 +564,8 @@ export class Renderer {
     return {
       width: W, height: H, unit: round(prep.unit), hasMask: this.hasMask, samples: n,
       backgroundMode: ['keep', 'white', 'lines'][prep.mode], output, input,
+      // 消しゴム・ペン（人が画面で描いた物）。上の数値は、それらを反映した最終出力に対する物
+      paint: { targets: this.paint.targets(), penUsed: this.paint.penOn() },
     };
   }
 

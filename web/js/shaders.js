@@ -147,7 +147,9 @@ void main() {
   o = vec4(inside ? d + 0.5 : 0.5 - d, 0.0, 0.0, 1.0);
 }`;
 
-// 5. 合成: 白地 → トーン層 → ベタ → 線画（乗算）→ 背景処理 → 透かし（→ 純2値）
+// 5. 合成: 白地 → トーン層 → ベタ → 線画（乗算）→ 背景処理 → 消しゴム「すべて」→ ペン（→ 純2値）→ 透かし
+// 消しゴム: 対象（各層 / ベタ / 線画 / すべて）ごとの消去マスク（0 = そのまま、1 = 消す）を、そのインク量に掛ける。
+// マスクは RGBA テクスチャの各チャンネルに1対象ずつ入っていて、スロット = テクスチャ番号 × 4 + チャンネル（無ければ -1）。
 // トーン（明るさ補正・ベタ・層）は「人物」と「背景」で別々の設定を持てる（配列の 0..7 が人物、8..15 が背景）。
 // uMode: 0 = 出力、1 / 2 = 統計用（縮小した格子で画素を抜き出し、数値を RGBA に詰める）
 export const FS_COMPOSITE = HEAD + `
@@ -171,7 +173,38 @@ uniform int uBinary;
 uniform int uMode;
 uniform vec2 uSampleScale;   // 統計用: 格子1マスが何画素か
 uniform ivec2 uSize;
+uniform sampler2D uEr0;      // 消去マスク（使っている枚数は uErN）
+uniform sampler2D uEr1;
+uniform sampler2D uEr2;
+uniform sampler2D uEr3;
+uniform sampler2D uEr4;
+uniform sampler2D uEr5;
+uniform sampler2D uEr6;
+uniform sampler2D uEr7;
+uniform int uErN;
+uniform int uErLayer[16];    // 各層（詰めた番号。0..7 人物、8..15 背景）のスロット
+uniform ivec4 uErMisc;       // ベタ（人物）, ベタ（背景）, 線画, すべて のスロット
+uniform sampler2D uPen;      // ペン: R = 黒の量, G = 白（修正液）の量
+uniform int uPenOn;
 out vec4 o;
+
+vec4 gErase[8];
+// この画素の消去マスクをまとめて読む（マスクは画像より小さいことがあるので、滑らかに拡大して読む）
+void loadErase(vec2 uv) {
+  if (uErN > 0) gErase[0] = textureLod(uEr0, uv, 0.0);
+  if (uErN > 1) gErase[1] = textureLod(uEr1, uv, 0.0);
+  if (uErN > 2) gErase[2] = textureLod(uEr2, uv, 0.0);
+  if (uErN > 3) gErase[3] = textureLod(uEr3, uv, 0.0);
+  if (uErN > 4) gErase[4] = textureLod(uEr4, uv, 0.0);
+  if (uErN > 5) gErase[5] = textureLod(uEr5, uv, 0.0);
+  if (uErN > 6) gErase[6] = textureLod(uEr6, uv, 0.0);
+  if (uErN > 7) gErase[7] = textureLod(uEr7, uv, 0.0);
+}
+// そのスロットの「残す量」（1 = そのまま、0 = 全部消す）
+float keep(int slot) {
+  if (slot < 0) return 1.0;
+  return 1.0 - gErase[slot >> 2][slot & 3];
+}
 
 // 輝度 L がしきい値 th 未満なら 1。soft > 0 なら境界をなだらかにする
 float below(float L, float th, float soft) {
@@ -216,7 +249,8 @@ Tone tone(float L0, int r, vec2 p) {
     vec4 B = uB[r * 8 + i];
     float m = below(L, A.x, A.y);
     if (m <= 0.0) continue;
-    if (m > 0.5) bits += exp2(float(i));
+    float k = keep(uErLayer[r * 8 + i]);
+    if (m > 0.5 && k > 0.5) bits += exp2(float(i));
     // しきい値からどれだけ暗いか（0 = しきい値ちょうど、1 = 真っ黒）
     float t = clamp((A.x - L) / max(A.x, 1e-4), 0.0, 1.0);
     // 境界のぼかしは線を細らせて表す（灰色にはしない）
@@ -227,9 +261,9 @@ Tone tone(float L0, int r, vec2 p) {
     float h = 0.5 * w;
     // 画素（幅1）と線（幅 w）の重なり長さ。1px 未満の線でも平均インク量 = 太さ/間隔
     float ink = clamp(min(dist + 0.5, h) - max(dist - 0.5, -h), 0.0, 1.0);
-    white *= 1.0 - ink * B.w;
+    white *= 1.0 - ink * B.w * k;
   }
-  float s = uSolid[r].x > 0.5 ? below(L, uSolid[r].y, uSolid[r].z) : 0.0;
+  float s = uSolid[r].x > 0.5 ? below(L, uSolid[r].y, uSolid[r].z) * keep(uErMisc[r]) : 0.0;
   return Tone(white * (1.0 - s), bits, s, L);
 }
 
@@ -242,6 +276,8 @@ void main() {
   }
   vec2 p = vec2(ip) + 0.5;
   float L0 = texelFetch(uLum, ip, 0).r;
+  vec2 uv = p / vec2(uSize);
+  loadErase(uv);
 
   // --- 人物の重み（マスクが無ければ全体が人物） ---
   float sd = 30000.0;
@@ -259,7 +295,8 @@ void main() {
     float D = g.r - uLine.y * g.g;
     line = clamp(-tanh(uLine.w * (D - uLine.z)), 0.0, 1.0);
   }
-  float lineInk = uLine.x * line;
+  float keepLine = keep(uErMisc.z);
+  float lineInk = uLine.x * line * keepLine;
 
   // --- 人物 / 背景それぞれのトーンを作って、人物の重みで混ぜる ---
   Tone tp = Tone(1.0, 0.0, 0.0, L0);
@@ -269,12 +306,22 @@ void main() {
   if (mode == 0) {
     if (pw < 1.0) tb = tone(L0, 1, p);
   } else if (mode == 2) {
-    bgLine = uBg.w * line;
+    bgLine = uBg.w * line * keepLine;
   } else {
     bgLine = 0.0;
   }
   float v = mix(tb.v * (1.0 - bgLine), tp.v * (1.0 - lineInk), pw);
-  if (mode == 1 && uBg.z > 0.0) v *= 1.0 - clamp(uBg.z - sd + 0.5, 0.0, 1.0) * pw;   // シルエット線
+  if (mode == 1 && uBg.z > 0.0) v *= 1.0 - clamp(uBg.z - sd + 0.5, 0.0, 1.0) * pw * keepLine;   // シルエット線
+
+  // --- 消しゴム「すべて」: その場所を白にする（トーン・ベタ・線画をまとめて消す） ---
+  if (uErMisc.w >= 0) v = 1.0 - (1.0 - v) * keep(uErMisc.w);
+
+  // --- ペン: 黒インクと白（修正液）。合成の最後（透かしの直前）に重ねる ---
+  if (uPenOn == 1) {
+    vec2 pen = textureLod(uPen, uv, 0.0).rg;
+    float white = min(pen.g, 1.0 - pen.r);
+    v = v * (1.0 - pen.r - white) + white;
+  }
 
   if (uBinary == 1) v = v >= 0.5 ? 1.0 : 0.0;
 
