@@ -124,6 +124,8 @@ def images_on_canvas(page) -> list[dict]:
 
 def apply_template(page) -> None:
     """コマ割りのひな形を1つ適用する（上流の「コマのひな形をクリックしたとき」と同じ呼び出し）"""
+    # ひな形のデータは、ひな形の一覧が開かれたときに後から読み込まれる（起動時は縦のひな形が開く）
+    page.wait_for_function("() => typeof MangaPanelsImage_Vertical !== 'undefined' && MangaPanelsImage_Vertical.length > 2")
     page.evaluate("""async () => {
         if (btmShouldSaveCurrentPage()) await btmSaveProjectFile();
         setCanvasGUID();
