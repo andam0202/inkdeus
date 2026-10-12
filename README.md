@@ -168,6 +168,27 @@ uv run inkdeus run demo_images/images --mask-dir demo_images/masks
   それを超える分の部分は人物と同じ設定で描いて、その旨を知らせます。
 - サーバなしで開いたとき（と、この機能が入る前のサーバにつないだとき）は、部分のタブは出ません。
 
+### 自分用スタイル（気に入った層の組み合わせに、名前を付けて保存する）
+
+気に入ったベタと層の組み合わせを、名前を付けて保存し、別の画像・別の領域・別のプロジェクトで呼び出せます。
+
+- 各タブ（人物 / 背景 / 部分）の「スタイルを選ぶ…」の一番下の「**いまの設定をスタイルとして保存…**」で、そのタブの領域の設定を保存します。
+  名前（1〜32 文字の英数字・かな漢字・`_` `-` `(` `)`。組み込みのスタイルの名前・別名とは重ねられません）、説明、保存先、
+  「明るさ補正も含める」かどうかを決めます。
+- 保存する中身は、その領域の**ベタと層**です（背景から保存したときは、背景の描き方も）。「明るさ補正も含める」をオンにすると、
+  明るさ・コントラスト・ガンマも入り、当てたときにその値になります（オフなら、当てた先の明るさ補正は変わりません）。
+  人物と同じ設定で描いている背景・部分から保存すると、実際に描かれている設定（人物の物）が入ります。
+- 保存先は 2 つです。**自分用**（全プロジェクト共通）は利用者の設定フォルダの `~/.config/inkdeus/styles.json`
+  （環境変数 `INKDEUS_CONFIG` でフォルダを変えられます）、**このプロジェクト**はプロジェクトのフォルダ直下の `styles.json` です。
+  同じ名前が両方にあるときは、プロジェクトの物が使われます。
+- 保存したスタイルは、「スタイルを選ぶ…」の組み込みの下に「自分用」「このプロジェクト」の見出しで並びます。選ぶと、組み込みのスタイルと同じように
+  その領域へ当たります（取り消せます）。背景の描き方が「白」「線だけ」の背景から保存した物は背景向けで、背景のタブにだけ出ます。
+- 「**自分用スタイルを管理…**」で、名前の変更・削除・上書き保存（いまのタブの領域の設定で中身を入れ替える）ができます。
+- ファイルの形は `{"version": 1, "styles": [{"name", "aliases", "description", "target", "includeLevels", "data", "createdAt", "updatedAt"}]}` で、
+  `data` は `solid` / `layers`（と `levels` / `mode`）です。層の id は持ちません（当てるときに新しく振ります）。
+  壊れたファイルや使えない項目は読み飛ばして、その旨を一覧に出します。
+- サーバなしで開いたとき（と、この機能が入る前のサーバにつないだとき）は、保存・管理の項目は出ません。
+
 ### 消しゴムとペン（手で消す・描き足す）
 
 プレビューの上のツールバーで「手のひら」（移動。既定）・「消しゴム」・「ペン」を切り替えます。
@@ -221,7 +242,7 @@ uv run inkdeus run demo_images/images --mask-dir demo_images/masks
 ```bash
 uv run inkdeus ctl state                                   # 開いている画像・プロジェクト・フォルダ
 uv run inkdeus ctl get [--name N]                          # 設定JSON
-uv run inkdeus ctl presets                                 # 名前付きスタイルの一覧
+uv run inkdeus ctl presets                                 # 名前付きスタイルの一覧（組み込みと自分用。origin が出どころ）
 uv run inkdeus ctl preset "ハッチ(1)" --region background   # スタイルを領域に適用（person / background / both / 部分名）
 uv run inkdeus ctl preset ベタ --region hair                # 部分（部分マスクのある部分）に当てると、その部分だけ別の設定になる
 uv run inkdeus ctl set regions.hair.solid.lineKnockout 0.8  # ベタの中の線画を白抜き
@@ -237,6 +258,10 @@ uv run inkdeus ctl versions [--name N]                     # バージョンの�
 uv run inkdeus ctl version new <V> [--from <元>]           # 設定を複製して新しいバージョンを作る（--from 省略時は既定から）
 uv run inkdeus ctl version rename <旧> <新>
 uv run inkdeus ctl version delete <V>                      # 設定と PNG を消す
+uv run inkdeus ctl style save <名前> --region <領域> [--scope user|project] [--with-levels] [--description "…"]
+                                                           # 開いている画像の、その領域の設定を自分用スタイルとして保存
+uv run inkdeus ctl style delete <名前> [--scope user|project]   # 削除（rename <旧> <新> で名前の変更）
+uv run inkdeus ctl style export <名前> > style.json        # JSON を標準出力へ。import <ファイル> [--scope …] [--overwrite] で取り込む
 uv run inkdeus ctl paint list                              # 消しゴム・ペン（人が画面で描いた物）のうち、保存されている対象の一覧
 uv run inkdeus ctl paint clear <対象|all-targets>          # 対象の消しゴム（またはペンで描いた物）を消す
 ```
@@ -253,6 +278,9 @@ uv run inkdeus ctl paint clear <対象|all-targets>          # 対象の消し�
 - `stats` は黒率・平均の濃さ・ベタや各層の面積率・入力の輝度の分布を、全体／人物／背景ごとに返します（どの設定に対する統計かを示す `rev` つき）。画像を見ずに数値で調整するためのものです。
   部分マスクのある画像では、部分ごとの項目（`output.hair` / `input.hair` など。`linked` = 人物と同じ設定で描いているか）も返します。
   別の設定にした部分は `person` の集計から外れます（`person` = 人物の設定で描かれている所）。
+- 自分用スタイルは `ctl preset <名前> --region <領域>` でそのまま当てられます（`ctl presets` の `origin` が `user` = 全プロジェクト共通 /
+  `project` = このプロジェクト専用）。`style save` の `--region` は `person` / `background` / 部分名で、`--with-levels` で明るさ補正も含めます。
+  `style import` は、`style export` の出力や `styles.json` そのものを読みます（同じ名前があるときは `--overwrite` で上書き）。
 - 部分名は、部分マスクの置き場にある名前だけを受け付けます（打ち間違いは非0終了）。`ctl folders` の `partNames` が、そのフォルダの部分名です。
   まだ設定の無い部分へ `set` / `patch` すると、いまの人物の設定を写した項目ができます。`regions.<部分名>.linked` が `true` の間は人物と同じ設定で
   描かれるので、**その部分だけ変えるには `linked` を `false` にします**（`ctl preset … --region <部分名>` は自動で切ります）。

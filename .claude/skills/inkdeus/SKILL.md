@@ -158,6 +158,31 @@ uv run inkdeus ctl stats --wait                               # output.hair.soli
   （プレビューの Alt+クリックで、その場所の領域のタブへ切り替わる）。
 - `lineKnockout` を上げると、ベタの輪郭のすぐ内側にも白い線が出ることがある。気になると言われたら値を下げる。
 
+### 自分用スタイル（気に入った設定に名前を付けて使い回す）
+
+「この髪の感じを保存しておいて」「さっきの『細かい影』をこの画像の服にも」のような依頼は、自分用スタイルで行う。
+中身は、ある領域の**ベタと層**（`--with-levels` で明るさ補正も。背景から保存すると背景の描き方も）。
+
+```bash
+uv run inkdeus ctl presets                                          # 一覧。origin が builtin（組み込み）/ user（全プロジェクト共通）/ project（このプロジェクト専用）
+uv run inkdeus ctl style save 細かい影 --region person             # 開いている画像の、その領域の設定を保存（既定は user）
+uv run inkdeus ctl style save 髪の艶 --region hair --scope project --with-levels --description "ベタ＋白抜き 0.8"
+uv run inkdeus ctl preset 細かい影 --region clothes                 # 別の画像・別の領域へ当てる（組み込みのスタイルと同じ）
+uv run inkdeus ctl style rename 細かい影 細かい影2
+uv run inkdeus ctl style delete 細かい影2 [--scope user|project]
+uv run inkdeus ctl style export 髪の艶 > style.json                 # ほかのPC・プロジェクトへ持っていく
+uv run inkdeus ctl style import style.json [--scope user|project] [--overwrite]
+```
+
+- 名前は 1〜32 文字の英数字・かな漢字・`_` `-` `(` `)`。組み込みのスタイルの名前・別名（`ベタ` `白` `hatch1` など）とは重ねられない（非0終了）。
+- 保存先: user = `~/.config/inkdeus/styles.json`（`INKDEUS_CONFIG` で変更可）、project = プロジェクトのフォルダ直下の `styles.json`。
+  同じ名前が両方にあれば project が使われる（`presets` で user 側に `shadowed: true`）。
+- `style save` は同じ名前があれば上書きする（`replaced: true`）。利用者が作った物を上書き・削除するときは、先に確かめる。
+- 当てても、`--with-levels` で保存した物でなければ明るさ補正（levels）は変わらない。背景の描き方が「白」「線だけ」の背景から保存した物は
+  背景向け（`target: background`）で、人物・部分には当てられない。
+- 利用者は画面でも同じことができる（各タブの「スタイルを選ぶ…」の下の「いまの設定をスタイルとして保存…」「自分用スタイルを管理…」）。
+  `ctl` で保存・削除した物は、開いている画面の選択欄にもすぐ出る・消える。
+
 ### 消しゴム・ペン（利用者が画面で手を入れた所）
 
 利用者は、プレビューの上のツールバーで、消しゴム（層ごと・ベタ・線画・すべて）とペン（黒・白）を使って仕上げる。これは**利用者が画面で行う作業**で、
@@ -200,7 +225,8 @@ uv run inkdeus ctl open <画像名> --folder <名前>           # ブラウザ�
 ```bash
 uv run inkdeus ctl state                       # 現在の画像・プロジェクト・フォルダ
 uv run inkdeus ctl get                         # 設定JSON（params）と rev
-uv run inkdeus ctl presets                     # 名前付きスタイルの一覧
+uv run inkdeus ctl presets                     # 名前付きスタイルの一覧（組み込みと自分用）
+uv run inkdeus ctl style save|delete|rename|export|import …   # 自分用スタイル（上の節）
 uv run inkdeus ctl preset <スタイル> --region person|background|both|<部分名>
 uv run inkdeus ctl set <ドット区切りのキー> <値>   # 例: regions.background.levels.brightness 0.25
 uv run inkdeus ctl patch '<JSON Merge Patch>'  # 複数項目をまとめて。配列(layers)は丸ごと置換になる
