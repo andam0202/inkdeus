@@ -157,6 +157,11 @@ def test_erasing_a_selected_layer_removes_only_that_layer(live):
     got2 = pixels(page)
     band2 = (slice(24, 56), slice(20, 236))
     assert (got2[band2] == no_b[band2]).all() and (got2[BAND] == no_a[BAND]).all()
+    # 何も消していない対象を「戻す」でなぞっても、何も起きない（履歴にも積まれない）
+    before = page.evaluate("() => window.inkdeus.historyInfo()")
+    eraser(page, "lines", "restore")
+    drag(page, ACROSS)
+    assert page.evaluate("() => window.inkdeus.historyInfo()") == before and (pixels(page) == got2).all()
     # 「戻す」でなぞると戻る
     eraser(page, "layer", "restore", size=60)
     drag(page, [(10, 40), (246, 40)])
@@ -439,10 +444,12 @@ def test_layer_delete_duplicate_and_style_with_masks(live):
     # 層を削除すると、その層のマスクも消える（保存先からも）。取り消すとマスクごと戻る
     page.locator('.layer[data-layer="0"]').get_by_title("削除").click()
     assert (settled(page) == no_a).all()
+    assert paint(page)["targets"] == [] and page.evaluate("() => window.inkdeus.stats().paint.targets") == []
+    assert page.evaluate("() => document.getElementById('eraseMark').hidden") is True
     page.evaluate("async () => { await window.inkdeus.save(); await window.inkdeus.paint.flush(); }")
     assert not (folder / f"layer-{ID_A}.png").exists() and not folder.exists()
     page.evaluate("() => window.inkdeus.undo()")
-    assert (pixels(page) == erased).all()
+    assert (pixels(page) == erased).all() and paint(page)["targets"] == [f"layer-{ID_A}"]
     page.evaluate("async () => { await window.inkdeus.save(); await window.inkdeus.paint.flush(); }")
     assert (folder / f"layer-{ID_A}.png").is_file()
     # 名前付きスタイルを当てると層が入れ替わる（新しい id）ので、古い層のマスクは効かなくなる。取り消すと戻る
@@ -842,11 +849,17 @@ def test_ctl_paint_reaches_the_open_page(live, capsys):
     page.wait_for_function("() => { const s = window.inkdeus.paint.state(); return !s.loading && s.targets.length === 0; }")
     assert (settled(page) == base).all() and not (live["out"] / "mix.paint").exists()
     assert page.locator(".erased").count() == 0
+    # 設定に無い層のマスク（層が入れ替わった残り）が保存先にあっても、読み込まない
+    client = live["app"].test_client()
+    client.put("/api/paint/mix.png/layer-zzzz9999", data=(live["out"].parent / "images" / "mix.png").read_bytes())
+    page.wait_for_function("() => { const s = window.inkdeus.paint.state(); return !s.loading && s.steps === 0; }")
+    page.wait_for_timeout(300)
+    assert paint(page)["targets"] == [] and (settled(page) == base).all()
     # 外部から消したあとも、続けて描いて保存できる
     pen(page, "black", size=8)
     drag(page, ACROSS)
     page.evaluate("() => window.inkdeus.paint.flush()")
-    assert [t["target"] for t in ctl("paint", "list")["targets"]] == ["pen"]
+    assert [t["target"] for t in ctl("paint", "list")["targets"]] == ["layer-zzzz9999", "pen"]
     assert page.errors == []
 
 

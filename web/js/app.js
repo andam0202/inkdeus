@@ -594,6 +594,9 @@ function paintReferenced(target) {
   return !target.startsWith('layer-') || layerIds(state.params).has(target.slice(6));
 }
 
+/** 描いた物があって、いまの設定で効いている対象（消した層のマスクは、取り消しに備えて持っているが数えない） */
+const paintTargets = () => (renderer ? renderer.paint.targets().filter(paintReferenced) : []);
+
 const paintURL = (name, target, version, folder, extra = '') => `api/paint/${encodeURIComponent(name)}`
   + (target ? `/${encodeURIComponent(target)}` : '') + queryOf(version, folder, extra);
 
@@ -615,7 +618,8 @@ async function loadPaint() {
   const folder = state.folder;
   const list = await getJSON(paintURL(name, '', version, folder));
   for (const row of (list && Array.isArray(list.targets) ? list.targets : [])) {
-    if (!isTarget(row.target)) continue;
+    // 設定に無い層のマスク（外部の変更で層が入れ替わった残りなど）は、効かないので読まない
+    if (!isTarget(row.target) || !paintReferenced(row.target)) continue;
     try {
       const r = await fetch(paintURL(name, row.target, version, folder, `v=${row.stamp || 0}`), { cache: 'no-store' });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -750,6 +754,7 @@ function selectLayer(region, id) {
 
 function beginStroke(target, brush) {
   if (!renderer || !renderer.W || batch.running) return false;
+  if (brush.mode === 'restore' && !renderer.paint.has(target)) return false;     // 消した所が無い（戻す物が無い）
   try {
     renderer.paint.beginStroke(target, brush);
     return true;
@@ -847,6 +852,7 @@ function scheduleStats() {
 function computeStats() {
   if (!renderer || !renderer.W) return null;
   const stats = renderer.stats(state.params, { solo: state.solo });
+  stats.paint.targets = stats.paint.targets.filter(paintReferenced);
   return { name: state.name, version: state.version, rev: state.rev, renderMs: Math.round(lastRenderMs * 10) / 10, ...stats };
 }
 
@@ -1778,7 +1784,7 @@ async function init() {
     imagePoint: (e) => imagePoint(e),
     eraseTarget: (kind) => eraseTargetOf(kind),
     used: (target) => !!target && renderer.paint.has(target),
-    usedTargets: () => renderer.paint.targets(),
+    usedTargets: () => paintTargets(),
     persistent: () => paintPersistent(),
     beginStroke, stamp: stampStroke, endStroke, clearTarget,
     message: (text, kind) => showMessage(text, kind),
@@ -1864,7 +1870,7 @@ const hooks = {
   historyInfo: () => ({ length: history.length, pos: hpos }),
   // 消しゴム・ペン
   paint: {
-    state: () => ({ ...tools.state(), selected: state.selLayer, targets: renderer.paint.targets(),
+    state: () => ({ ...tools.state(), selected: state.selLayer, targets: paintTargets(),
       persistent: paintPersistent(), maskSize: [renderer.paint.mw, renderer.paint.mh],
       saving: !!paintSync.timer || !!paintSync.running, loading: paintSync.loading,
       onServer: [...paintSync.onServer].sort(),

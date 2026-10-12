@@ -89,7 +89,11 @@ export function createTools(root, cursor, host) {
 
   const targetSel = el('select', { id: 'eraseTarget', title: '消しゴムを当てる対象' },
     ERASE_TARGETS.map(([value, label]) => el('option', { value }, label)));
-  targetSel.addEventListener('change', () => { view.eraseTarget = targetSel.value; refresh(); });
+  targetSel.addEventListener('change', () => {
+    view.eraseTarget = targetSel.value;
+    targetSel.blur();                 // 選んだあとは、キー操作（E / B / [ ] など）がそのまま効くように
+    refresh();
+  });
   const targetLabel = el('span', { id: 'eraseTargetLabel', class: 'tool-note' });
   const modeErase = el('button', { type: 'button', id: 'eraseModeErase', title: '消す (X で切り替え)',
     onclick: () => { view.eraseMode = 'erase'; refresh(); } }, '消す');
