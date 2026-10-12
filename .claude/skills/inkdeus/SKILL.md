@@ -87,7 +87,7 @@ uv run inkdeus ctl export-all --status          # 進み具合（ctl state の b
 uv run inkdeus ctl export-all --abort           # 中止
 ```
 
-各画像はその画像に保存済みの設定で書き出される。設定の無い画像には「いまブラウザに出ている設定」が使われ、その画像の設定として保存される。
+全画像の全バージョンが対象（`--default-only` で既定のバージョンだけ）。各画像はその画像に保存済みの設定で書き出される。設定の無い画像には「いまブラウザに出ている設定」が使われ、その画像の設定として保存される。
 書き出し済みで設定が変わっていない画像は飛ばす。白黒化の画面を開いているブラウザが必要（`clients` が 1 以上）。枚数が多いと時間がかかるので、
 長く待つときは `--wait` を付けずに始めて `--status` で確かめる。
 
@@ -102,6 +102,25 @@ uv run inkdeus ctl export-all --abort           # 中止
 
 まだ設定が保存されていない画像をブラウザで開くと、直前に開いていた画像の設定を引き継ぐ（同じ調子で続けて作業するため）。開いた直後に `ctl get` で実際の値を確かめること。
 
+### バージョン（同じ画像から、設定の違う白黒版を複数作る）
+
+「背景を白にした版も作って」「背景をハッチにした別の版がほしい」のような依頼は、いまの設定を壊さず**バージョン**を足す。
+
+```bash
+uv run inkdeus ctl versions                              # 一覧（既定は name が ""）。ctl state の currentVersion がいま開いている物
+uv run inkdeus ctl version new 白背景                    # 既定の設定を複製して作る（--from <元> で複製元を選ぶ）
+uv run inkdeus ctl open <画像名> --version 白背景        # ブラウザをそのバージョンへ切り替える（統計を取るにはこれが要る）
+uv run inkdeus ctl preset 白 --region background         # 以降の get / set / patch / preset / stats / export は、開いているバージョンが対象
+uv run inkdeus ctl stats --wait
+uv run inkdeus ctl version rename 白背景 bg-white
+uv run inkdeus ctl version delete bg-white               # 設定と PNG を消す（既定は消せない）
+```
+
+- 名前は 1〜32 文字の英数字・かな漢字・`_` `-`。ファイルは `<out>/<名前>@<バージョン>.inkdeus.json` / `.png`（既定は従来どおり `@` なし）。
+- どのコマンドも `--version <名前>` で対象を明示できる（既定のバージョンは `--version ""`）。開いていないバージョンは設定ファイルだけが変わり、統計は届かない。
+- `/manga/` では各バージョンが別の素材として並ぶ。名前を変える・削除すると、漫画のページで使っている絵に影響する
+  （削除 → 既定へ切り替わる。名前の変更 → 開いているページだけ追従）ので、利用者に確かめてから行う。
+
 `--name <画像名>` を付けると、開いていない画像の設定も変えられる（ファイルだけ更新され、次に開いたとき反映される。統計はブラウザで開いている画像の分しか届かない）。
 
 ### コマンド
@@ -114,9 +133,10 @@ uv run inkdeus ctl preset <スタイル> --region person|background|both
 uv run inkdeus ctl set <ドット区切りのキー> <値>   # 例: regions.background.levels.brightness 0.25
 uv run inkdeus ctl patch '<JSON Merge Patch>'  # 複数項目をまとめて。配列(layers)は丸ごと置換になる
 uv run inkdeus ctl stats --wait                # 統計
-uv run inkdeus ctl open <画像名>               # 開く画像を切り替える
+uv run inkdeus ctl open <画像名> [--version V] # 開く画像（とバージョン）を切り替える
 uv run inkdeus ctl export                      # ブラウザに PNG 書き出しを指示（保存先が返る）
-uv run inkdeus ctl export-all [--force] [--wait]   # 全画像の書き出し（--status / --abort）
+uv run inkdeus ctl export-all [--force] [--default-only] [--wait]   # 全画像・全バージョンの書き出し（--status / --abort）
+uv run inkdeus ctl versions / version new|rename|delete   # バージョン（上の節）
 ```
 
 値が範囲外・キーの打ち間違いなどは非0終了になり、何も変わらない（`problems` に理由）。

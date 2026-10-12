@@ -103,7 +103,7 @@
     autoSwap: false,             // 白黒版ができたら、置いてある元画像を白黒版に置き換える
     inked: { versions: null, changed: new Set(), pairs: new Map() },   // 白黒版の更新時刻と、開いてから変わった物
     events: { connected: false, opened: 0, received: 0 },
-    hot: { updated: 0, last: null },                                    // 書き出しの通知で差し替えた回数
+    hot: { updated: 0, last: null, fallback: 0 },                       // 書き出しの通知で差し替えた回数、既定へ切り替えた枚数
     // ローカルフォント（利用者のPCにあるフォント。inkdeus のサーバが配信する）
     fonts: { list: [], loaded: new Set(), loading: new Map(), failed: new Map(), registered: false, supported: true },
   };
@@ -202,6 +202,9 @@
     const base = String(rel).split('/').pop();
     return base.replace(/\.[^.]+$/, '');
   }
+  // バージョン（同じ元画像から作る、設定の違う白黒版）の表示名。'' は既定
+  function verLabel(version) { return version ? String(version) : '既定'; }
+  const VERSION_RE = /^[\p{L}\p{N}_-]{1,32}$/u;
   function formatTime(seconds) {
     const d = new Date(seconds * 1000);
     const pad = (n) => String(n).padStart(2, '0');
@@ -238,8 +241,14 @@
       onclick: () => run(() => adjustSelected()) });
     ui.btnToInked = el('button', { type: 'button', text: '白黒版に差し替え', onclick: () => run(() => swapSelected('inked')) });
     ui.btnToSource = el('button', { type: 'button', text: '元画像に戻す', onclick: () => run(() => swapSelected('source')) });
-    ui.sel = el('div', { class: 'ikb-sel', hidden: true }, [ui.selName,
-      el('div', { class: 'ikb-row' }, [ui.btnAdjust, ui.btnToInked, ui.btnToSource])]);
+    ui.selVer = el('div', { class: 'ikb-sel-ver', hidden: true });
+    ui.verButtons = el('div', { class: 'ikb-row ikb-ver-row', hidden: true });
+    ui.btnNewVer = el('button', { type: 'button', text: '新しいバージョンを作って調整', hidden: true,
+      title: 'いま置いてあるバージョンを複製し、この絵を新しいバージョンへ切り替えて、白黒化の画面で開きます',
+      onclick: () => run(() => newVersionAndAdjust()) });
+    ui.sel = el('div', { class: 'ikb-sel', hidden: true }, [ui.selName, ui.selVer, ui.verButtons,
+      el('div', { class: 'ikb-row' }, [ui.btnAdjust, ui.btnToInked, ui.btnToSource]),
+      el('div', { class: 'ikb-row' }, [ui.btnNewVer])]);
     ui.float = el('button', { type: 'button', class: 'ikb-icon', text: '⧉', title: '重ねて表示／並べて表示（漫画エディタの画面を押しのけるかどうか）',
       'aria-label': '重ねて表示／並べて表示', 'aria-pressed': 'false', onclick: () => setFloat(!state.float) });
     ui.resize = el('div', { class: 'ikb-resize', title: 'ドラッグで幅を変える（ダブルクリックで既定の幅）', role: 'separator',
@@ -455,33 +464,58 @@
     const src = currentSource();
     const nodes = [];
     let group = null;
+    const inkedTab = !!src && src.builtin && src.name === 'inked';
+    // 白黒のタブ: 同じ元画像のバージョンは隣り合って届く。何個あるかを先に数える
+    const perBase = new Map();
+    if (inkedTab) state.items.forEach((item) => { if (item.base) perBase.set(item.base, (perBase.get(item.base) || 0) + 1); });
+    let row = null;                    // 同じ元画像のバージョンを横に並べる枠
+    let rowBase = null;
     state.items.forEach((item) => {
       if (src && src.recursive && item.group !== group) {
         group = item.group;
         nodes.push(el('div', { class: 'ikb-group', text: group || '（直下）' }));
       }
+      // 白黒の一覧では version がバージョン名、stamp が更新時刻（古いサーバは version に更新時刻を入れていた）
+      const version = inkedTab && typeof item.version === 'string' ? item.version : '';
+      const stamp = item.stamp || (typeof item.version === 'number' ? item.version : 0);
       const img = el('img', { loading: 'lazy', decoding: 'async', alt: item.name, draggable: 'false',
-        src: withVersion(thumbUrl(src.name, item.path), item.version) });
+        src: withVersion(thumbUrl(src.name, item.path), stamp) });
       // 白黒化の画面で開ける画像（元画像と、その白黒版）には「調整」を付ける
       const editable = item.editable !== undefined ? item.editable : (src.name === 'source' ? item.path : null);
       const adjust = src.builtin && editable ? el('button', {
-        type: 'button', class: 'ikb-adjust', text: '調整', title: `白黒化の画面で ${editable} を開く（別のタブ）`,
-        onclick: (e) => { e.stopPropagation(); openEditor(editable); },
+        type: 'button', class: 'ikb-adjust', text: '調整',
+        title: `白黒化の画面で ${editable}${version ? `（バージョン「${version}」）` : ''} を開く（別のタブ）`,
+        onclick: (e) => { e.stopPropagation(); openEditor(editable, version); },
         onkeydown: (e) => e.stopPropagation(),
       }) : null;
+      const many = inkedTab && item.base && perBase.get(item.base) > 1;
+      const label = inkedTab && (many || version)
+        ? el('span', { class: 'ikb-ver', text: verLabel(version), title: `バージョン: ${verLabel(version)}` }) : null;
       const cell = el('div', {
         role: 'button', tabindex: '0', class: 'ikb-item' + (src.mode === 'free' ? ' ikb-free' : ''), draggable: 'true',
         title: `${item.path}（${item.width}×${item.height}）`,
-        'data-path': item.path,
+        'data-path': item.path, 'data-version': inkedTab ? version : null, 'data-base': inkedTab ? (item.base || '') : null,
         onclick: () => run(() => placeAsset(src.name, item.path, uiPlaceOptions(src))),
         onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.currentTarget.click(); } },
         ondragstart: (e) => {
           e.dataTransfer.setData('application/x-inkdeus-asset', JSON.stringify({ source: src.name, path: item.path }));
           e.dataTransfer.effectAllowed = 'copy';
         },
-      }, [img, el('span', { class: 'ikb-caption', text: item.name })].concat(adjust ? [adjust] : []));
+      }, [img, el('span', { class: 'ikb-caption', text: many ? stem(item.base) : item.name })]
+        .concat(label ? [label] : []).concat(adjust ? [adjust] : []));
       if (src.name === 'source' && item.inked) cell.classList.add('ikb-has-inked');
-      nodes.push(cell);
+      if (many) {
+        if (!row || rowBase !== item.base) {
+          rowBase = item.base;
+          row = el('div', { class: 'ikb-vgroup', 'data-base': item.base, title: `${item.base} のバージョン` });
+          nodes.push(row);
+        }
+        row.appendChild(cell);
+      } else {
+        row = null;
+        rowBase = null;
+        nodes.push(cell);
+      }
     });
     if (!state.items.length) {
       const empty = !src ? '' : src.missing ? 'このソースのフォルダが見つかりません'
@@ -755,10 +789,11 @@
 
   // ---- 白黒化の画面との行き来（別のタブで調整 → 書き出しの通知を受けて、使っている白黒版を差し替える） ----
 
-  function openEditor(name) {
+  function openEditor(name, version) {
     // 同じ名前のタブを使い回す（既に開いていれば、そのタブの画像が切り替わる）
-    const win = window.open('/?image=' + encodeURIComponent(name), EDITOR_TAB);
-    say(win ? `白黒化の画面で開きました: ${name}（調整すると、ここで使っている白黒版も替わります）`
+    const win = window.open('/?image=' + encodeURIComponent(name)
+      + (version ? '&version=' + encodeURIComponent(version) : ''), EDITOR_TAB);
+    say(win ? `白黒化の画面で開きました: ${name}${version ? `（バージョン「${version}」）` : ''}（調整すると、ここで使っている白黒版も替わります）`
       : 'タブを開けませんでした（ポップアップがブロックされていないか確かめてください）', win ? 'info' : 'error');
     return !!win;
   }
@@ -817,14 +852,25 @@
   //   - 「白黒版ができたら元画像を置き換える」がオンなら、白黒版のある元画像を白黒版に切り替える（履歴に1件）
   // 取り消し・やり直し・ページの切り替えのあと（オブジェクトが作り直されたあと）にも呼ばれる
   async function syncPage() {
-    if (!state.ready || !has('canvas') || !state.inked.versions) return { refreshed: 0, swapped: 0 };
+    if (!state.ready || !has('canvas') || !state.inked.versions) return { refreshed: 0, swapped: 0, fallback: 0 };
     let refreshed = 0;
     let swapped = 0;
+    const lost = [];
     for (const { obj, ref } of assetImages()) {
       try {
         if (ref.source === 'inked') {
           const version = state.inked.versions[ref.rel];
-          if (version && state.inked.changed.has(ref.rel) && obj.__ikbVersion !== version) {
+          if (!version) {
+            // その白黒版が無い（消された・名前の変わったバージョン）。既定のバージョン、無ければ元画像へ切り替える
+            const pair = await pairOf('inked', ref.rel).catch(() => null);
+            if (pair && pair.missing) {
+              const done = pair.default
+                ? await replaceElement(obj, 'inked', pair.default.path,
+                  state.inked.changed.has(pair.default.path) ? pair.default.version : null)
+                : pair.source ? await replaceElement(obj, 'source', pair.source.path, null) : false;
+              if (done) lost.push(`${stem(pair.name)}「${verLabel(pair.version)}」→ ${pair.default ? '既定' : '元画像'}`);
+            }
+          } else if (state.inked.changed.has(ref.rel) && obj.__ikbVersion !== version) {
             if (await replaceElement(obj, 'inked', ref.rel, version)) refreshed += 1;
           }
         } else if (state.autoSwap) {
@@ -836,12 +882,17 @@
         console.error('[inkdeus]', e);
       }
     }
-    if (refreshed || swapped) {
+    if (refreshed || swapped || lost.length) {
       canvas.requestRenderAll();
       optional(() => updateLayerPanel());
-      if (swapped) optional(() => saveStateByManual());
+      if (swapped || lost.length) optional(() => saveStateByManual());
     }
-    return { refreshed, swapped };
+    if (lost.length) {
+      state.hot.fallback += lost.length;
+      say(`見つからないバージョンを使っていた絵を切り替えました: ${lost.join('、')}`, 'error');
+      renderSelection(true);
+    }
+    return { refreshed, swapped, fallback: lost.length };
   }
 
   let syncChain = Promise.resolve();
@@ -853,7 +904,7 @@
         syncChain = syncChain.then(async () => {
           for (let i = 0; i < 100 && has('isProjectBusy') && isProjectBusy(); i++) await sleep(100);
           return syncPage();
-        }).catch((e) => { console.error('[inkdeus]', e); return { refreshed: 0, swapped: 0 }; });
+        }).catch((e) => { console.error('[inkdeus]', e); return { refreshed: 0, swapped: 0, fallback: 0 }; });
         syncChain.then(resolve);
       }, delay === undefined ? 150 : delay);
     });
@@ -881,7 +932,8 @@
     if (!ev || !ev.file) return;
     state.events.received += 1;
     if (!state.inked.versions) state.inked.versions = {};
-    state.inked.versions[ev.file] = ev.version;
+    // stamp が PNG の更新時刻（古いサーバは version に入れていた。いまの version はバージョン名）
+    state.inked.versions[ev.file] = ev.stamp || (typeof ev.version === 'number' ? ev.version : Date.now());
     state.inked.changed.add(ev.file);
     state.inked.pairs.clear();
     const viewing = state.source === 'inked' || state.source === 'source';
@@ -892,6 +944,30 @@
       state.hot.last = ev.name;
       say(`${ev.name} を更新しました`);
     }
+    renderSelection(true);
+  }
+
+  // バージョンが作られた・名前が変わった・消された（白黒化の画面や ctl から）
+  async function onVersionsEvent(ev) {
+    state.events.received += 1;
+    await refreshVersions();
+    state.inked.pairs.clear();
+    if (ev.action === 'rename' && ev.file && ev.toFile && has('canvas')) {
+      // 開いているページで使っている絵を、新しい名前のファイルへ付け替える
+      let moved = 0;
+      for (const { obj, ref } of assetImages()) {
+        if (ref.source === 'inked' && ref.rel === ev.file && await replaceElement(obj, 'inked', ev.toFile, null)) moved += 1;
+      }
+      if (moved) {
+        canvas.requestRenderAll();
+        optional(() => updateLayerPanel());
+        optional(() => saveStateByManual());
+        say(`バージョンの名前の変更に合わせました: ${ev.version} → ${ev.to}`);
+      }
+    }
+    await queueSync(0);                                         // 消されたバージョンを使っている絵は既定へ
+    const viewing = state.source === 'inked' || state.source === 'source';
+    listSources().then(() => (viewing ? loadItems(false) : null)).catch(() => {});
     renderSelection(true);
   }
 
@@ -917,6 +993,7 @@
       let ev;
       try { ev = JSON.parse(msg.data); } catch (e) { return; }
       if (ev.type === 'exported') onExported(ev).catch((e) => console.error('[inkdeus]', e));
+      else if (ev.type === 'versions') onVersionsEvent(ev).catch((e) => console.error('[inkdeus]', e));
     };
   }
 
@@ -943,11 +1020,26 @@
     ui.btnToSource.hidden = sel.ref.source !== 'inked';
     ui.btnAdjust.disabled = false;
     ui.btnToSource.disabled = false;
+    ui.selVer.hidden = true;
+    ui.verButtons.hidden = true;
+    ui.btnNewVer.hidden = true;
     pairOf(sel.ref.source, sel.ref.rel).then((pair) => {
       if (selKey !== key) return;
       ui.btnAdjust.disabled = !pair.name;
       ui.btnToSource.disabled = !pair.source;
       if (pair.name) ui.selName.title = pair.name;
+      // バージョン: いま置いてある物の名前と、同じ元画像の別バージョンへ切り替えるボタン
+      const inked = sel.ref.source === 'inked' && Array.isArray(pair.versions);     // 古いサーバには versions が無い
+      const others = inked ? pair.versions.filter((v) => v.path !== sel.ref.rel) : [];
+      ui.selVer.hidden = !inked;
+      ui.selVer.textContent = `バージョン: ${verLabel(pair.version)}`;
+      ui.verButtons.replaceChildren(el('span', { class: 'ikb-dim', text: '切り替え:' }), ...others.map((v) => el('button', {
+        type: 'button', class: 'ikb-ver-btn', 'data-version': v.name, text: verLabel(v.name),
+        title: `この絵をバージョン「${verLabel(v.name)}」へ切り替える（位置・大きさ・切り抜きはそのまま）`,
+        onclick: () => run(() => switchVersion(v.name)),
+      })));
+      ui.verButtons.hidden = !others.length;
+      ui.btnNewVer.hidden = !inked || !pair.name;
     }).catch(() => {});
   }
 
@@ -956,7 +1048,66 @@
     if (!sel) throw new Error('inkdeus の画像が選ばれていません');
     const pair = await pairOf(sel.ref.source, sel.ref.rel);
     if (!pair.name) throw new Error('この白黒版の元画像が見つかりません');
-    return openEditor(pair.name);
+    return openEditor(pair.name, sel.ref.source === 'inked' ? (pair.version || '') : '');
+  }
+
+  function selectedInked() {
+    const sel = selectedAsset();
+    if (!sel || sel.ref.source !== 'inked') throw new Error('白黒版の画像が選ばれていません');
+    return sel;
+  }
+
+  // 選択中の絵を、同じ元画像の別バージョンへ切り替える（位置・見た目の大きさ・切り抜き・コマとの紐づけは保つ。取り消せる）
+  async function switchVersion(version) {
+    requireFeature('place');
+    const sel = selectedInked();
+    await waitIdle();
+    state.inked.pairs.delete('inked|' + sel.ref.rel);
+    const pair = await pairOf('inked', sel.ref.rel);
+    const target = (pair.versions || []).find((v) => v.name === (version || ''));
+    if (!target) throw new Error(`バージョン「${verLabel(version)}」の白黒版がありません（白黒化の画面で開くと書き出されます）`);
+    if (target.path === sel.ref.rel) return { ok: true, changed: false, version: target.name, src: sel.obj.getSrc() };
+    const done = await replaceElement(sel.obj, 'inked', target.path,
+      state.inked.changed.has(target.path) ? target.version : null);
+    if (done) {
+      canvas.requestRenderAll();
+      updateLayerPanel();
+      saveStateByManual();                                   // 絵の内容の変更なので、取り消せるよう履歴に積む
+      say(`バージョンを切り替えました: ${stem(pair.name || sel.ref.rel)} → ${verLabel(target.name)}`);
+    }
+    renderSelection(true);
+    return { ok: !!done, changed: !!done, version: target.name, object: describe(sel.obj), src: sel.obj.getSrc() };
+  }
+
+  // いま置いてあるバージョンを複製 → 置いてある絵を新しいバージョンへ切り替え → 白黒化の画面で開く
+  async function newVersionAndAdjust(name, opts) {
+    requireFeature('place');
+    const sel = selectedInked();
+    const pair = await pairOf('inked', sel.ref.rel);
+    if (!pair.name || !Array.isArray(pair.versions)) throw new Error('この白黒版の元画像が見つかりません');
+    let version = name;
+    if (version === undefined) {
+      version = window.prompt('新しいバージョンの名前（英数字・かな漢字・_ - で 32 文字まで）。'
+        + `「${verLabel(pair.version)}」の設定を複製します`, '');
+      if (version === null || !version.trim()) return null;
+    }
+    version = String(version).trim();
+    if (!VERSION_RE.test(version)) throw new Error('バージョン名に使えるのは英数字・かな漢字・_ - だけです（1〜32 文字）');
+    await waitIdle();
+    const made = await api('POST', '/api/versions/' + encodeURIComponent(pair.name),
+      JSON.stringify({ version, copyFrom: pair.version || '', copyExport: true }));
+    await refreshVersions();
+    state.inked.pairs.clear();
+    if (!made.copiedExport) throw new Error('複製元の白黒版が見つからないため、絵は切り替えていません（バージョンは作りました）');
+    const done = await replaceElement(sel.obj, 'inked', made.file, null);
+    if (done) {
+      canvas.requestRenderAll();
+      updateLayerPanel();
+      saveStateByManual();
+    }
+    renderSelection(true);
+    const opened = (opts && opts.open === false) ? false : openEditor(pair.name, version);
+    return { ok: !!done, version, file: made.file, opened, src: sel.obj.getSrc() };
   }
 
   // 選択中の絵を、白黒版 ⇔ 元画像で差し替える（位置・見た目の大きさ・切り抜き・コマとの紐づけは保つ）
@@ -1474,6 +1625,7 @@
       name: state.name, source: state.source, imageMax: state.imageMax,
       width: state.width, float: !!state.float, preferInked: state.preferInked, autoSwap: state.autoSwap,
       events: Object.assign({}, state.events), hot: Object.assign({}, state.hot),
+      inkedFiles: Object.keys(state.inked.versions || {}),
       fonts: { names: state.fonts.list.map((x) => x.name), loaded: Array.from(state.fonts.loaded),
         failed: Array.from(state.fonts.failed.keys()), supported: state.fonts.supported },
       autosave: { enabled: state.autosave.enabled, seconds: state.autosave.seconds,
@@ -1497,6 +1649,8 @@
     exportPage, exportAllPages,
     // 白黒化の画面との行き来
     openEditor, adjustSelected, swapSelected, syncPage: () => queueSync(0), reconnectEvents: connectEvents,
+    // バージョン（同じ元画像から作る、設定の違う白黒版）
+    switchVersion, newVersionAndAdjust,
     setPreferInked(on) { state.preferInked = !!on; ui.prefer.value = on ? '1' : '0'; },
     setAutoSwap(on) { state.autoSwap = !!on; ui.autoSwap.checked = !!on; if (on) return queueSync(0); return null; },
     // フォント

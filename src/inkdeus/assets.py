@@ -187,32 +187,77 @@ class Catalog:
 
     # ---- 元画像と白黒版（書き出した PNG）の対応 ----
 
-    def _inked_of(self, entry) -> dict | None:
-        p = self.lib.export_path(entry)
+    def _inked_of(self, entry, version: str = "") -> dict | None:
+        """その画像・バージョンの白黒版（書き出した PNG）。path はファイル名、version は更新時刻（ミリ秒）、
+        name はバージョン名（"" = 既定）"""
+        p = self.lib.export_path(entry, version)
         try:
             st = p.stat()
         except OSError:
             return None
-        return {"path": p.name, "mtime": st.st_mtime, "version": st.st_mtime_ns // 1_000_000}
+        return {"path": p.name, "name": version, "mtime": st.st_mtime, "version": st.st_mtime_ns // 1_000_000}
+
+    def _inked_versions(self, entry, index: dict | None = None) -> list[dict]:
+        """書き出し済みのバージョンの白黒版の並び（既定が先頭）"""
+        rows = []
+        for v in self.lib.versions(entry, index):
+            if v["hasExport"]:
+                found = self._inked_of(entry, v["name"])
+                if found is not None:
+                    rows.append(found)
+        return rows
+
+    @staticmethod
+    def _split_inked(rel: str) -> str | None:
+        """白黒版のファイル名から基底名を取る（直下の .png だけ）"""
+        if "/" in rel or "\\" in rel or not rel.lower().endswith(".png"):
+            return None
+        return rel[:-4]
 
     def pair(self, source: str, rel: str) -> dict | None:
-        """source か inked の名前から、{name, source, inked} を返す（一覧に無い名前は None）"""
+        """source か inked の名前から、元画像と白黒版の対応を返す（どの画像の物とも読めない名前は None）:
+            name      元画像の名前（白黒化の画面で開く名前）
+            source    {path}
+            version   その名前が指すバージョン（source から引いたときは ""）
+            inked     そのバージョンの白黒版（まだ無ければ None）
+            default   既定のバージョンの白黒版（無ければ None）
+            versions  書き出し済みの全バージョンの白黒版
+            missing   inked の名前で引いたが、その PNG が無い（消された・名前の変わったバージョン）"""
         entries = self.lib.entries()
+        version = ""
         if source == "source":
             entry = entries.get(rel)
             if entry is None:
                 return None
         else:
-            entry = next((e for e in entries.values() if self.lib.export_path(e).name == rel), None)
-            if entry is None:
+            stem = self._split_inked(rel)
+            found = self.lib.resolve_stem(stem, entries) if stem is not None else None
+            if found is None:
                 # 元画像が見当たらない書き出し済み PNG（元画像を消した等）
-                found = self.find(Source("inked", "", "panel", False, None, builtin=True), rel)
-                if found is None:
+                item = self.find(Source("inked", "", "panel", False, None, builtin=True), rel)
+                if item is None:
                     return None
-                st = found.path.stat()
-                return {"name": None, "source": None,
-                        "inked": {"path": rel, "mtime": st.st_mtime, "version": st.st_mtime_ns // 1_000_000}}
-        return {"name": entry.name, "source": {"path": entry.name}, "inked": self._inked_of(entry)}
+                st = item.path.stat()
+                inked = {"path": rel, "name": "", "mtime": st.st_mtime, "version": st.st_mtime_ns // 1_000_000}
+                return {"name": None, "source": None, "version": "", "inked": inked, "default": inked,
+                        "versions": [inked], "missing": False}
+            entry, version = found
+        inked = self._inked_of(entry, version)
+        return {"name": entry.name, "source": {"path": entry.name}, "version": version, "inked": inked,
+                "default": self._inked_of(entry), "versions": self._inked_versions(entry),
+                "missing": source == "inked" and inked is None}
+
+    def fallback(self, rel: str) -> Item | None:
+        """無い白黒版（消された・名前の変わったバージョン）の代わりに出す画像: 既定のバージョン、無ければ元画像"""
+        stem = self._split_inked(rel)
+        found = self.lib.resolve_stem(stem) if stem is not None else None
+        if found is None or found[1] == "":
+            return None
+        entry = found[0]
+        default = self.lib.export_path(entry)
+        if default.is_file():
+            return Item(default.name, default, "")
+        return Item(entry.name, entry.path, "") if entry.path.is_file() else None
 
     def versions(self, src: Source) -> dict[str, int]:
         out = {}
@@ -244,7 +289,16 @@ class Catalog:
         limit = max(1, min(MAX_LIMIT, limit))
         rows = []
         entries = self.lib.entries() if src.builtin else {}
-        by_export = {self.lib.export_path(e).name: e.name for e in entries.values()} if src.name == "inked" else {}
+        index = self.lib.version_index(entries) if src.builtin and src.name == "source" else None
+        owners: dict[str, tuple] = {}
+        if src.builtin and src.name == "inked":
+            # 元画像ごとにまとめ、既定のバージョンを先頭にして並べる（同じ元画像のバージョンが隣り合うように）
+            for item in items:
+                found = self.lib.resolve_stem(item.rel[:-4], entries)
+                if found is not None:
+                    owners[item.rel] = found
+            items.sort(key=lambda i: ((owners[i.rel][0].name.casefold(), owners[i.rel][1].casefold())
+                                      if i.rel in owners else (i.rel.casefold(), "")))
         for item in items[offset:offset + limit]:
             w, h = self.size(item)
             try:
@@ -253,12 +307,17 @@ class Catalog:
             except OSError:
                 mtime, nbytes, version = 0.0, 0, 0
             row = {"path": item.rel, "name": item.path.name, "group": item.group,
-                   "width": w, "height": h, "mtime": mtime, "bytes": nbytes, "version": version}
+                   "width": w, "height": h, "mtime": mtime, "bytes": nbytes, "version": version,
+                   "stamp": version}          # stamp = 更新時刻（ミリ秒）。白黒の一覧では version がバージョン名になる
             if src.builtin and src.name == "source":
                 row["editable"] = item.rel                     # 白黒化の画面で開く画像名
                 row["inked"] = self._inked_of(entries[item.rel]) if item.rel in entries else None
+                row["versions"] = self._inked_versions(entries[item.rel], index) if item.rel in entries else []
             elif src.builtin and src.name == "inked":
-                row["editable"] = by_export.get(item.rel)      # 元画像が無ければ None
+                owner = owners.get(item.rel)
+                row["editable"] = owner[0].name if owner else None      # 元画像が無ければ None
+                row["base"] = owner[0].name if owner else None          # 元画像の名前
+                row["version"] = owner[1] if owner else ""              # バージョン名（"" = 既定）
             rows.append(row)
         return {"source": src.name, "label": src.label, "mode": src.mode, "recursive": src.recursive,
                 "total": len(items), "offset": offset, "limit": limit, "items": rows}

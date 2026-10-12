@@ -25,6 +25,8 @@ const state = {
   images: [],           // サーバの画像一覧
   index: -1,
   name: null,           // 表示中の画像名
+  version: '',          // 表示中のバージョン（'' = 既定。同じ画像から作る、設定の違う白黒版）
+  versionsOK: false,    // サーバがバージョンに対応しているか（古いサーバにつないだときは既定だけで動く）
   remote: false,        // 表示中の画像がサーバの一覧のものか（ドロップした画像は false）
   params: null,
   rev: null,            // 表示中の設定に対応する設定ファイルの版（未保存の変更があるときは古い）
@@ -35,6 +37,7 @@ const state = {
   lastExport: '',
   autoExport: true,     // 変更を自動で書き出す（漫画の構成の画面へ反映するため）
   batchForce: false,    // 一括書き出しで、書き出し済みの画像も作り直す
+  batchDefaultOnly: false,   // 一括書き出しで、既定のバージョンだけを書き出す
   lastBatch: '',        // 直近の一括書き出しの結果
   view: { zoom: 1, cx: 0, cy: 0 },
   compare: false,
@@ -46,6 +49,7 @@ let renderer = null;
 let gallery = null;                     // 画像一覧パネル（サーバありのときだけ）
 let history = [];
 let hpos = -1;
+const historyStash = new Map();         // バージョン名 → { history, hpos }（表示中の画像の、ほかのバージョンの履歴）
 let saveTimer = null;
 let saving = false;
 let statsTimer = null;
@@ -100,7 +104,35 @@ async function getJSON(url) {
   }
 }
 
-const apiPath = (kind, name) => `api/${kind}/${encodeURIComponent(name)}`;
+const apiPath = (kind, name, version = '') => `api/${kind}/${encodeURIComponent(name)}`
+  + (version ? `?version=${encodeURIComponent(version)}` : '');
+
+// ---- バージョンの記録（state.images[].versions。画像単位の項目は既定のバージョンの物） ----
+
+const VERSION_NAME_RE = /^[\p{L}\p{N}_-]{1,32}$/u;
+const versionLabel = (version) => version || '既定';
+
+/** その画像のバージョンの記録（無ければ null）。古いサーバの一覧には versions が無いので、既定の1件を補う */
+function verOf(item, version = '') {
+  if (!item) return null;
+  if (!Array.isArray(item.versions) || !item.versions.length) {
+    item.versions = [{ name: '', hasParams: !!item.hasParams, hasExport: !!item.hasExport, exportFresh: !!item.exportFresh,
+      exportFile: item.exportFile, exportVersion: item.exportVersion }];
+  }
+  return item.versions.find((v) => v.name === version) || null;
+}
+
+/** バージョンの状態（設定あり・書き出し済み・最新か）を書き換えて、一覧の印を新しくする */
+function mark(name, version, patch) {
+  const item = state.images.find((i) => i.name === name);
+  if (!item) return;
+  const rec = verOf(item, version);
+  if (rec) Object.assign(rec, patch);
+  if (version === '') Object.assign(item, patch);
+  if (gallery) gallery.update(name);
+}
+
+const currentItem = () => (state.remote ? state.images.find((i) => i.name === state.name) : null) || null;
 
 // ---- 描画 ----
 
@@ -305,10 +337,11 @@ const ctx = {
   },
   exportNow: () => exportNow(),
   setAutoExport: (on) => setAutoExport(on),
-  exportAll: () => exportAll({ force: state.batchForce }),
+  exportAll: () => exportAll({ force: state.batchForce, defaultOnly: state.batchDefaultOnly }),
   setBatchForce: (on) => { state.batchForce = !!on; },
+  setBatchDefaultOnly: (on) => { state.batchDefaultOnly = !!on; },
   saveJSON: () => download(new Blob([JSON.stringify(state.params, null, 2) + '\n'], { type: 'application/json' }),
-    `${state.name ? stemOf(state.name) : 'inkdeus'}.inkdeus.json`),
+    `${state.name ? stemOf(state.name) : 'inkdeus'}${state.version ? `@${state.version}` : ''}.inkdeus.json`),
   openJSON: () => $('fileParams').click(),
   openMask: () => $('fileMask').click(),
 };
@@ -377,18 +410,17 @@ function scheduleSave() {
 async function saveNow() {
   if (!canAutoSave()) return;
   const name = state.name;
+  const version = state.version;
   saving = true;
   try {
-    const r = await fetch(apiPath('params', name), {
+    const r = await fetch(apiPath('params', name, version), {
       method: 'PUT', body: JSON.stringify(state.params),
       headers: { 'Content-Type': 'application/json', 'X-Inkdeus-Client': CLIENT_ID },
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
-    const item = state.images.find((i) => i.name === name);
-    if (item) item.hasParams = true;
-    if (gallery) gallery.update(name);
-    if (name === state.name) state.rev = j.rev;
+    mark(name, version, { hasParams: true });
+    if (name === state.name && version === state.version) state.rev = j.rev;
     if (!saveTimer) setSaveState('保存済み');
   } catch (e) {
     setSaveState('保存に失敗');
@@ -418,7 +450,7 @@ function scheduleStats() {
 function computeStats() {
   if (!renderer || !renderer.W) return null;
   const stats = renderer.stats(state.params, { solo: state.solo });
-  return { name: state.name, rev: state.rev, renderMs: Math.round(lastRenderMs * 10) / 10, ...stats };
+  return { name: state.name, version: state.version, rev: state.rev, renderMs: Math.round(lastRenderMs * 10) / 10, ...stats };
 }
 
 async function postStats() {
@@ -430,7 +462,7 @@ async function postStats() {
     const stats = computeStats();
     if (!stats) return;
     lastStats = stats;
-    await fetch(apiPath('stats', name), {
+    await fetch(apiPath('stats', name, state.version), {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(stats),
     });
   } catch (e) {
@@ -442,22 +474,20 @@ function postState() {
   if (!state.server) return;
   fetch('api/state', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ current: state.remote ? state.name : null, client: CLIENT_ID }),
+    body: JSON.stringify({ current: state.remote ? state.name : null, version: state.remote ? state.version : '',
+      client: CLIENT_ID }),
   }).catch(() => {});
 }
 
 /** 設定ファイルが外から書き換えられたときに読み直す（取り消し履歴にも1件として積む） */
 async function onExternalParams(ev) {
-  const item = state.images.find((i) => i.name === ev.name);
-  if (item) {
-    item.hasParams = ev.rev !== null;
-    item.exportFresh = false;             // 設定が書き換わったので、いまの白黒版はもう最新ではない
-    if (gallery) gallery.update(ev.name);
-  }
-  if (ev.source === CLIENT_ID || !state.remote || ev.name !== state.name) return;
+  const version = typeof ev.version === 'string' ? ev.version : '';
+  // 設定が書き換わったので、いまの白黒版はもう最新ではない
+  mark(ev.name, version, { hasParams: ev.rev !== null, exportFresh: false });
+  if (ev.source === CLIENT_ID || !state.remote || ev.name !== state.name || version !== state.version) return;
   if (ev.rev === null || ev.rev === state.rev) return;
-  const r = await fetch(apiPath('params', ev.name), { cache: 'no-store' });
-  if (!r.ok || ev.name !== state.name) return;
+  const r = await fetch(apiPath('params', ev.name, version), { cache: 'no-store' });
+  if (!r.ok || ev.name !== state.name || version !== state.version) return;
   const rev = r.headers.get('X-Inkdeus-Rev');
   if (rev === state.rev) return;
   let raw;
@@ -483,24 +513,28 @@ function connectEvents() {
     try { ev = JSON.parse(msg.data); } catch { return; }
     if (ev.type === 'params') onExternalParams(ev).catch((e) => console.warn(e));
     else if (ev.type === 'exported') onExported(ev);
+    else if (ev.type === 'versions') onVersions(ev).catch((e) => console.warn(e));
     else if (batch.running && (ev.type === 'open' || ev.type === 'export')) return;   // 一括書き出しの最中は受けない
-    else if (ev.type === 'open') openByName(ev.name);
-    else if (ev.type === 'export') openByName(ev.name).then(() => exportNow()).catch((e) => console.warn(e));
-    else if (ev.type === 'export-all') exportAll({ force: !!ev.force }).catch((e) => console.warn(e));
+    else if (ev.type === 'open') openByName(ev.name, ev.version);
+    else if (ev.type === 'export') openByName(ev.name, ev.version).then(() => exportNow()).catch((e) => console.warn(e));
+    else if (ev.type === 'export-all') exportAll({ force: !!ev.force, defaultOnly: !!ev.defaultOnly }).catch((e) => console.warn(e));
     else if (ev.type === 'export-all-abort') abortExportAll();
   };
 }
 
 /** どこかで（この画面・別のタブ・一括書き出し）白黒版が保存された。一覧の印とサムネイルを新しくする */
 function onExported(ev) {
-  const item = state.images.find((i) => i.name === ev.name);
-  if (!item) return;
-  item.hasExport = true;
-  item.exportFile = ev.file || item.exportFile;
-  item.exportVersion = ev.version || item.exportVersion;
-  // 表示中の画像に未反映の変更が残っているなら、まだ「最新」ではない
-  item.exportFresh = !(state.remote && ev.name === state.name && autoExport.dirty);
-  if (gallery) gallery.update(ev.name);
+  // version はバージョン名、stamp は PNG の更新時刻（古いサーバは version に更新時刻を入れていた）
+  const version = typeof ev.version === 'string' ? ev.version : '';
+  const stamp = ev.stamp || (typeof ev.version === 'number' ? ev.version : null);
+  const rec = verOf(state.images.find((i) => i.name === ev.name), version);
+  if (!rec) return;
+  const patch = { hasExport: true,
+    // 表示中の画像に未反映の変更が残っているなら、まだ「最新」ではない
+    exportFresh: !(state.remote && ev.name === state.name && version === state.version && autoExport.dirty) };
+  if (ev.file) patch.exportFile = ev.file;
+  if (stamp) patch.exportVersion = stamp;
+  mark(ev.name, version, patch);
 }
 
 /** 前後の画像へ（画像一覧で絞り込んでいるときは、その結果の中で動く） */
@@ -514,14 +548,17 @@ function stepImage(delta) {
   openIndex(state.images.findIndex((i) => i.name === names[next]));
 }
 
-async function openByName(name) {
-  if (state.remote && state.name === name) return;
+/** 画像（とバージョン）を開く。version が null / 未指定なら「指定なし」（その画像を開いていればそのまま、別の画像からなら既定） */
+async function openByName(name, version = null) {
+  const same = state.remote && state.name === name;
+  const want = version === null || version === undefined ? (same ? state.version : '') : version;
+  if (same && want === state.version) return;
   let index = state.images.findIndex((i) => i.name === name);
-  if (index < 0) {
-    await refreshImages();          // 起動後に増えた画像かもしれない
+  if (index < 0 || !verOf(state.images[index], want)) {
+    await refreshImages();          // 起動後に増えた画像・バージョンかもしれない
     index = state.images.findIndex((i) => i.name === name);
   }
-  if (index >= 0) await openIndex(index);
+  if (index >= 0) await openIndex(index, want);
 }
 
 async function refreshImages() {
@@ -537,8 +574,156 @@ async function refreshImages() {
   }));
   if (state.remote && state.name) sel.value = state.name;
   $('nav').hidden = state.images.length < 2;
+  state.versionsOK = state.images.some((i) => Array.isArray(i.versions));
   if (gallery) gallery.refresh();
+  updateVersionUI();
 }
+
+// ---- バージョン（同じ画像から作る、設定の違う白黒版） ----
+
+function updateVersionUI() {
+  const item = currentItem();
+  const box = $('verBox');
+  box.hidden = !(state.server && state.versionsOK && item);
+  if (box.hidden) return;
+  verOf(item);
+  const option = (value, text, disabled = false) => {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = text;
+    opt.disabled = disabled;
+    return opt;
+  };
+  const actions = document.createElement('optgroup');
+  actions.label = '操作';
+  // 操作の値は @ で始める（バージョン名には @ を使えないので、名前とぶつからない）
+  actions.append(option('@new', '＋ いまの設定を複製して新しいバージョン…'),
+    option('@rename', '名前を変える…', !state.version), option('@delete', '削除…', !state.version));
+  const sel = $('selVersion');
+  sel.replaceChildren(...item.versions.map((v) => option(v.name, versionLabel(v.name))), actions);
+  sel.value = state.version;
+}
+
+async function versionRequest(method, body, query = '') {
+  const r = await fetch(`api/versions/${encodeURIComponent(state.name)}${query}`, {
+    method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined,
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || (r.status === 404 ? 'そのバージョンはありません' : `HTTP ${r.status}`));
+  return j;
+}
+
+function needVersions() {
+  if (!state.server || !state.remote || !state.name) throw new Error('バージョンは、サーバの一覧にある画像でだけ使えます');
+  if (batch.running) throw new Error('全画像の書き出しの最中です');
+}
+
+/** いまの設定を複製して新しいバージョンを作り、それを開く */
+async function createVersion(version) {
+  needVersions();
+  if (!VERSION_NAME_RE.test(version || '')) throw new Error('バージョン名に使えるのは英数字・かな漢字・_ - だけです（1〜32 文字）');
+  const item = currentItem();
+  await flushSave();
+  if (!(verOf(item, state.version) || {}).hasParams) await saveNow();   // 複製元がまだ保存されていなければ、先に保存する
+  await versionRequest('POST', { version, copyFrom: state.version });
+  await refreshImages();
+  await openIndex(state.images.findIndex((i) => i.name === item.name), version);
+  return version;
+}
+
+/** 表示中のバージョンが別の名前になった（この画面・別のタブ・ctl のどこからでも）ときの後始末 */
+function followRename(from, to) {
+  if (state.version !== from) return;
+  state.version = to;
+  document.title = titleOf();
+  postState();
+}
+
+async function renameVersion(from, to) {
+  needVersions();
+  if (!from) throw new Error('既定のバージョンの名前は変えられません');
+  if (!VERSION_NAME_RE.test(to || '')) throw new Error('バージョン名に使えるのは英数字・かな漢字・_ - だけです（1〜32 文字）');
+  await flushSave();
+  await flushAutoExport();
+  await versionRequest('PATCH', { version: from, to });
+  if (historyStash.has(from)) { historyStash.set(to, historyStash.get(from)); historyStash.delete(from); }
+  followRename(from, to);
+  await refreshImages();
+  return to;
+}
+
+/** 表示中のバージョンが消える（消えた）ときに、保存・書き出しの予約を取り下げる（消した物を書き戻さないように） */
+async function dropPending() {
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  clearTimeout(statsTimer);
+  statsTimer = null;
+  clearTimeout(autoExport.timer);
+  autoExport.timer = null;
+  autoExport.again = false;
+  autoExport.dirty = false;
+  if (autoExport.running) await autoExport.running.catch(() => {});
+}
+
+async function deleteVersion(version) {
+  needVersions();
+  if (!version) throw new Error('既定のバージョンは削除できません');
+  const name = state.name;
+  if (version === state.version) await dropPending();
+  await versionRequest('DELETE', null, `?version=${encodeURIComponent(version)}`);
+  historyStash.delete(version);
+  await refreshImages();
+  if (state.name === name && version === state.version) {
+    await openIndex(state.images.findIndex((i) => i.name === name), '');
+  }
+}
+
+/** どこかで（別のタブ・ctl）バージョンが作られた・名前が変わった・消された */
+async function onVersions(ev) {
+  const mine = state.remote && ev.name === state.name;
+  if (mine && ev.action === 'rename') {
+    if (historyStash.has(ev.version)) { historyStash.set(ev.to, historyStash.get(ev.version)); historyStash.delete(ev.version); }
+    followRename(ev.version, ev.to);
+  }
+  const gone = mine && ev.action === 'delete' && ev.version === state.version;
+  if (gone) await dropPending();
+  await refreshImages();
+  if (gone && state.name === ev.name && state.version === ev.version && !batch.running) {
+    showMessage(`バージョン「${ev.version}」は削除されました。既定のバージョンを開きます`);
+    await openIndex(state.images.findIndex((i) => i.name === ev.name), '');
+  }
+}
+
+function wireVersions() {
+  const ask = {
+    '@new': async () => {
+      const name = window.prompt('新しいバージョンの名前（英数字・かな漢字・_ - で 32 文字まで）。いまの設定を複製します', '');
+      if (name !== null && name.trim()) await createVersion(name.trim());
+    },
+    '@rename': async () => {
+      const name = window.prompt(`バージョン「${state.version}」の新しい名前`, state.version);
+      if (name !== null && name.trim() && name.trim() !== state.version) await renameVersion(state.version, name.trim());
+    },
+    '@delete': async () => {
+      if (window.confirm(`バージョン「${state.version}」を削除します（設定と書き出した PNG を消します）。よろしいですか？`)) {
+        await deleteVersion(state.version);
+      }
+    },
+  };
+  $('selVersion').addEventListener('change', async () => {
+    const value = $('selVersion').value;
+    try {
+      if (ask[value]) await ask[value]();
+      else await openIndex(state.index, value);
+    } catch (e) {
+      showMessage(e.message, 'error');
+    } finally {
+      updateVersionUI();                 // 操作の項目を選んだままにしない
+    }
+  });
+}
+
+const titleOf = () => `${state.name}${state.version ? ` @${state.version}` : ''} — inkdeus`;
 
 // ---- 画像・マスクの読み込み ----
 
@@ -550,6 +735,7 @@ async function setImageBlob(blob, name, remote) {
     bitmap.close();
   }
   state.name = name;
+  state.version = '';
   state.remote = remote;
   state.hasMask = false;
   state.lastExport = '';
@@ -580,47 +766,79 @@ async function setMaskBlob(blob) {
   state.hasMask = renderer.hasMask;
 }
 
-/** サーバの一覧の i 番目を開く（マスクと保存済みの設定も読む） */
-async function openIndex(i) {
+/** サーバの一覧の i 番目を開く（マスクと保存済みの設定も読む）。version でバージョンを選ぶ（'' = 既定） */
+async function openIndex(i, version = '') {
   if (i < 0 || i >= state.images.length) return;
   await flushSave();
   await flushAutoExport();             // 前の画像の「未反映の変更」を書き出してから離れる
   const item = state.images[i];
+  if (version && !verOf(item, version)) {
+    showMessage(`${item.name} のバージョン「${version}」が見つかりません。既定のバージョンを開きます`, 'error');
+    version = '';
+  }
+  // 同じ画像のバージョンを切り替えるだけなら、画像とマスクは読み直さない。取り消し履歴はバージョンごとに取っておく
+  const sameImage = state.remote && state.name === item.name && renderer.W > 0;
+  if (sameImage) historyStash.set(state.version, { history, hpos });
+  else historyStash.clear();
   setBusy(true);
   try {
-    const r = await fetch(apiPath('image', item.name), { cache: 'no-store' });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    await setImageBlob(await r.blob(), item.name, true);
-    state.index = i;
-    $('selImage').value = item.name;
-    if (item.hasMask) {
-      const m = await fetch(apiPath('mask', item.name), { cache: 'no-store' });
-      if (m.ok) await setMaskBlob(await m.blob());
+    if (sameImage) {
+      state.lastExport = '';
+      state.solo = null;
+      state.rev = null;
+      setSaveState('');
+    } else {
+      const r = await fetch(apiPath('image', item.name), { cache: 'no-store' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      await setImageBlob(await r.blob(), item.name, true);
+      if (item.hasMask) {
+        const m = await fetch(apiPath('mask', item.name), { cache: 'no-store' });
+        if (m.ok) await setMaskBlob(await m.blob());
+      }
     }
-    // 保存済みの設定があればそれを、無ければ直前の設定を引き継ぐ
-    const saved = item.hasParams ? await fetch(apiPath('params', item.name), { cache: 'no-store' }) : null;
+    state.version = version;
+    state.index = i;
+    document.title = titleOf();
+    $('selImage').value = item.name;
+    // 保存済みの設定があればそれを読む。無ければ、既定のバージョンは直前の設定を引き継ぎ、名前付きは既定値から始める
+    const rec = verOf(item, version);
+    const saved = rec && rec.hasParams ? await fetch(apiPath('params', item.name, version), { cache: 'no-store' }) : null;
     if (saved && saved.ok) {
       const rev = saved.headers.get('X-Inkdeus-Rev');
       loadParams(await saved.json(), { fresh: true });
       state.rev = rev;
+      // このバージョンを離れたときの履歴が、いまの設定の続きとして使えるなら戻す
+      const kept = sameImage ? historyStash.get(version) : null;
+      if (kept && kept.history[kept.hpos] === JSON.stringify(state.params)) {
+        history = kept.history;
+        hpos = kept.hpos;
+        rebuild();
+      }
       setSaveState('保存済み');
+    } else if (version) {
+      loadParams({}, { fresh: true });
+      await saveNow();
     } else {
       resetHistory();
       rebuild();
       // 既定値と違う設定を引き継いだときは、サーバ（と外部の操作）にも分かるようすぐ保存する
       if (JSON.stringify(state.params) !== JSON.stringify(defaultParams())) await saveNow();
     }
+    historyStash.delete(version);
     postState();
     renderNow();
     // 白黒版がまだ無い（または設定より古い）画像は、開いた時点で書き出しの対象にする
-    if (item.exportFresh) setExportState(state.autoExport ? '書き出し済み' : '');
-    else touchAutoExport();
+    if (rec && rec.exportFresh) {
+      autoExport.dirty = false;
+      setExportState(state.autoExport ? '書き出し済み' : '');
+    } else touchAutoExport();
   } catch (e) {
     showMessage(`${item.name} を開けませんでした: ${e.message}`, 'error');
   } finally {
     setBusy(false);
     $('btnPrev').disabled = state.index <= 0;
     $('btnNext').disabled = state.index >= state.images.length - 1;
+    updateVersionUI();                 // ヘッダの高さが変わりうるので、一覧の位置合わせより先に
     if (gallery) gallery.setCurrent();
   }
 }
@@ -630,6 +848,8 @@ async function openLocalImage(file) {
   setBusy(true);
   try {
     await setImageBlob(file, file.name, false);
+    historyStash.clear();
+    updateVersionUI();
     postState();
     resetHistory();
     rebuild();
@@ -708,22 +928,16 @@ async function encodeCurrent() {
   return seq === renderSeq ? blob : null;
 }
 
-/** PNG をサーバへ保存する（表示中の画像の書き出しとして） */
-async function uploadExport(name, blob) {
-  const r = await fetch(apiPath('export', name), {
+/** PNG をサーバへ保存する（表示中の画像・バージョンの書き出しとして） */
+async function uploadExport(name, blob, version = '') {
+  const r = await fetch(apiPath('export', name, version), {
     method: 'POST', body: blob,
     headers: { 'Content-Type': 'image/png', ...(state.rev ? { 'X-Inkdeus-Rev': state.rev } : {}) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const j = await r.json();
-  const item = state.images.find((i) => i.name === name);
-  if (item) {
-    item.hasExport = true;
-    item.exportFresh = true;
-    if (j.mtime) item.exportVersion = Math.round(j.mtime * 1000);
-  }
-  if (gallery) gallery.update(name);
-  return { path: j.path, bytes: blob.size };
+  mark(name, version, { hasExport: true, exportFresh: true, ...(j.mtime ? { exportVersion: Math.round(j.mtime * 1000) } : {}) });
+  return { path: j.path, bytes: blob.size, version };
 }
 
 async function exportNow() {
@@ -746,14 +960,14 @@ async function exportNow() {
     if (state.server && state.remote) {
       const snap = JSON.stringify(state.params);
       await flushSave();                        // 保存先の設定ファイルと書き出した絵をそろえる
-      result = await uploadExport(state.name, blob);
+      result = await uploadExport(state.name, blob, state.version);
       state.lastExport = `保存しました: ${result.path}`;
       if (snap === JSON.stringify(state.params) && !autoExport.timer) {
         autoExport.dirty = false;
         setExportState('書き出し済み');
       }
     } else {
-      const filename = `${stemOf(state.name || 'image')}_inkdeus.png`;
+      const filename = `${stemOf(state.name || 'image')}_inkdeus.png`;       // サーバなしではバージョンを持たない
       download(blob, filename);
       result = { download: filename, bytes: blob.size };
       state.lastExport = `ダウンロードしました: ${filename}`;
@@ -784,9 +998,7 @@ function autoExportReady() {
 function touchAutoExport() {
   if (!autoExportReady()) return;
   autoExport.dirty = true;
-  const item = state.images.find((i) => i.name === state.name);
-  if (item) item.exportFresh = false;
-  if (gallery) gallery.update(state.name);
+  mark(state.name, state.version, { exportFresh: false });
   if (!state.autoExport) {
     setExportState('未反映の変更あり');
     return;
@@ -816,17 +1028,19 @@ function runAutoExport() {
     return Promise.resolve();
   }
   const name = state.name;
+  const version = state.version;
+  const here = () => state.name === name && state.version === version;
   setExportState('書き出し中…');
   autoExport.running = (async () => {
     try {
       await flushSave();
       const snap = JSON.stringify(state.params);
       const blob = await encodeCurrent();
-      if (!blob || state.name !== name) {
-        autoExport.again = state.name === name;  // 途中で絵が変わった。保存せずにやり直す
+      if (!blob || !here()) {
+        autoExport.again = here();               // 途中で絵が変わった。保存せずにやり直す
         return;
       }
-      await uploadExport(name, blob);
+      await uploadExport(name, blob, version);
       autoExport.count += 1;
       if (snap === JSON.stringify(state.params) && !autoExport.timer && !autoExport.again) {
         autoExport.dirty = false;
@@ -890,6 +1104,7 @@ function batchReport(extra = {}) {
   const remaining = batch.exported > 0 && batch.running ? (elapsed / batch.exported) * left : null;
   return { running: batch.running, total: batch.total, done: batch.done, exported: batch.exported,
     skipped: batch.skipped, failed: batch.failed, current: batch.current, aborted: batch.abort, force: batch.force,
+    defaultOnly: !!batch.defaultOnly,
     elapsed: Math.round(elapsed * 10) / 10, remaining: remaining === null ? null : Math.round(remaining),
     errors: batch.errors.slice(0, 20), ...extra };
 }
@@ -919,11 +1134,12 @@ function abortExportAll() {
 }
 
 /**
- * プロジェクトの全画像を順に開いて書き出す。各画像は保存済みの設定で、設定の無い画像は
- * 「始めたときに画面に出ていた設定」で書き出す（その設定をその画像の設定として保存する）。
- * 書き出し済みで、設定・元画像がその後変わっていない画像は飛ばす（force で作り直す）
+ * プロジェクトの全画像・全バージョンを順に開いて書き出す（defaultOnly で既定のバージョンだけ）。
+ * それぞれ保存済みの設定で、設定の無い画像（既定のバージョン）は「始めたときに画面に出ていた設定」で書き出す
+ * （その設定をその画像の設定として保存する）。
+ * 書き出し済みで、設定・元画像がその後変わっていない物は飛ばす（force で作り直す）
  */
-async function exportAll({ force = false } = {}) {
+async function exportAll({ force = false, defaultOnly = false } = {}) {
   if (batch.running) return batchReport();
   if (!state.server) {
     showMessage('全画像の書き出しはサーバありのときだけ使えます', 'error');
@@ -934,34 +1150,45 @@ async function exportAll({ force = false } = {}) {
   await refreshImages();
   const base = JSON.stringify(state.params);
   const startName = state.remote ? state.name : null;
-  Object.assign(batch, { running: true, abort: false, total: state.images.length, done: 0, exported: 0, skipped: 0,
-    failed: 0, current: null, startedAt: performance.now(), force: !!force, errors: [] });
+  const startVersion = state.version;
+  const targets = [];
+  state.images.forEach((item, i) => {
+    verOf(item);
+    for (const rec of item.versions) {
+      if (!defaultOnly || rec.name === '') targets.push({ i, item, rec });
+    }
+  });
+  Object.assign(batch, { running: true, abort: false, total: targets.length, done: 0, exported: 0, skipped: 0,
+    failed: 0, current: null, startedAt: performance.now(), force: !!force, defaultOnly: !!defaultOnly, errors: [] });
   state.lastBatch = '';
   rebuild();
   await postBatch({ started: true });
   batchTicker = setInterval(() => showBatch(), 1000);
   try {
-    for (let i = 0; i < state.images.length && !batch.abort; i++) {
-      const item = state.images[i];
-      batch.current = item.name;
-      if (!force && item.exportFresh) {
+    for (let t = 0; t < targets.length && !batch.abort; t++) {
+      const { i, item, rec } = targets[t];
+      const version = rec.name;
+      const label = version ? `${item.name} @${version}` : item.name;
+      batch.current = label;
+      // 設定の無い名前付きのバージョン（PNG だけが置いてある物）は、何で描くか決められないので飛ばす
+      if ((!force && rec.exportFresh) || (version && !rec.hasParams)) {
         batch.skipped += 1;
       } else {
         try {
-          const hadParams = item.hasParams;
+          const hadParams = rec.hasParams;
           if (!hadParams) state.params = JSON.parse(base);     // 設定の無い画像には、始めたときの設定を使う
-          await openIndex(i);
-          if (state.name !== item.name || !state.remote) throw new Error('画像を開けませんでした');
+          await openIndex(i, version);
+          if (state.name !== item.name || state.version !== version || !state.remote) throw new Error('画像を開けませんでした');
           if (!hadParams) await saveNow();
           state.solo = null;
           renderNow();
           const blob = await encodeCurrent();
           if (!blob) throw new Error('書き出しの途中で描き直しが入りました');
-          await uploadExport(item.name, blob);
+          await uploadExport(item.name, blob, version);
           batch.exported += 1;
         } catch (e) {
           batch.failed += 1;
-          batch.errors.push(`${item.name}: ${e.message}`);
+          batch.errors.push(`${label}: ${e.message}`);
         }
       }
       batch.done += 1;
@@ -974,12 +1201,14 @@ async function exportAll({ force = false } = {}) {
     batch.current = null;
     const r = batchReport();
     state.lastBatch = `${batch.abort ? '中止しました' : '終わりました'}: 書き出し ${r.exported} / 飛ばし ${r.skipped}`
-      + ` / 失敗 ${r.failed}（全 ${r.total} 枚・${formatSpan(r.elapsed)}）`
+      + ` / 失敗 ${r.failed}（全 ${r.total} 件・${formatSpan(r.elapsed)}）`
       + (r.errors.length ? `\n${r.errors.join('\n')}` : '');
     await postBatch();
-    // 始める前に開いていた画像へ戻る
+    // 始める前に開いていた画像・バージョンへ戻る
     const back = startName ? state.images.findIndex((x) => x.name === startName) : -1;
-    if (back >= 0 && state.name !== startName) await openIndex(back);
+    if (back >= 0 && (state.name !== startName || state.version !== startVersion)) {
+      await openIndex(back, verOf(state.images[back], startVersion) ? startVersion : '');
+    }
     autoExport.dirty = false;
     rebuild();
     showMessage(`全画像の書き出し: ${state.lastBatch}`, batch.failed ? 'error' : 'info');
@@ -1015,6 +1244,7 @@ async function init() {
 
   wireViewer();
   wireFiles();
+  wireVersions();
   rebuild();
   resizeCanvas();
 
@@ -1028,11 +1258,13 @@ async function init() {
       locked: () => batch.running,
     });
     await refreshImages();
-    // /?image=<画像名> で、その画像を開いた状態で始める（漫画の構成の画面の「調整」から来る）
-    const wanted = new URLSearchParams(location.search).get('image');
+    // /?image=<画像名>[&version=<バージョン>] で、その画像（のバージョン）を開いた状態で始める
+    // （漫画の構成の画面の「調整」から来る）
+    const query = new URLSearchParams(location.search);
+    const wanted = query.get('image');
     const index = wanted ? state.images.findIndex((i) => i.name === wanted) : 0;
     if (wanted && index < 0) showMessage(`指定の画像が見つかりません: ${wanted}`, 'error');
-    await openIndex(Math.max(0, index));
+    await openIndex(Math.max(0, index), index >= 0 && wanted ? (query.get('version') || '') : '');
   } else if (state.server) {
     showMessage('入力フォルダに画像がありません', 'error');
   }
@@ -1043,7 +1275,7 @@ const hooks = {
   ready: null,
   state,
   info: () => ({
-    server: state.server, name: state.name, width: renderer.W, height: renderer.H,
+    server: state.server, name: state.name, version: state.version, width: renderer.W, height: renderer.H,
     hasMask: state.hasMask, maxTextureSize: renderer.maxTextureSize,
     unit: effectiveUnit(state.params, renderer.W),
     renderer: (() => {
@@ -1068,7 +1300,16 @@ const hooks = {
     return { ms: r.ms, passes: r.passes, warnings };
   },
   render: () => renderNow(),
-  open: async (name) => { await openIndex(state.images.findIndex((i) => i.name === name)); return hooks.info(); },
+  open: async (name, version = '') => {
+    await openIndex(state.images.findIndex((i) => i.name === name), version);
+    return hooks.info();
+  },
+  // バージョン（同じ画像から作る、設定の違う白黒版）
+  version: () => state.version,
+  versions: () => { const item = currentItem(); verOf(item); return item ? JSON.parse(JSON.stringify(item.versions)) : []; },
+  openVersion: async (version) => { await openIndex(state.index, version); return state.version; },
+  createVersion, renameVersion, deleteVersion,
+  historyInfo: () => ({ length: history.length, pos: hpos }),
   save: async () => { clearTimeout(saveTimer); saveTimer = null; await saveNow(); },
   readPixels: (x, y, w, h) => renderer.readPixels(x, y, w, h),
   readPixelsBase64: (x, y, w, h) => {

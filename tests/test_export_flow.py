@@ -127,7 +127,7 @@ def test_auto_export_after_changes_settle(live):
         assert mean(png) > 250
         first = wait_for(lambda: events.of("exported"))[0]
         assert first["name"] == "a.png" and first["file"] == "a.png" and first["rev"] and first["mtime"] > 0
-        assert first["version"] == png.stat().st_mtime_ns // 1_000_000
+        assert first["version"] == "" and first["stamp"] == png.stat().st_mtime_ns // 1_000_000
         assert api(live, "api/state")["clients"] == 1                # 聞くだけの相手は「開いているブラウザ」に数えない
 
         # 設定を続けて変えても、書き出しは溜まらない（落ち着いてから最新の設定で1回）

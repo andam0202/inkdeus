@@ -34,6 +34,8 @@ function badgesOf(item) {
   if (item.hasExport && item.exportFresh) out.push(['fresh', '書出', '書き出し済み（白黒版は最新）']);
   else if (item.hasExport) out.push(['stale', '古い', '書き出しが古い（白黒版が、設定・元画像・マスクより古い）']);
   if (!item.hasMask) out.push(['nomask', 'マスク無', 'マスクなし（人物マスクが無い画像）']);
+  const named = Array.isArray(item.versions) ? item.versions.filter((v) => v.name).length : 0;
+  if (named) out.push(['versions', `+${named}`, `名前付きのバージョンが ${named} 個（印とサムネイルは既定のバージョンの物）`]);
   return out;
 }
 

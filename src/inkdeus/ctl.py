@@ -43,7 +43,7 @@ class Client:
             except ValueError:
                 detail = {}
             if e.code == 404:
-                raise CtlError("その名前の画像（または設定）はありません", detail) from e
+                raise CtlError("その名前の画像（または設定・バージョン）はありません", detail) from e
             raise CtlError(detail.get("error") or f"サーバがエラーを返しました (HTTP {e.code})", detail) from e
         except (urllib.error.URLError, OSError) as e:
             raise CtlError(f"サーバに接続できません: {self.base}（inkdeus を起動していますか？）") from e
@@ -58,9 +58,27 @@ class Client:
             raise CtlError("ブラウザで開いている画像がありません。--name で指定してください", {"images": names})
         return current
 
+    def target(self, args) -> tuple[str, str]:
+        """対象の (画像名, バージョン)。--version が無ければ、いまブラウザで開いているバージョン
+        （--name で、開いていない画像を指したときは既定のバージョン）"""
+        given = getattr(args, "name", None)
+        version = getattr(args, "version", None)
+        if given and version is not None:
+            return given, version
+        state = self.call("GET", "/api/state")
+        current = state.get("current")
+        if not given and not current:
+            names = [i["name"] for i in self.call("GET", "/api/images")["images"]]
+            raise CtlError("ブラウザで開いている画像がありません。--name で指定してください", {"images": names})
+        name = given or current
+        if version is None:
+            version = (state.get("currentVersion") or "") if name == current else ""
+        return name, version
 
-def _path(kind: str, name: str) -> str:
-    return f"/api/{kind}/{quote(name, safe='')}"
+
+def _path(kind: str, name: str, version: str = "") -> str:
+    base = f"/api/{kind}/{quote(name, safe='')}"
+    return f"{base}?version={quote(version, safe='')}" if version else base
 
 
 def _brief(result: dict) -> dict:
@@ -84,7 +102,8 @@ def cmd_state(c: Client, args) -> dict:
 
 
 def cmd_get(c: Client, args) -> dict:
-    return c.call("GET", _path("params", c.name(args.name)) + "?resolve=1")
+    name, version = c.target(args)
+    return c.call("GET", _path("params", name, version) + ("&" if version else "?") + "resolve=1")
 
 
 def cmd_patch(c: Client, args) -> dict:
@@ -94,7 +113,7 @@ def cmd_patch(c: Client, args) -> dict:
         raise CtlError(f"パッチが JSON として読めません: {e}") from e
     if not isinstance(patch, dict):
         raise CtlError("パッチは JSON オブジェクトである必要があります")
-    return _brief(c.call("PATCH", _path("params", c.name(args.name)), patch))
+    return _brief(c.call("PATCH", _path("params", *c.target(args)), patch))
 
 
 def cmd_set(c: Client, args) -> dict:
@@ -102,11 +121,11 @@ def cmd_set(c: Client, args) -> dict:
         value = json.loads(args.value)
     except ValueError:
         value = args.value                      # JSON でなければ文字列として扱う
-    return _brief(c.call("POST", _path("set", c.name(args.name)), {"key": args.key, "value": value}))
+    return _brief(c.call("POST", _path("set", *c.target(args)), {"key": args.key, "value": value}))
 
 
 def cmd_preset(c: Client, args) -> dict:
-    return _brief(c.call("POST", _path("style", c.name(args.name)), {"style": args.style, "region": args.region}))
+    return _brief(c.call("POST", _path("style", *c.target(args)), {"style": args.style, "region": args.region}))
 
 
 def cmd_presets(c: Client, args) -> dict:
@@ -114,13 +133,13 @@ def cmd_presets(c: Client, args) -> dict:
 
 
 def cmd_stats(c: Client, args) -> dict:
-    name = c.name(args.name)
-    result = c.call("GET", _path("stats", name))
+    name, version = c.target(args)
+    result = c.call("GET", _path("stats", name, version))
     if not args.wait:
         return result
 
     def fresh():
-        r = c.call("GET", _path("stats", name))
+        r = c.call("GET", _path("stats", name, version))
         return r if r["fresh"] else None
 
     if result["clients"] == 0:
@@ -129,21 +148,28 @@ def cmd_stats(c: Client, args) -> dict:
     if result["current"] != name:
         raise CtlError(f"ブラウザで開いているのは {result['current']} です。先に inkdeus ctl open {name} してください",
                        result, code=2)
+    if (result.get("currentVersion") or "") != version:
+        shown = result.get("currentVersion") or "既定"
+        hint = f"inkdeus ctl open {name}" + (f" --version {version}" if version else ' --version ""')
+        raise CtlError(f"ブラウザで開いているバージョンは「{shown}」です。先に {hint} してください", result, code=2)
     result = _wait(fresh, args.timeout)
     if result is None:
         raise CtlError(f"{args.timeout:g} 秒待ちましたが、いまの設定に対する統計が届きません",
-                       c.call("GET", _path("stats", name)), code=3)
+                       c.call("GET", _path("stats", name, version)), code=3)
     return result
 
 
 def cmd_open(c: Client, args) -> dict:
-    r = c.call("POST", "/api/command", {"type": "open", "name": args.image})
+    # --version が無ければ「指定なし」（その画像を開いていればそのまま、別の画像からなら既定のバージョン）
+    r = c.call("POST", "/api/command", {"type": "open", "name": args.image, "version": args.version})
     if r["clients"] == 0:
         raise CtlError("ブラウザが開いていないため切り替えられません", r, code=2)
 
     def switched():
         s = c.call("GET", "/api/state")
-        return s if s.get("current") == args.image else None
+        if s.get("current") != args.image:
+            return None
+        return s if args.version is None or (s.get("currentVersion") or "") == args.version else None
 
     state = _wait(switched, args.timeout)
     if state is None:
@@ -152,20 +178,36 @@ def cmd_open(c: Client, args) -> dict:
 
 
 def cmd_export(c: Client, args) -> dict:
-    name = c.name(args.name)
-    before = c.call("GET", _path("exported", name)).get("seq", 0)
-    r = c.call("POST", "/api/command", {"type": "export", "name": name})
+    name, version = c.target(args)
+    before = c.call("GET", _path("exported", name, version)).get("seq", 0)
+    r = c.call("POST", "/api/command", {"type": "export", "name": name, "version": version})
     if r["clients"] == 0:
         raise CtlError("ブラウザが開いていないため書き出せません（書き出しはブラウザが行います）", r, code=2)
 
     def done():
-        e = c.call("GET", _path("exported", name))
+        e = c.call("GET", _path("exported", name, version))
         return e if e.get("seq", 0) > before else None
 
     result = _wait(done, args.timeout, interval=0.5)
     if result is None:
         raise CtlError(f"{args.timeout:g} 秒待ちましたが、書き出しが終わりません", code=3)
-    return {"name": name, **result}
+    return {"name": name, "version": version, **result}
+
+
+def cmd_versions(c: Client, args) -> dict:
+    return c.call("GET", _path("versions", c.name(args.name)))
+
+
+def cmd_version(c: Client, args) -> dict:
+    name = c.name(args.name)
+    if args.action == "new":
+        body = {"version": args.version_name}
+        if args.source is not None:
+            body["copyFrom"] = args.source
+        return c.call("POST", _path("versions", name), body)
+    if args.action == "rename":
+        return c.call("PATCH", _path("versions", name), {"version": args.old, "to": args.new})
+    return c.call("DELETE", _path("versions", name, args.version_name))
 
 
 def cmd_export_all(c: Client, args) -> dict:
@@ -177,7 +219,8 @@ def cmd_export_all(c: Client, args) -> dict:
     before = c.call("GET", "/api/batch")
     if before.get("running"):
         raise CtlError("一括書き出しは既に進行中です（進み具合は export-all --status、中止は --abort）", before, code=2)
-    r = c.call("POST", "/api/command", {"type": "export-all", "force": args.force})
+    r = c.call("POST", "/api/command", {"type": "export-all", "force": args.force,
+                                        "defaultOnly": args.default_only})
     if r["clients"] == 0:
         raise CtlError("ブラウザが開いていないため書き出せません（書き出しはブラウザが行います）", r, code=2)
 
@@ -222,8 +265,11 @@ def build_parser() -> argparse.ArgumentParser:
         p.set_defaults(func=func)
         return p
 
-    def with_name(p):
+    def with_name(p, version=True):
         p.add_argument("--name", help="対象の画像名（省略時はブラウザで開いている画像）")
+        if version:
+            p.add_argument("--version", default=None, metavar="V",
+                           help='対象のバージョン（省略時はブラウザで開いているバージョン。既定のバージョンは ""）')
         return p
 
     add("state", cmd_state, "現在の画像・プロジェクト・フォルダなど")
@@ -245,13 +291,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=60.0)
     p = add("open", cmd_open, "ブラウザで開く画像を切り替える")
     p.add_argument("image", help="画像名")
+    p.add_argument("--version", default=None, metavar="V", help='開くバージョン（既定のバージョンは ""）')
     p.add_argument("--timeout", type=float, default=60.0)
     p = with_name(add("export", cmd_export, "ブラウザに PNG の書き出しを指示し、保存先を返す"))
     p.add_argument("--timeout", type=float, default=300.0)
+    with_name(add("versions", cmd_versions, "画像のバージョン（設定の違う白黒版）の一覧"), version=False)
+    p = add("version", cmd_version, "バージョンを作る（設定を複製）・名前を変える・削除する")
+    vsub = p.add_subparsers(dest="action", required=True, metavar="<new|rename|delete>")
+    q = with_name(vsub.add_parser("new", parents=[target], help="設定を複製して新しいバージョンを作る"), version=False)
+    q.add_argument("version_name", metavar="V", help="新しいバージョンの名前（英数字・かな漢字・_ - で 32 文字まで）")
+    q.add_argument("--from", dest="source", default=None, metavar="元",
+                   help='複製元のバージョン（省略時は既定のバージョン）')
+    q = with_name(vsub.add_parser("rename", parents=[target], help="バージョンの名前を変える"), version=False)
+    q.add_argument("old", metavar="旧")
+    q.add_argument("new", metavar="新")
+    q = with_name(vsub.add_parser("delete", parents=[target], help="バージョンを削除する（設定と PNG を消す）"),
+                  version=False)
+    q.add_argument("version_name", metavar="V")
     p = add("export-all", cmd_export_all,
-            "ブラウザに全画像の書き出しを指示する。各画像は保存済みの設定で、設定の無い画像は"
-            "いま画面に出ている設定で書き出す。書き出し済みで設定が変わっていない画像は飛ばす")
+            "ブラウザに全画像・全バージョンの書き出しを指示する。各画像は保存済みの設定で、設定の無い画像は"
+            "いま画面に出ている設定で書き出す。書き出し済みで設定が変わっていない物は飛ばす")
     p.add_argument("--force", action="store_true", help="書き出し済みの画像も作り直す")
+    p.add_argument("--default-only", action="store_true", help="既定のバージョンだけを書き出す")
     p.add_argument("--wait", action="store_true", help="終わるまで待って結果（件数）を返す")
     p.add_argument("--status", action="store_true", help="進み具合だけを表示する（何も始めない）")
     p.add_argument("--abort", action="store_true", help="進行中の一括書き出しを中止する")

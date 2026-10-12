@@ -6,6 +6,7 @@ import io
 import json
 import threading
 import urllib.request
+from urllib.parse import quote
 
 import pytest
 from PIL import Image
@@ -45,7 +46,7 @@ class FakeBrowser(threading.Thread):
 
     def __init__(self, url: str, current: str):
         super().__init__(daemon=True)
-        self.url, self.current = url, current
+        self.url, self.current, self.version = url, current, ""
         self.seen: list[dict] = []
         self.ready = threading.Event()
         self.stream = None
@@ -56,8 +57,12 @@ class FakeBrowser(threading.Thread):
                                      headers={"Content-Type": content_type})
         urllib.request.urlopen(req, timeout=10).read()
 
+    @staticmethod
+    def query(ev):
+        return f"?version={quote(ev['version'])}" if ev.get("version") else ""
+
     def run(self):
-        self.post("api/state", {"current": self.current})
+        self.post("api/state", {"current": self.current, "version": self.version})
         self.stream = urllib.request.urlopen(self.url + "api/events", timeout=60)
         try:
             for raw in self.stream:
@@ -68,15 +73,20 @@ class FakeBrowser(threading.Thread):
                     continue
                 ev = json.loads(line[6:])
                 self.seen.append(ev)
-                if ev["type"] == "params" and ev["name"] == self.current:
-                    self.post(f"api/stats/{ev['name']}", {"rev": ev["rev"], "output": {"all": {"blackRatio": 0.5}}})
+                if ev["type"] == "params" and ev["name"] == self.current and ev.get("version", "") == self.version:
+                    self.post(f"api/stats/{ev['name']}{self.query(ev)}",
+                              {"rev": ev["rev"], "output": {"all": {"blackRatio": 0.5}}})
                 elif ev["type"] == "open":
+                    if ev["version"] is not None:
+                        self.version = ev["version"]
+                    elif ev["name"] != self.current:
+                        self.version = ""
                     self.current = ev["name"]
-                    self.post("api/state", {"current": self.current})
+                    self.post("api/state", {"current": self.current, "version": self.version})
                 elif ev["type"] == "export":
                     buf = io.BytesIO()
                     Image.new("L", (4, 4), 200).save(buf, "PNG")
-                    self.post(f"api/export/{ev['name']}", buf.getvalue(), "image/png")
+                    self.post(f"api/export/{ev['name']}{self.query(ev)}", buf.getvalue(), "image/png")
         except (OSError, ValueError, AttributeError):       # 接続を閉じられたら終わる
             pass
 

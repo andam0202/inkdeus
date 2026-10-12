@@ -262,7 +262,7 @@ def test_events_for_own_and_external_changes(dirs):
     assert q.empty()
     # ブラウザ自身の保存: 送り主の ID が付く
     rev = client.put("/api/params/scene.png", data=b'{"version": 2}', headers={"X-Inkdeus-Client": "tab-1"}).get_json()["rev"]
-    assert q.get_nowait() == {"type": "params", "name": "scene.png", "rev": rev, "source": "tab-1"}
+    assert q.get_nowait() == {"type": "params", "name": "scene.png", "version": "", "rev": rev, "source": "tab-1"}
     assert session.scan() == [] and q.empty()        # サーバ自身が書いた物は外部変更として数えない
     # 外部（エディタなど）がファイルを書き換えた
     path = images / "inkdeus_out" / "scene.inkdeus.json"
@@ -273,10 +273,10 @@ def test_events_for_own_and_external_changes(dirs):
     assert session.scan() == []                      # 同じ内容では二度出ない
     # 外部からの PATCH も source なしで届く
     r = client.patch("/api/params/scene.png", data=b'{"unit": 2}').get_json()
-    assert q.get_nowait() == {"type": "params", "name": "scene.png", "rev": r["rev"], "source": None}
+    assert q.get_nowait() == {"type": "params", "name": "scene.png", "version": "", "rev": r["rev"], "source": None}
     # 画像の切り替え・書き出しの指示
     assert client.post("/api/command", data=json.dumps({"type": "open", "name": "plain.png"})).get_json()["clients"] == 1
-    assert q.get_nowait() == {"type": "open", "name": "plain.png"}
+    assert q.get_nowait() == {"type": "open", "name": "plain.png", "version": None}
     assert client.post("/api/command", data=json.dumps({"type": "explode", "name": "plain.png"})).status_code == 400
     assert client.post("/api/command", data=json.dumps({"type": "open", "name": "nope.png"})).status_code == 404
     session.hub.unsubscribe(q)
@@ -319,7 +319,7 @@ def test_export_status_and_exported_event(dirs):
         ev = q.get_nowait()
         assert ev == {"type": "exported", "name": "scene.png", "file": "scene.png", "rev": "abc",
                       "mtime": (out / "scene.png").stat().st_mtime,
-                      "version": (out / "scene.png").stat().st_mtime_ns // 1_000_000}
+                      "version": "", "stamp": (out / "scene.png").stat().st_mtime_ns // 1_000_000}
     assert (row()["hasExport"], row()["exportFresh"]) == (True, False)    # 設定がまだ保存されていない
     client.put("/api/params/scene.png", data=json.dumps({"version": 2}), content_type="application/json")
     past = time.time_ns() - 60_000_000_000
@@ -331,7 +331,8 @@ def test_export_status_and_exported_event(dirs):
     assert row()["exportFresh"] is False
     r = client.post("/api/command", data=json.dumps({"type": "export-all", "force": True})).get_json()
     assert r["clients"] == 1 and r["force"] is True
-    assert editor.get_nowait()["type"] == "params" and editor.get_nowait() == {"type": "export-all", "force": True}
+    assert editor.get_nowait()["type"] == "params" and editor.get_nowait() == {"type": "export-all", "force": True,
+                                                                              "defaultOnly": False}
 
 
 def test_batch_progress_roundtrip(client):

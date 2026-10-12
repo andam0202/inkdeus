@@ -299,13 +299,17 @@ function watermarkSection(ctx) {
 }
 
 function outputSection(ctx) {
-  const { params, lastExport, server, remote, images, autoExport, batchForce, lastBatch } = ctx.state;
+  const { params, lastExport, server, remote, images, autoExport, batchForce, batchDefaultOnly, versionsOK,
+    lastBatch } = ctx.state;
   const auto = el('input', { type: 'checkbox', id: 'chkAutoExport' });
   auto.checked = !!autoExport;
   auto.addEventListener('change', () => ctx.setAutoExport(auto.checked));
   const force = el('input', { type: 'checkbox', id: 'chkExportAllForce' });
   force.checked = !!batchForce;
   force.addEventListener('change', () => ctx.setBatchForce(force.checked));
+  const defaultOnly = el('input', { type: 'checkbox', id: 'chkExportAllDefaultOnly' });
+  defaultOnly.checked = !!batchDefaultOnly;
+  defaultOnly.addEventListener('change', () => ctx.setBatchDefaultOnly(defaultOnly.checked));
   return section('output', [
     ...Object.entries(SECTIONS.output).map(([k, f]) => fieldRow(ctx, f, params.output, k)),
     el('div', { class: 'buttons' },
@@ -316,8 +320,9 @@ function outputSection(ctx) {
       auto, '変更を自動で書き出す（漫画の画面へ反映）'),
     server && images.length > 0 && el('div', { class: 'buttons' },
       el('button', { id: 'btnExportAll', onclick: () => ctx.exportAll(),
-        title: '各画像を、その画像に保存済みの設定で書き出します。設定の無い画像には、いま画面に出ている設定を使います' }, '全画像を書き出す'),
-      el('label', { class: 'check', title: '書き出し済みで設定が変わっていない画像も作り直す' }, force, 'すべて作り直す')),
+        title: '全画像の全バージョンを、それぞれに保存済みの設定で書き出します。設定の無い画像には、いま画面に出ている設定を使います' }, '全画像を書き出す'),
+      el('label', { class: 'check', title: '書き出し済みで設定が変わっていない画像も作り直す' }, force, 'すべて作り直す'),
+      versionsOK && el('label', { class: 'check', title: '名前付きのバージョンは書き出さない' }, defaultOnly, '既定のバージョンだけ')),
     server && lastBatch && el('div', { class: 'note', id: 'batchInfo', style: 'white-space: pre-wrap' }, lastBatch),
     el('div', { class: 'buttons' },
       el('button', { id: 'btnSaveJSON', onclick: () => ctx.saveJSON() }, '設定を保存 (JSON)'),

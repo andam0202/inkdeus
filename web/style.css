@@ -34,6 +34,10 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 }
 .brand { font-weight: 700; letter-spacing: 0.04em; margin-right: 8px; }
 #nav { display: inline-flex; gap: 4px; align-items: center; }
+#verBox { display: inline-flex; gap: 4px; align-items: center; flex: none; white-space: nowrap; }
+#selImage { min-width: 6em; }
+#verBox[hidden] { display: none; }
+#selVersion { max-width: 11em; }
 #selImage { max-width: 320px; }
 .badge { border: 1px solid var(--line); border-radius: 10px; padding: 0 8px; color: var(--dim); font-size: 12px; }
 
@@ -143,6 +147,7 @@ body.gal-resizing, body.gal-resizing * { cursor: ew-resize !important; user-sele
 .gal-badge[data-kind="params"] { color: #9ec5ff; }
 .gal-badge[data-kind="fresh"] { color: #a8d8a0; }
 .gal-badge[data-kind="stale"] { color: #f2b56b; border-color: #f2b56b; }
+.gal-badge[data-kind="versions"] { color: #d9c2ff; }
 .gal-badge[data-kind="nomask"] { color: var(--dim); border-style: dashed; border-color: var(--dim); }
 .gal-name { font-size: 10px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gal-item.current .gal-name { color: var(--fg); }

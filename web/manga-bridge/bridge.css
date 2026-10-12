@@ -141,6 +141,20 @@ html.ikb-resizing, html.ikb-resizing * { cursor: ew-resize !important; user-sele
   /* 透過の素材が見分けられるように市松模様を敷く */
   background: repeating-conic-gradient(#3a3d44 0% 25%, #2b2e34 0% 50%) 0 0 / 12px 12px;
 }
+/* 白黒のタブ: 同じ元画像のバージョンを横に並べる枠と、バージョン名のラベル */
+.ikb-vgroup {
+  grid-column: 1 / -1; display: flex; gap: 4px; padding: 3px; overflow-x: auto;
+  border: 1px dashed var(--ikb-line); border-radius: 4px;
+}
+.ikb-vgroup > .ikb-item { flex: 0 0 84px; }
+.ikb-ver {
+  position: absolute; left: 2px; top: 2px; max-width: calc(100% - 40px); padding: 0 4px; font-size: 9px; line-height: 14px;
+  background: rgba(20, 21, 25, 0.85); color: #d9c2ff; border-radius: 3px; pointer-events: none;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ikb-sel-ver { color: #d9c2ff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ikb-ver-row { flex-wrap: wrap; }
+.ikb-ver-row[hidden], .ikb-sel-ver[hidden] { display: none; }
 .ikb-caption { font-size: 10px; color: var(--ikb-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ikb .ikb-more { flex: none; }
 .ikb-count, .ikb-dim { color: var(--ikb-dim); font-size: 11px; }

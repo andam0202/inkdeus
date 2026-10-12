@@ -38,6 +38,12 @@ HEARTBEAT_SECONDS = 3.0
 MANGA_NAME_RE = re.compile(r"[\w\-]{1,64}")           # 漫画データの名前（パス区切りや . を含められない）
 MANGA_AUTOSAVE = "autosave"                            # 自動保存用の予約名
 MANGA_SUFFIX = ".lz4"
+VERSION_SEP = "@"                                      # <stem>@<バージョン>.png / .inkdeus.json
+VERSION_RE = re.compile(r"[\w\-]{1,32}")               # バージョン名（英数・かな漢字・_ -。@・空白・パス区切りは不可）
+
+
+class VersionError(ValueError):
+    """バージョン名として使えない（利用者に見せる理由つき）"""
 
 
 def find_web_dir() -> Path:
@@ -133,21 +139,112 @@ class Library:
         p = self.mask_dir / f"{entry.path.stem}.png"
         return p if p.is_file() else None
 
-    def params_path(self, entry: Entry) -> Path:
-        return self.out_dir / f"{entry.stem}{PARAMS_SUFFIX}"
+    # ---- バージョン（同じ元画像から作る、設定の違う白黒版）----
+    # 既定のバージョン（名前 ""）は <stem>.inkdeus.json / <stem>.png、
+    # 名前付きは <stem>@<バージョン>.inkdeus.json / <stem>@<バージョン>.png に置く。
 
-    def export_path(self, entry: Entry) -> Path:
-        return self.out_dir / f"{entry.stem}.png"
+    @staticmethod
+    def _base(entry: Entry, version: str = "") -> str:
+        return f"{entry.stem}{VERSION_SEP}{version}" if version else entry.stem
 
-    def export_status(self, entry: Entry) -> tuple[bool, bool]:
+    def params_path(self, entry: Entry, version: str = "") -> Path:
+        return self.out_dir / f"{self._base(entry, version)}{PARAMS_SUFFIX}"
+
+    def export_path(self, entry: Entry, version: str = "") -> Path:
+        return self.out_dir / f"{self._base(entry, version)}.png"
+
+    def check_version(self, entry: Entry, version: str, entries: dict[str, Entry] | None = None) -> str:
+        """バージョン名を確かめる（"" は既定）。使えなければ VersionError"""
+        if version == "":
+            return version
+        if not isinstance(version, str) or VERSION_RE.fullmatch(version) is None:
+            raise VersionError("バージョン名に使えるのは英数字・かな漢字・_ - だけです（1〜32 文字）")
+        stems = {e.stem for e in (self.entries() if entries is None else entries).values()}
+        if self._base(entry, version) in stems:
+            # <stem>@<バージョン> という名前の元画像が別にある。そのファイルはそちらの既定のバージョンとして読む
+            raise VersionError(f"「{self._base(entry, version)}」という名前の元画像があるため、"
+                               f"このバージョン名は使えません")
+        return version
+
+    def resolve_stem(self, stem: str, entries: dict[str, Entry] | None = None) -> tuple[Entry, str] | None:
+        """出力ファイルの基底名（拡張子なし）から (元画像, バージョン) を引く。
+        元画像の一覧に実在する基底名を優先する（名前に @ を含む元画像は、その画像の既定のバージョン）"""
+        by_stem = {e.stem: e for e in (self.entries() if entries is None else entries).values()}
+        if stem in by_stem:
+            return by_stem[stem], ""
+        base, sep, version = stem.rpartition(VERSION_SEP)
+        if sep and base in by_stem and VERSION_RE.fullmatch(version):
+            return by_stem[base], version
+        return None
+
+    def version_index(self, entries: dict[str, Entry] | None = None) -> dict[str, dict[str, dict]]:
+        """out フォルダを1回だけ走査して、画像名 → {バージョン名 → {"params": stat, "export": stat}} を返す"""
+        entries = self.entries() if entries is None else entries
+        index: dict[str, dict[str, dict]] = {name: {} for name in entries}
+        try:
+            with os.scandir(self.out_dir) as it:
+                items = [(i.name, i) for i in it]
+        except OSError:
+            return index
+        for fname, item in items:
+            if fname.endswith(PARAMS_SUFFIX):
+                kind, stem = "params", fname[: -len(PARAMS_SUFFIX)]
+            elif fname.endswith(".png"):
+                kind, stem = "export", fname[:-4]
+            else:
+                continue
+            found = self.resolve_stem(stem, entries)
+            if found is None:
+                continue
+            try:
+                if not item.is_file():
+                    continue
+                st = item.stat()
+            except OSError:
+                continue
+            index[found[0].name].setdefault(found[1], {})[kind] = st
+        return index
+
+    def versions(self, entry: Entry, index: dict | None = None) -> list[dict]:
+        """その画像のバージョンの一覧（既定が先頭。名前付きは名前順）"""
+        found = (self.version_index() if index is None else index).get(entry.name, {})
+        try:
+            inputs = [entry.path.stat().st_mtime_ns]
+        except OSError:
+            inputs = []
+        mask = self.mask_path(entry)
+        if mask is not None:
+            inputs.append(mask.stat().st_mtime_ns)
+        rows = []
+        for name in ["", *sorted(v for v in found if v)]:
+            rec = found.get(name, {})
+            params, export = rec.get("params"), rec.get("export")
+            # 設定がまだ保存されていない物は「新しい」とは見なさない
+            fresh = (export is not None and params is not None and bool(inputs)
+                     and export.st_mtime_ns >= max(params.st_mtime_ns, *inputs))
+            stamps = [st.st_mtime for st in (params, export) if st is not None]
+            rows.append({
+                "name": name, "hasParams": params is not None, "hasExport": export is not None,
+                "exportFresh": fresh, "updatedAt": max(stamps) if stamps else None,
+                # 白黒版（書き出した PNG）のファイル名と更新時刻（ミリ秒。サムネイルのキャッシュ回避に使う）
+                "exportFile": self.export_path(entry, name).name,
+                "exportVersion": export.st_mtime_ns // 1_000_000 if export is not None else None,
+            })
+        return rows
+
+    def has_version(self, entry: Entry, version: str) -> bool:
+        """既定のバージョンは常にある。名前付きは、設定か書き出しのファイルがあるとき"""
+        return version == "" or self.params_path(entry, version).is_file() or self.export_path(entry, version).is_file()
+
+    def export_status(self, entry: Entry, version: str = "") -> tuple[bool, bool]:
         """(書き出し済みか, その書き出しがいまの設定・元画像・マスクより新しいか)。
         設定がまだ保存されていない画像は「新しい」とは見なさない"""
         try:
-            done = self.export_path(entry).stat().st_mtime_ns
+            done = self.export_path(entry, version).stat().st_mtime_ns
         except OSError:
             return False, False
         try:
-            inputs = [self.params_path(entry).stat().st_mtime_ns, entry.path.stat().st_mtime_ns]
+            inputs = [self.params_path(entry, version).stat().st_mtime_ns, entry.path.stat().st_mtime_ns]
         except OSError:
             return True, False
         mask = self.mask_path(entry)
@@ -215,26 +312,28 @@ class Session:
         self.hub = Hub()
         self.lock = threading.RLock()
         self.current: str | None = None
+        self.current_version: str = ""                        # いまブラウザで開いているバージョン（"" = 既定）
+        self._owners: dict[str, tuple[str, str]] = {}         # 設定ファイル名 → (画像名, バージョン)
         self.revs: dict[str, str | None] = {}                 # 設定ファイル名 → 最後に知っている rev
         self._stamps: dict[str, tuple[int, int]] = {}         # 設定ファイル名 → (mtime_ns, size)
-        self.stats: dict[str, dict] = {}
-        self.exports: dict[str, dict] = {}
+        self.stats: dict[tuple[str, str], dict] = {}          # (画像名, バージョン) → 統計
+        self.exports: dict[tuple[str, str], dict] = {}
         self.batch: dict = {"seq": 0, "running": False}       # 一括書き出しの進み具合（ブラウザが知らせてくる）
         self._stop = threading.Event()
         self._primed = False                                  # 最初の走査（起動時の状態の記録）が済んだか
 
     # ---- 設定ファイル ----
 
-    def read_params(self, entry: Entry) -> tuple[bytes | None, str | None]:
+    def read_params(self, entry: Entry, version: str = "") -> tuple[bytes | None, str | None]:
         try:
-            data = self.lib.params_path(entry).read_bytes()
+            data = self.lib.params_path(entry, version).read_bytes()
         except OSError:
             return None, None
         return data, rev_of(data)
 
-    def resolved(self, entry: Entry) -> dict:
+    def resolved(self, entry: Entry, version: str = "") -> dict:
         """いまの設定（ファイルが無ければ既定値）を整えて返す"""
-        data, rev = self.read_params(entry)
+        data, rev = self.read_params(entry, version)
         raw = None
         problems: list[str] = []
         if data is not None:
@@ -243,49 +342,70 @@ class Session:
             except (UnicodeDecodeError, ValueError):
                 problems.append("設定ファイルが JSON として読めないため既定値を使いました")
         params, warns = schema.normalize(raw)
-        return {"name": entry.name, "rev": rev, "exists": data is not None,
+        return {"name": entry.name, "version": version, "rev": rev, "exists": data is not None,
                 "params": params, "warnings": problems + warns}
 
-    def write_params(self, entry: Entry, params: dict, source: str | None) -> str:
+    def remember(self, path: Path, entry: Entry, version: str, rev: str | None) -> None:
+        """サーバ自身が書いた（消した）設定ファイルを覚える（監視が「外部からの変更」と取り違えないように）"""
+        with self.lock:
+            try:
+                st = path.stat()
+            except OSError:
+                self.revs.pop(path.name, None)
+                self._stamps.pop(path.name, None)
+                self._owners.pop(path.name, None)
+                return
+            self.revs[path.name] = rev
+            self._stamps[path.name] = (st.st_mtime_ns, st.st_size)
+            self._owners[path.name] = (entry.name, version)
+
+    def write_params(self, entry: Entry, params: dict, source: str | None, version: str = "") -> str:
         """設定を書き込み、ブラウザへ知らせる。source は書いた本人（ブラウザの ID）で、外部からなら None"""
         data = (json.dumps(params, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-        path = self.lib.params_path(entry)
+        path = self.lib.params_path(entry, version)
         with self.lock:
             _atomic_write(path, data)
             rev = rev_of(data)
-            self.revs[path.name] = rev
-            try:
-                st = path.stat()
-                self._stamps[path.name] = (st.st_mtime_ns, st.st_size)
-            except OSError:
-                pass
-        self.hub.publish({"type": "params", "name": entry.name, "rev": rev, "source": source})
+            self.remember(path, entry, version, rev)
+        self.hub.publish({"type": "params", "name": entry.name, "version": version, "rev": rev, "source": source})
         return rev
 
     # ---- 設定ファイルの外部変更の監視 ----
 
     def scan(self) -> list[dict]:
         """out フォルダの設定ファイルを調べ、サーバ以外が書き換えた物をイベントにして返す（配信もする）"""
-        by_file = {self.lib.params_path(e).name: e for e in self.lib.entries().values()}
+        entries = self.lib.entries()
         seen: dict[str, tuple[int, int]] = {}
+        owners: dict[str, tuple[str, str]] = {}
         try:
             with os.scandir(self.lib.out_dir) as it:
                 for item in it:
-                    if item.name in by_file:
-                        st = item.stat()
-                        seen[item.name] = (st.st_mtime_ns, st.st_size)
+                    if not item.name.endswith(PARAMS_SUFFIX):
+                        continue
+                    found = self.lib.resolve_stem(item.name[: -len(PARAMS_SUFFIX)], entries)
+                    if found is None:
+                        continue
+                    st = item.stat()
+                    seen[item.name] = (st.st_mtime_ns, st.st_size)
+                    owners[item.name] = (found[0].name, found[1])
         except OSError:
             pass
         events = []
         with self.lock:
-            for fname, entry in by_file.items():
+            for fname in sorted(set(seen) | set(self._stamps)):
                 stamp = seen.get(fname)
                 if stamp == self._stamps.get(fname):
                     continue
+                owner = owners.get(fname) or self._owners.get(fname)
+                if owner is None:
+                    self._stamps.pop(fname, None)
+                    continue
                 if stamp is None:
                     self._stamps.pop(fname, None)
+                    self._owners.pop(fname, None)
                     rev = None
                 else:
+                    self._owners[fname] = owner
                     self._stamps[fname] = stamp
                     try:
                         rev = rev_of((self.lib.out_dir / fname).read_bytes())
@@ -294,7 +414,8 @@ class Session:
                 changed = self.revs.get(fname) != rev
                 self.revs[fname] = rev
                 if changed and self._primed:
-                    events.append({"type": "params", "name": entry.name, "rev": rev, "source": None})
+                    events.append({"type": "params", "name": owner[0], "version": owner[1],
+                                   "rev": rev, "source": None})
             self._primed = True
         for ev in events:
             self.hub.publish(ev)
@@ -380,6 +501,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
     def info() -> dict:
         return {
             "current": session.current,
+            "currentVersion": session.current_version if session.current else "",
             "images": len(lib.entries()),
             "clients": session.hub.count(),
             "project": project,
@@ -471,6 +593,13 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
             abort(404)
         return item
 
+    def inked_fallback(source: str, rel: str) -> assets_mod.Item | None:
+        """消された・名前の変わったバージョンの白黒版を指す URL には、既定のバージョン（無ければ元画像）を返す
+        （保存済みの漫画データを開いたとき、絵そのものが消えてしまわないように）"""
+        if source != "inked" or catalog.find(asset_source(source), rel) is not None:
+            return None
+        return catalog.fallback(rel)
+
     def int_arg(name: str, default: int | None, lo: int, hi: int) -> int | None:
         raw = request.args.get(name)
         if raw is None or raw == "":
@@ -518,11 +647,13 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
 
     @app.get("/api/assets/<source>/image/<path:rel>")
     def api_assets_image(source: str, rel: str):
-        item = asset_item(source, rel)
+        substitute = inked_fallback(source, rel)
+        item = substitute or asset_item(source, rel)
         limit = int_arg("max", None, *assets_mod.MAX_SIDE_RANGE)
-        if limit is None:
-            return send_file(item.path, conditional=True)
-        return send_derived(item, "max", limit)
+        resp = send_file(item.path, conditional=True) if limit is None else send_derived(item, "max", limit)
+        if substitute is not None:
+            resp.headers["X-Inkdeus-Fallback"] = "1"
+        return resp
 
     @app.get("/api/assets/<source>/thumb/<path:rel>")
     def api_assets_thumb(source: str, rel: str):
@@ -609,21 +740,34 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
 
     # ---- 画像・マスク ----
 
+    def ver_arg(entry: Entry, must_exist: bool = True) -> str:
+        """クエリ ?version=<名前>（省略 = 既定）。使えない名前は 400、無いバージョンは 404"""
+        version = request.args.get("version", "")
+        try:
+            lib.check_version(entry, version)
+        except VersionError as e:
+            abort(400, description=str(e))
+        if must_exist and not lib.has_version(entry, version):
+            abort(404)
+        return version
+
     @app.get("/api/images")
     def api_images():
         items = []
-        for e in lib.entries().values():
+        entries = lib.entries()
+        index = lib.version_index(entries)
+        for e in entries.values():
             w, h = lib.size(e)
-            exported, fresh = lib.export_status(e)
-            export = lib.export_path(e)
+            versions = lib.versions(e, index)
+            default = versions[0]
             items.append({
-                # 白黒版（書き出した PNG）のファイル名と更新時刻（ミリ秒。サムネイルのキャッシュ回避に使う）
-                "exportFile": export.name,
-                "exportVersion": export.stat().st_mtime_ns // 1_000_000 if exported else None,
+                # 画像単位の項目は既定のバージョンの物（名前付きは versions に並ぶ）
+                "exportFile": default["exportFile"], "exportVersion": default["exportVersion"],
                 "name": e.name, "width": w, "height": h,
                 "hasMask": lib.mask_path(e) is not None,
-                "hasParams": lib.params_path(e).is_file(),
-                "hasExport": exported, "exportFresh": fresh,
+                "hasParams": default["hasParams"],
+                "hasExport": default["hasExport"], "exportFresh": default["exportFresh"],
+                "versions": versions,
             })
         return jsonify({"images": items, "outDir": str(lib.out_dir),
                         "maskDir": str(lib.mask_dir) if lib.mask_dir else None})
@@ -644,10 +788,11 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
     @app.route("/api/params/<path:name>", methods=["GET", "PUT", "PATCH"])
     def api_params(name: str):
         entry = lib.get(name)
+        version = ver_arg(entry)
         if request.method == "GET":
             if request.args.get("resolve"):
-                return jsonify(session.resolved(entry))
-            data, rev = session.read_params(entry)
+                return jsonify(session.resolved(entry, version))
+            data, rev = session.read_params(entry, version)
             if data is None:
                 abort(404)
             resp = Response(data, mimetype="application/json")
@@ -656,45 +801,47 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         body = json_body()
         if request.method == "PUT":
             # ブラウザ自身の保存（ブラウザ側で整えてあるのでそのまま書く）
-            rev = session.write_params(entry, body, request.headers.get("X-Inkdeus-Client"))
-            return jsonify({"path": str(lib.params_path(entry)), "rev": rev})
+            rev = session.write_params(entry, body, request.headers.get("X-Inkdeus-Client"), version)
+            return jsonify({"path": str(lib.params_path(entry, version)), "rev": rev, "version": version})
         # PATCH: 外部からの部分更新（JSON Merge Patch）。検証に通らなければ何も書かない
-        base = session.resolved(entry)["params"]
+        base = session.resolved(entry, version)["params"]
         try:
             params, _ = schema.normalize(schema.merge_patch(base, body), strict=True)
         except schema.ValidationError as e:
             return fail(e.problems)
-        rev = session.write_params(entry, params, None)
-        return jsonify({"name": entry.name, "rev": rev, "params": params})
+        rev = session.write_params(entry, params, None, version)
+        return jsonify({"name": entry.name, "version": version, "rev": rev, "params": params})
 
     @app.post("/api/set/<path:name>")
     def api_set(name: str):
         entry = lib.get(name)
+        version = ver_arg(entry)
         body = json_body()
         if not isinstance(body.get("key"), str) or "value" not in body:
             return fail(["key と value が必要です"])
-        base = session.resolved(entry)["params"]
+        base = session.resolved(entry, version)["params"]
         try:
             params, _ = schema.normalize(schema.set_path(base, body["key"], body["value"]),
                                          strict=True)
         except schema.ValidationError as e:
             return fail(e.problems)
-        rev = session.write_params(entry, params, None)
-        return jsonify({"name": entry.name, "rev": rev, "params": params})
+        rev = session.write_params(entry, params, None, version)
+        return jsonify({"name": entry.name, "version": version, "rev": rev, "params": params})
 
     @app.post("/api/style/<path:name>")
     def api_style(name: str):
         entry = lib.get(name)
+        version = ver_arg(entry)
         body = json_body()
-        base = session.resolved(entry)["params"]
+        base = session.resolved(entry, version)["params"]
         try:
             style = schema.resolve_style(str(body.get("style", "")))
             params = schema.apply_style(base, str(body.get("style", "")), str(body.get("region", "person")))
             params, _ = schema.normalize(params, strict=True)
         except schema.ValidationError as e:
             return fail(e.problems)
-        rev = session.write_params(entry, params, None)
-        return jsonify({"name": entry.name, "rev": rev, "style": style,
+        rev = session.write_params(entry, params, None, version)
+        return jsonify({"name": entry.name, "version": version, "rev": rev, "style": style,
                         "region": body.get("region", "person"), "params": params})
 
     @app.get("/api/styles")
@@ -706,25 +853,119 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
     @app.post("/api/export/<path:name>")
     def api_export(name: str):
         entry = lib.get(name)
+        version = ver_arg(entry)
         data = request.get_data(cache=False)
         if not data.startswith(PNG_SIGNATURE):
             abort(400, description="PNG ではありません")
-        path = lib.export_path(entry)
+        path = lib.export_path(entry, version)
         _atomic_write(path, data)
         with session.lock:
-            seq = session.exports.get(entry.name, {}).get("seq", 0) + 1
-            session.exports[entry.name] = {"seq": seq, "path": str(path), "bytes": len(data),
-                                           "time": time.time(), "rev": request.headers.get("X-Inkdeus-Rev")}
+            seq = session.exports.get((entry.name, version), {}).get("seq", 0) + 1
+            session.exports[(entry.name, version)] = {
+                "seq": seq, "version": version, "path": str(path), "bytes": len(data),
+                "time": time.time(), "rev": request.headers.get("X-Inkdeus-Rev")}
         st = path.stat()
-        # 書き出しを知らせる（漫画の構成の画面が、使っている白黒版を新しい物に替える）
-        session.hub.publish({"type": "exported", "name": entry.name, "file": path.name, "mtime": st.st_mtime,
-                             "version": st.st_mtime_ns // 1_000_000, "rev": request.headers.get("X-Inkdeus-Rev")})
-        return jsonify({"path": str(path), "bytes": len(data), "mtime": st.st_mtime})
+        # 書き出しを知らせる（漫画の構成の画面が、使っている白黒版を新しい物に替える）。
+        # version はバージョン名、stamp は PNG の更新時刻（ミリ秒。キャッシュ回避に使う）
+        session.hub.publish({"type": "exported", "name": entry.name, "version": version, "file": path.name,
+                             "mtime": st.st_mtime, "stamp": st.st_mtime_ns // 1_000_000,
+                             "rev": request.headers.get("X-Inkdeus-Rev")})
+        return jsonify({"path": str(path), "bytes": len(data), "mtime": st.st_mtime, "version": version})
 
     @app.get("/api/exported/<path:name>")
     def api_exported(name: str):
         entry = lib.get(name)
-        return jsonify(session.exports.get(entry.name, {"seq": 0}))
+        return jsonify(session.exports.get((entry.name, ver_arg(entry)), {"seq": 0}))
+
+    # ---- バージョン（同じ元画像から作る、設定の違う白黒版）----
+
+    def version_listing(entry: Entry) -> dict:
+        return {"name": entry.name, "versions": lib.versions(entry),
+                "current": session.current_version if session.current == entry.name else None}
+
+    def body_version(entry: Entry, body: dict, key: str, allow_default: bool) -> str:
+        value = body.get(key, "" if allow_default else None)
+        if not isinstance(value, str) or (value == "" and not allow_default):
+            abort(400, description=f"{key} にバージョン名を指定してください")
+        try:
+            return lib.check_version(entry, value)
+        except VersionError as e:
+            abort(400, description=str(e))
+
+    def announce(entry: Entry, action: str, version: str, **extra) -> None:
+        session.hub.publish({"type": "versions", "action": action, "name": entry.name, "version": version,
+                             "file": lib.export_path(entry, version).name, **extra})
+
+    @app.route("/api/versions/<path:name>", methods=["GET", "POST", "PATCH", "DELETE"])
+    def api_versions(name: str):
+        entry = lib.get(name)
+        if request.method == "GET":
+            return jsonify(version_listing(entry))
+        if request.method == "POST":
+            # 作成: copyFrom（省略 = 既定）の設定を複製する。copyExport が真なら書き出した PNG も写す
+            body = json_body()
+            version = body_version(entry, body, "version", False)
+            source = body_version(entry, body, "copyFrom", True)
+            if lib.has_version(entry, version):
+                return jsonify({"error": f"バージョン「{version}」は既にあります"}), 409
+            if not lib.has_version(entry, source):
+                abort(404)
+            params = session.resolved(entry, source)["params"]
+            rev = session.write_params(entry, params, None, version)
+            copied = False
+            if body.get("copyExport") is True:
+                try:
+                    _atomic_write(lib.export_path(entry, version), lib.export_path(entry, source).read_bytes())
+                    copied = True
+                except OSError:
+                    pass                                    # 複製元がまだ書き出されていない
+            announce(entry, "create", version, copyFrom=source)
+            return jsonify({**version_listing(entry), "version": version, "copyFrom": source, "rev": rev,
+                            "copiedExport": copied, "file": lib.export_path(entry, version).name})
+        if request.method == "PATCH":
+            # 名前の変更
+            body = json_body()
+            version = body_version(entry, body, "version", False)
+            target = body_version(entry, body, "to", False)
+            if not lib.has_version(entry, version):
+                abort(404)
+            if lib.has_version(entry, target):
+                return jsonify({"error": f"バージョン「{target}」は既にあります"}), 409
+            with session.lock:
+                for getter in (lib.params_path, lib.export_path):
+                    src, dst = getter(entry, version), getter(entry, target)
+                    if src.is_file():
+                        os.replace(src, dst)
+                old, new = lib.params_path(entry, version), lib.params_path(entry, target)
+                rev = session.revs.get(old.name)
+                session.remember(old, entry, version, None)
+                session.remember(new, entry, target, rev)
+                for table in (session.stats, session.exports):
+                    table.pop((entry.name, version), None)
+                if session.current == entry.name and session.current_version == version:
+                    session.current_version = target
+            announce(entry, "rename", version, to=target, toFile=lib.export_path(entry, target).name)
+            return jsonify({**version_listing(entry), "version": target, "renamedFrom": version})
+        # DELETE: 設定と PNG を消す（既定のバージョンは消せない）
+        version = request.args.get("version", "")
+        if version == "":
+            abort(400, description="既定のバージョンは削除できません")
+        try:
+            lib.check_version(entry, version)
+        except VersionError as e:
+            abort(400, description=str(e))
+        if not lib.has_version(entry, version):
+            abort(404)
+        with session.lock:
+            for path in (lib.params_path(entry, version), lib.export_path(entry, version)):
+                path.unlink(missing_ok=True)
+            session.remember(lib.params_path(entry, version), entry, version, None)
+            for table in (session.stats, session.exports):
+                table.pop((entry.name, version), None)
+            if session.current == entry.name and session.current_version == version:
+                session.current_version = ""
+        announce(entry, "delete", version)
+        return jsonify({**version_listing(entry), "deleted": version})
 
     # ---- 外部からの操作（状態・イベント・統計・指示） ----
 
@@ -733,9 +974,17 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         if request.method == "POST":
             body = json_body()
             current = body.get("current")
-            if current is not None and current not in lib.entries():
+            entries = lib.entries()
+            if current is not None and current not in entries:
                 abort(404)
+            version = body.get("version") or ""
+            if current is not None and version:
+                try:
+                    lib.check_version(entries[current], version, entries)
+                except VersionError as e:
+                    abort(400, description=str(e))
             session.current = current
+            session.current_version = version if current is not None else ""
         return jsonify(info())
 
     @app.get("/api/events")
@@ -763,17 +1012,24 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
     def api_stats(name: str):
         entry = lib.get(name)
         if request.method == "POST":
+            version = ver_arg(entry, must_exist=False)
+            if not lib.has_version(entry, version):
+                # 統計を送る直前にバージョンが消された・名前が変わった。エラーにはせず受け流す
+                return jsonify({"ok": False})
             body = json_body()
             body["name"] = entry.name
+            body["version"] = version
             body["receivedAt"] = time.time()
-            session.stats[entry.name] = body
+            session.stats[(entry.name, version)] = body
             return jsonify({"ok": True})
-        _, rev = session.read_params(entry)
-        stats = session.stats.get(entry.name)
+        version = ver_arg(entry)
+        _, rev = session.read_params(entry, version)
+        stats = session.stats.get((entry.name, version))
         return jsonify({
-            "name": entry.name, "currentRev": rev, "stats": stats,
+            "name": entry.name, "version": version, "currentRev": rev, "stats": stats,
             "fresh": stats is not None and stats.get("rev") == rev,
             "clients": session.hub.count(), "current": session.current,
+            "currentVersion": session.current_version if session.current else "",
         })
 
     @app.route("/api/batch", methods=["GET", "POST"])
@@ -786,7 +1042,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
                 if body.get("started") is True:
                     seq += 1
                 keys = ("running", "total", "done", "exported", "skipped", "failed", "current", "aborted",
-                        "force", "elapsed", "remaining", "errors")
+                        "force", "defaultOnly", "elapsed", "remaining", "errors")
                 session.batch = {"seq": seq, **{k: body[k] for k in keys if k in body}, "time": time.time()}
                 session.batch["running"] = body.get("running") is True
         return jsonify(session.batch)
@@ -797,12 +1053,24 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         kind = body.get("type")
         if kind in ("export-all", "export-all-abort"):
             # 一括書き出しの開始・中止（画像名は要らない）
-            event = {"type": kind, "force": body.get("force") is True}
+            event = {"type": kind, "force": body.get("force") is True,
+                     "defaultOnly": body.get("defaultOnly") is True}
             return jsonify({**event, "clients": session.hub.publish(event), "batch": session.batch})
         if kind not in ("open", "export"):
             abort(400, description="type は open / export / export-all / export-all-abort のどれかです")
         entry = lib.get(str(body.get("name", "")))
-        clients = session.hub.publish({"type": kind, "name": entry.name})
-        return jsonify({"type": kind, "name": entry.name, "clients": clients})
+        # version: 開く・書き出すバージョン。null（省略）は「指定なし」（open はいまのまま / 既定、export は既定）
+        version = body.get("version")
+        if version is not None:
+            if not isinstance(version, str):
+                abort(400, description="version は文字列で指定してください")
+            try:
+                lib.check_version(entry, version)
+            except VersionError as e:
+                abort(400, description=str(e))
+            if not lib.has_version(entry, version):
+                abort(404)
+        clients = session.hub.publish({"type": kind, "name": entry.name, "version": version})
+        return jsonify({"type": kind, "name": entry.name, "version": version, "clients": clients})
 
     return app
