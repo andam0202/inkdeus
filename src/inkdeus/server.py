@@ -582,7 +582,11 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         for e in lib.entries().values():
             w, h = lib.size(e)
             exported, fresh = lib.export_status(e)
+            export = lib.export_path(e)
             items.append({
+                # 白黒版（書き出した PNG）のファイル名と更新時刻（ミリ秒。サムネイルのキャッシュ回避に使う）
+                "exportFile": export.name,
+                "exportVersion": export.stat().st_mtime_ns // 1_000_000 if exported else None,
                 "name": e.name, "width": w, "height": h,
                 "hasMask": lib.mask_path(e) is not None,
                 "hasParams": lib.params_path(e).is_file(),

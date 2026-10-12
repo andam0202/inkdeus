@@ -3,6 +3,7 @@
 import { Renderer } from './renderer.js';
 import { encodeGrayPNG } from './png.js';
 import { buildPanel } from './panel.js';
+import { createGallery } from './gallery.js';
 import {
   SCHEMA, normalize, defaultParams, applyStyle, effectiveUnit, effectiveWatermark, STYLES,
 } from './schema.js';
@@ -42,6 +43,7 @@ const state = {
 };
 
 let renderer = null;
+let gallery = null;                     // 画像一覧パネル（サーバありのときだけ）
 let history = [];
 let hpos = -1;
 let saveTimer = null;
@@ -258,11 +260,16 @@ function wireViewer() {
     $('btnOriginal').addEventListener(ev, () => showOriginal(false));
   }
   const typing = (t) => t && (t.tagName === 'TEXTAREA' || t.tagName === 'SELECT'
-    || (t.tagName === 'INPUT' && ['text', 'number'].includes(t.type)));
+    || (t.tagName === 'INPUT' && ['text', 'number', 'search'].includes(t.type)));
   window.addEventListener('keydown', (e) => {
     if (e.code === 'Space' && !typing(e.target)) {
       e.preventDefault();
       if (!e.repeat) showOriginal(true);
+      return;
+    }
+    if ((e.key === '[' || e.key === ']') && !typing(e.target) && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      if (!e.repeat) stepImage(e.key === ']' ? 1 : -1);        // 前後の画像（絞り込み中はその中で）
       return;
     }
     const mod = e.ctrlKey || e.metaKey;
@@ -380,6 +387,7 @@ async function saveNow() {
     const j = await r.json();
     const item = state.images.find((i) => i.name === name);
     if (item) item.hasParams = true;
+    if (gallery) gallery.update(name);
     if (name === state.name) state.rev = j.rev;
     if (!saveTimer) setSaveState('保存済み');
   } catch (e) {
@@ -441,7 +449,11 @@ function postState() {
 /** 設定ファイルが外から書き換えられたときに読み直す（取り消し履歴にも1件として積む） */
 async function onExternalParams(ev) {
   const item = state.images.find((i) => i.name === ev.name);
-  if (item) item.hasParams = ev.rev !== null;
+  if (item) {
+    item.hasParams = ev.rev !== null;
+    item.exportFresh = false;             // 設定が書き換わったので、いまの白黒版はもう最新ではない
+    if (gallery) gallery.update(ev.name);
+  }
   if (ev.source === CLIENT_ID || !state.remote || ev.name !== state.name) return;
   if (ev.rev === null || ev.rev === state.rev) return;
   const r = await fetch(apiPath('params', ev.name), { cache: 'no-store' });
@@ -470,12 +482,36 @@ function connectEvents() {
     let ev;
     try { ev = JSON.parse(msg.data); } catch { return; }
     if (ev.type === 'params') onExternalParams(ev).catch((e) => console.warn(e));
+    else if (ev.type === 'exported') onExported(ev);
     else if (batch.running && (ev.type === 'open' || ev.type === 'export')) return;   // 一括書き出しの最中は受けない
     else if (ev.type === 'open') openByName(ev.name);
     else if (ev.type === 'export') openByName(ev.name).then(() => exportNow()).catch((e) => console.warn(e));
     else if (ev.type === 'export-all') exportAll({ force: !!ev.force }).catch((e) => console.warn(e));
     else if (ev.type === 'export-all-abort') abortExportAll();
   };
+}
+
+/** どこかで（この画面・別のタブ・一括書き出し）白黒版が保存された。一覧の印とサムネイルを新しくする */
+function onExported(ev) {
+  const item = state.images.find((i) => i.name === ev.name);
+  if (!item) return;
+  item.hasExport = true;
+  item.exportFile = ev.file || item.exportFile;
+  item.exportVersion = ev.version || item.exportVersion;
+  // 表示中の画像に未反映の変更が残っているなら、まだ「最新」ではない
+  item.exportFresh = !(state.remote && ev.name === state.name && autoExport.dirty);
+  if (gallery) gallery.update(ev.name);
+}
+
+/** 前後の画像へ（画像一覧で絞り込んでいるときは、その結果の中で動く） */
+function stepImage(delta) {
+  if (batch.running || !state.images.length) return;
+  const names = gallery ? gallery.visibleNames() : state.images.map((i) => i.name);
+  if (!names.length) return;
+  const at = names.indexOf(state.name);
+  const next = at < 0 ? (delta > 0 ? 0 : names.length - 1) : at + delta;
+  if (next < 0 || next >= names.length) return;
+  openIndex(state.images.findIndex((i) => i.name === names[next]));
 }
 
 async function openByName(name) {
@@ -501,6 +537,7 @@ async function refreshImages() {
   }));
   if (state.remote && state.name) sel.value = state.name;
   $('nav').hidden = state.images.length < 2;
+  if (gallery) gallery.refresh();
 }
 
 // ---- 画像・マスクの読み込み ----
@@ -584,6 +621,7 @@ async function openIndex(i) {
     setBusy(false);
     $('btnPrev').disabled = state.index <= 0;
     $('btnNext').disabled = state.index >= state.images.length - 1;
+    if (gallery) gallery.setCurrent();
   }
 }
 
@@ -679,7 +717,12 @@ async function uploadExport(name, blob) {
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const j = await r.json();
   const item = state.images.find((i) => i.name === name);
-  if (item) { item.hasExport = true; item.exportFresh = true; }
+  if (item) {
+    item.hasExport = true;
+    item.exportFresh = true;
+    if (j.mtime) item.exportVersion = Math.round(j.mtime * 1000);
+  }
+  if (gallery) gallery.update(name);
   return { path: j.path, bytes: blob.size };
 }
 
@@ -743,6 +786,7 @@ function touchAutoExport() {
   autoExport.dirty = true;
   const item = state.images.find((i) => i.name === state.name);
   if (item) item.exportFresh = false;
+  if (gallery) gallery.update(state.name);
   if (!state.autoExport) {
     setExportState('未反映の変更あり');
     return;
@@ -976,6 +1020,13 @@ async function init() {
 
   connectEvents();
   if (state.images.length) {
+    // 画像一覧パネル（サーバなしで1枚ずつ開く使い方では出さない）
+    gallery = createGallery($('gallery'), {
+      images: () => state.images,
+      current: () => (state.remote ? state.name : null),
+      open: (name) => { if (name !== state.name || !state.remote) openIndex(state.images.findIndex((i) => i.name === name)); },
+      locked: () => batch.running,
+    });
     await refreshImages();
     // /?image=<画像名> で、その画像を開いた状態で始める（漫画の構成の画面の「調整」から来る）
     const wanted = new URLSearchParams(location.search).get('image');
@@ -1034,6 +1085,7 @@ const hooks = {
   setAutoExport: (on) => { setAutoExport(on); rebuild(); },
   exportAll: (opts) => exportAll(opts || {}),
   abortExportAll,
+  gallery: () => (gallery ? { ...gallery.state(), visible: gallery.visibleNames() } : null),
   batch: () => batchReport(),
   undo, redo,
 };
