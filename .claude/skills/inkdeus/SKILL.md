@@ -64,6 +64,23 @@ uv run inkdeus assets remove <名前> --name <ソース名>
 `--mode panel`（既定）はコマにはめ込む画像、`--mode free` はコマにはめずページ上へ自由に置く素材。`--recursive` はサブフォルダも含める。
 `/manga/` の画面の操作（コマ割り・画像の配置・吹き出し）は、いまは利用者が画面で行う（`ctl` からの操作には未対応）。
 
+白黒の調整は `/manga/` にその場で反映される。白黒化の画面（`/`）と `/manga/` を別々のタブで開いておいてもらい、
+`ctl set` / `ctl patch` / `ctl preset` で設定を変えると、白黒化の画面が PNG を自動で書き出し（「変更を自動で書き出す」がオンのとき）、
+`/manga/` で使っている白黒版が新しい画像に替わる。対象の画像を白黒化の画面で開くには `ctl open <画像名>`（または `/?image=<画像名>`）。
+
+### 全画像をまとめて書き出す
+
+```bash
+uv run inkdeus ctl export-all --wait            # 終わるまで待って件数を返す（書き出し / 飛ばし / 失敗）
+uv run inkdeus ctl export-all --force --wait    # 書き出し済みの画像も作り直す
+uv run inkdeus ctl export-all --status          # 進み具合（ctl state の batch でも見られる）
+uv run inkdeus ctl export-all --abort           # 中止
+```
+
+各画像はその画像に保存済みの設定で書き出される。設定の無い画像には「いまブラウザに出ている設定」が使われ、その画像の設定として保存される。
+書き出し済みで設定が変わっていない画像は飛ばす。白黒化の画面を開いているブラウザが必要（`clients` が 1 以上）。枚数が多いと時間がかかるので、
+長く待つときは `--wait` を付けずに始めて `--status` で確かめる。
+
 ## 2. 依頼を受けたときの進め方
 
 1. **対象を確かめる**: `uv run inkdeus ctl state` → `current`（いま開いている画像）。別の画像なら `ctl open <画像名>`。
@@ -89,6 +106,7 @@ uv run inkdeus ctl patch '<JSON Merge Patch>'  # 複数項目をまとめて。�
 uv run inkdeus ctl stats --wait                # 統計
 uv run inkdeus ctl open <画像名>               # 開く画像を切り替える
 uv run inkdeus ctl export                      # ブラウザに PNG 書き出しを指示（保存先が返る）
+uv run inkdeus ctl export-all [--force] [--wait]   # 全画像の書き出し（--status / --abort）
 ```
 
 値が範囲外・キーの打ち間違いなどは非0終了になり、何も変わらない（`problems` に理由）。
