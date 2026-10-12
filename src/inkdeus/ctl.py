@@ -48,37 +48,43 @@ class Client:
         except (urllib.error.URLError, OSError) as e:
             raise CtlError(f"サーバに接続できません: {self.base}（inkdeus を起動していますか？）") from e
 
-    def name(self, given: str | None) -> str:
-        """対象の画像名。指定が無ければ、いまブラウザで開いている画像"""
-        if given:
-            return given
-        current = self.call("GET", "/api/state").get("current")
-        if not current:
-            names = [i["name"] for i in self.call("GET", "/api/images")["images"]]
-            raise CtlError("ブラウザで開いている画像がありません。--name で指定してください", {"images": names})
-        return current
-
-    def target(self, args) -> tuple[str, str]:
-        """対象の (画像名, バージョン)。--version が無ければ、いまブラウザで開いているバージョン
-        （--name で、開いていない画像を指したときは既定のバージョン）"""
+    def target(self, args) -> tuple[str, str, str]:
+        """対象の (画像名, バージョン, フォルダ)。
+        --folder が無ければ、いまブラウザで開いているフォルダ。--name が無ければ、そのフォルダで開いている画像。
+        --version が無ければ、いまブラウザで開いているバージョン（開いていない画像を指したときは既定のバージョン）"""
         given = getattr(args, "name", None)
         version = getattr(args, "version", None)
-        if given and version is not None:
-            return given, version
+        folder = getattr(args, "folder", None)
+        if given and version is not None and folder is not None:
+            return given, version, folder
         state = self.call("GET", "/api/state")
-        current = state.get("current")
+        shown = state.get("currentFolder") or DEFAULT_FOLDER
+        folder = folder or shown
+        current = state.get("current") if folder == shown else None
         if not given and not current:
-            names = [i["name"] for i in self.call("GET", "/api/images")["images"]]
-            raise CtlError("ブラウザで開いている画像がありません。--name で指定してください", {"images": names})
+            query = f"?folder={quote(folder, safe='')}" if folder != DEFAULT_FOLDER else ""
+            names = [i["name"] for i in self.call("GET", "/api/images" + query)["images"]]
+            where = "" if folder == shown else f"フォルダ「{folder}」で"
+            raise CtlError(f"{where}ブラウザで開いている画像がありません。--name で指定してください", {"images": names})
         name = given or current
         if version is None:
             version = (state.get("currentVersion") or "") if name == current else ""
-        return name, version
+        return name, version, folder
+
+    def name(self, args) -> tuple[str, str]:
+        """バージョンを取らないコマンド用: (画像名, フォルダ)"""
+        name, _version, folder = self.target(args)
+        return name, folder
 
 
-def _path(kind: str, name: str, version: str = "") -> str:
+DEFAULT_FOLDER = "default"
+
+
+def _path(kind: str, name: str, version: str = "", folder: str = "", **extra) -> str:
+    query = {**({"version": version} if version else {}),
+             **({"folder": folder} if folder and folder != DEFAULT_FOLDER else {}), **extra}
     base = f"/api/{kind}/{quote(name, safe='')}"
-    return f"{base}?version={quote(version, safe='')}" if version else base
+    return base + ("?" + "&".join(f"{k}={quote(str(v), safe='')}" for k, v in query.items()) if query else "")
 
 
 def _brief(result: dict) -> dict:
@@ -102,8 +108,7 @@ def cmd_state(c: Client, args) -> dict:
 
 
 def cmd_get(c: Client, args) -> dict:
-    name, version = c.target(args)
-    return c.call("GET", _path("params", name, version) + ("&" if version else "?") + "resolve=1")
+    return c.call("GET", _path("params", *c.target(args), resolve=1))
 
 
 def cmd_patch(c: Client, args) -> dict:
@@ -133,18 +138,21 @@ def cmd_presets(c: Client, args) -> dict:
 
 
 def cmd_stats(c: Client, args) -> dict:
-    name, version = c.target(args)
-    result = c.call("GET", _path("stats", name, version))
+    name, version, folder = c.target(args)
+    result = c.call("GET", _path("stats", name, version, folder))
     if not args.wait:
         return result
 
     def fresh():
-        r = c.call("GET", _path("stats", name, version))
+        r = c.call("GET", _path("stats", name, version, folder))
         return r if r["fresh"] else None
 
     if result["clients"] == 0:
         raise CtlError("ブラウザが開いていないため統計は届きません（設定ファイルは更新済みで、次に開いたとき反映されます）",
                        result, code=2)
+    if (result.get("currentFolder") or DEFAULT_FOLDER) != folder:
+        raise CtlError(f"ブラウザで開いているフォルダは「{result.get('currentFolder')}」です。"
+                       f"先に inkdeus ctl open {name} --folder {folder} してください", result, code=2)
     if result["current"] != name:
         raise CtlError(f"ブラウザで開いているのは {result['current']} です。先に inkdeus ctl open {name} してください",
                        result, code=2)
@@ -155,19 +163,21 @@ def cmd_stats(c: Client, args) -> dict:
     result = _wait(fresh, args.timeout)
     if result is None:
         raise CtlError(f"{args.timeout:g} 秒待ちましたが、いまの設定に対する統計が届きません",
-                       c.call("GET", _path("stats", name, version)), code=3)
+                       c.call("GET", _path("stats", name, version, folder)), code=3)
     return result
 
 
 def cmd_open(c: Client, args) -> dict:
     # --version が無ければ「指定なし」（その画像を開いていればそのまま、別の画像からなら既定のバージョン）
-    r = c.call("POST", "/api/command", {"type": "open", "name": args.image, "version": args.version})
+    folder = args.folder or c.call("GET", "/api/state").get("currentFolder") or DEFAULT_FOLDER
+    r = c.call("POST", "/api/command", {"type": "open", "name": args.image, "version": args.version,
+                                        "folder": folder})
     if r["clients"] == 0:
         raise CtlError("ブラウザが開いていないため切り替えられません", r, code=2)
 
     def switched():
         s = c.call("GET", "/api/state")
-        if s.get("current") != args.image:
+        if s.get("current") != args.image or (s.get("currentFolder") or DEFAULT_FOLDER) != folder:
             return None
         return s if args.version is None or (s.get("currentVersion") or "") == args.version else None
 
@@ -178,36 +188,41 @@ def cmd_open(c: Client, args) -> dict:
 
 
 def cmd_export(c: Client, args) -> dict:
-    name, version = c.target(args)
-    before = c.call("GET", _path("exported", name, version)).get("seq", 0)
-    r = c.call("POST", "/api/command", {"type": "export", "name": name, "version": version})
+    name, version, folder = c.target(args)
+    before = c.call("GET", _path("exported", name, version, folder)).get("seq", 0)
+    r = c.call("POST", "/api/command", {"type": "export", "name": name, "version": version, "folder": folder})
     if r["clients"] == 0:
         raise CtlError("ブラウザが開いていないため書き出せません（書き出しはブラウザが行います）", r, code=2)
 
     def done():
-        e = c.call("GET", _path("exported", name, version))
+        e = c.call("GET", _path("exported", name, version, folder))
         return e if e.get("seq", 0) > before else None
 
     result = _wait(done, args.timeout, interval=0.5)
     if result is None:
         raise CtlError(f"{args.timeout:g} 秒待ちましたが、書き出しが終わりません", code=3)
-    return {"name": name, "version": version, **result}
+    return {"folder": folder, "name": name, "version": version, **result}
 
 
 def cmd_versions(c: Client, args) -> dict:
-    return c.call("GET", _path("versions", c.name(args.name)))
+    name, folder = c.name(args)
+    return c.call("GET", _path("versions", name, "", folder))
 
 
 def cmd_version(c: Client, args) -> dict:
-    name = c.name(args.name)
+    name, folder = c.name(args)
     if args.action == "new":
         body = {"version": args.version_name}
         if args.source is not None:
             body["copyFrom"] = args.source
-        return c.call("POST", _path("versions", name), body)
+        return c.call("POST", _path("versions", name, "", folder), body)
     if args.action == "rename":
-        return c.call("PATCH", _path("versions", name), {"version": args.old, "to": args.new})
-    return c.call("DELETE", _path("versions", name, args.version_name))
+        return c.call("PATCH", _path("versions", name, "", folder), {"version": args.old, "to": args.new})
+    return c.call("DELETE", _path("versions", name, args.version_name, folder))
+
+
+def cmd_folders(c: Client, args) -> dict:
+    return c.call("GET", "/api/folders")
 
 
 def cmd_export_all(c: Client, args) -> dict:
@@ -220,7 +235,7 @@ def cmd_export_all(c: Client, args) -> dict:
     if before.get("running"):
         raise CtlError("一括書き出しは既に進行中です（進み具合は export-all --status、中止は --abort）", before, code=2)
     r = c.call("POST", "/api/command", {"type": "export-all", "force": args.force,
-                                        "defaultOnly": args.default_only})
+                                        "defaultOnly": args.default_only, "allFolders": args.all_folders})
     if r["clients"] == 0:
         raise CtlError("ブラウザが開いていないため書き出せません（書き出しはブラウザが行います）", r, code=2)
 
@@ -267,6 +282,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     def with_name(p, version=True):
         p.add_argument("--name", help="対象の画像名（省略時はブラウザで開いている画像）")
+        p.add_argument("--folder", default=None, metavar="F",
+                       help="対象の画像フォルダ（省略時はブラウザで開いているフォルダ。既定のフォルダは default）")
         if version:
             p.add_argument("--version", default=None, metavar="V",
                            help='対象のバージョン（省略時はブラウザで開いているバージョン。既定のバージョンは ""）')
@@ -292,9 +309,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("open", cmd_open, "ブラウザで開く画像を切り替える")
     p.add_argument("image", help="画像名")
     p.add_argument("--version", default=None, metavar="V", help='開くバージョン（既定のバージョンは ""）')
+    p.add_argument("--folder", default=None, metavar="F", help="画像フォルダ（省略時はいま開いているフォルダ）")
     p.add_argument("--timeout", type=float, default=60.0)
     p = with_name(add("export", cmd_export, "ブラウザに PNG の書き出しを指示し、保存先を返す"))
     p.add_argument("--timeout", type=float, default=300.0)
+    add("folders", cmd_folders, "画像フォルダ（画像セット）の一覧と枚数。current がいま開いているフォルダ")
     with_name(add("versions", cmd_versions, "画像のバージョン（設定の違う白黒版）の一覧"), version=False)
     p = add("version", cmd_version, "バージョンを作る（設定を複製）・名前を変える・削除する")
     vsub = p.add_subparsers(dest="action", required=True, metavar="<new|rename|delete>")
@@ -313,6 +332,7 @@ def build_parser() -> argparse.ArgumentParser:
             "いま画面に出ている設定で書き出す。書き出し済みで設定が変わっていない物は飛ばす")
     p.add_argument("--force", action="store_true", help="書き出し済みの画像も作り直す")
     p.add_argument("--default-only", action="store_true", help="既定のバージョンだけを書き出す")
+    p.add_argument("--all-folders", action="store_true", help="すべての画像フォルダを書き出す（既定は、いま開いているフォルダ）")
     p.add_argument("--wait", action="store_true", help="終わるまで待って結果（件数）を返す")
     p.add_argument("--status", action="store_true", help="進み具合だけを表示する（何も始めない）")
     p.add_argument("--abort", action="store_true", help="進行中の一括書き出しを中止する")

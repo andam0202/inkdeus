@@ -30,6 +30,14 @@ THUMB_RANGE = (16, 1024)
 DEFAULT_LIMIT, MAX_LIMIT = 200, 1000
 
 
+DEFAULT_FOLDER = "default"
+
+
+def source_name(kind: str, folder: str) -> str:
+    """画像フォルダの元画像・白黒のソース名（既定のフォルダは source / inked のまま）"""
+    return kind if folder in ("", DEFAULT_FOLDER) else f"{kind}@{folder}"
+
+
 class AssetError(Exception):
     """利用者に見せるエラー"""
 
@@ -43,6 +51,8 @@ class Source:
     root: Path | None           # 既定のソース（source / inked）は None
     builtin: bool = False
     origin: str = "builtin"     # builtin / project / local
+    kind: str = ""              # 既定のソースの種類（"source" = 元画像 / "inked" = 白黒）。追加のソースは ""
+    folder: str = ""            # 既定のソースが属する画像フォルダ（"default" か追加フォルダの名前）
 
 
 @dataclass(frozen=True)
@@ -111,8 +121,10 @@ def _sort_key(item: Item):
 class Catalog:
     """ソースの一覧と、各ソースの画像。設定ファイルは毎回読み直す（稼働中に追加しても反映される）"""
 
-    def __init__(self, lib, project_file: Path | None = None, local_file: Path | None = None):
+    def __init__(self, lib, project_file: Path | None = None, local_file: Path | None = None, folders=None):
+        """folders は画像フォルダの並び [(名前, Library), …] を返す関数（省略時は既定のフォルダだけ）"""
         self.lib = lib
+        self.folders = folders or (lambda: [(DEFAULT_FOLDER, lib)])
         self.project_file = project_file
         self.local_file = local_file
         self.cache_dir = lib.out_dir / ".cache" / "assets"
@@ -121,7 +133,14 @@ class Catalog:
     # ---- ソース ----
 
     def sources(self) -> tuple[dict[str, Source], list[str]]:
-        out = {name: Source(name, label, "panel", False, None, builtin=True) for name, label in BUILTIN.items()}
+        # 元画像と白黒は画像フォルダごとのソース。既定のフォルダは従来の名前（source / inked）のまま、
+        # 追加のフォルダは source@<名前> / inked@<名前>
+        out = {}
+        for folder, _lib in self.folders():
+            for kind, label in BUILTIN.items():
+                name = source_name(kind, folder)
+                shown = label if folder == DEFAULT_FOLDER else f"{label}（{folder}）"
+                out[name] = Source(name, shown, "panel", False, None, builtin=True, kind=kind, folder=folder)
         problems: list[str] = []
         # プロジェクトの定義を優先し、同じ名前の共通定義は使わない
         for path, origin in ((self.project_file, "project"), (self.local_file, "local")):
@@ -136,11 +155,18 @@ class Catalog:
 
     # ---- 画像の一覧 ----
 
+    def lib_of(self, src: Source):
+        """既定のソース（元画像・白黒）が属する画像フォルダの Library"""
+        for folder, lib in self.folders():
+            if folder == src.folder:
+                return lib
+        return self.lib
+
     def items(self, src: Source) -> list[Item]:
-        if src.name == "source" and src.builtin:
-            return [Item(e.name, e.path, "") for e in self.lib.entries().values()]
-        if src.name == "inked" and src.builtin:
-            return self._scan(self.lib.out_dir, False, only_png=True)
+        if src.kind == "source":
+            return [Item(e.name, e.path, "") for e in self.lib_of(src).entries().values()]
+        if src.kind == "inked":
+            return self._scan(self.lib_of(src).out_dir, False, only_png=True)
         return self._scan(src.root, src.recursive)
 
     @staticmethod
@@ -187,22 +213,22 @@ class Catalog:
 
     # ---- 元画像と白黒版（書き出した PNG）の対応 ----
 
-    def _inked_of(self, entry, version: str = "") -> dict | None:
+    def _inked_of(self, lib, entry, version: str = "") -> dict | None:
         """その画像・バージョンの白黒版（書き出した PNG）。path はファイル名、version は更新時刻（ミリ秒）、
         name はバージョン名（"" = 既定）"""
-        p = self.lib.export_path(entry, version)
+        p = lib.export_path(entry, version)
         try:
             st = p.stat()
         except OSError:
             return None
         return {"path": p.name, "name": version, "mtime": st.st_mtime, "version": st.st_mtime_ns // 1_000_000}
 
-    def _inked_versions(self, entry, index: dict | None = None) -> list[dict]:
+    def _inked_versions(self, lib, entry, index: dict | None = None) -> list[dict]:
         """書き出し済みのバージョンの白黒版の並び（既定が先頭）"""
         rows = []
-        for v in self.lib.versions(entry, index):
+        for v in lib.versions(entry, index):
             if v["hasExport"]:
-                found = self._inked_of(entry, v["name"])
+                found = self._inked_of(lib, entry, v["name"])
                 if found is not None:
                     rows.append(found)
         return rows
@@ -214,7 +240,7 @@ class Catalog:
             return None
         return rel[:-4]
 
-    def pair(self, source: str, rel: str) -> dict | None:
+    def pair(self, src: Source, rel: str) -> dict | None:
         """source か inked の名前から、元画像と白黒版の対応を返す（どの画像の物とも読めない名前は None）:
             name      元画像の名前（白黒化の画面で開く名前）
             source    {path}
@@ -222,8 +248,15 @@ class Catalog:
             inked     そのバージョンの白黒版（まだ無ければ None）
             default   既定のバージョンの白黒版（無ければ None）
             versions  書き出し済みの全バージョンの白黒版
-            missing   inked の名前で引いたが、その PNG が無い（消された・名前の変わったバージョン）"""
-        entries = self.lib.entries()
+            missing   inked の名前で引いたが、その PNG が無い（消された・名前の変わったバージョン）
+            folder / sourceName / inkedName  画像フォルダの名前と、そのフォルダの元画像・白黒のソース名"""
+        if not src.kind:
+            return None
+        lib = self.lib_of(src)
+        source = src.kind
+        where = {"folder": src.folder, "sourceName": source_name("source", src.folder),
+                 "inkedName": source_name("inked", src.folder)}
+        entries = lib.entries()
         version = ""
         if source == "source":
             entry = entries.get(rel)
@@ -231,30 +264,31 @@ class Catalog:
                 return None
         else:
             stem = self._split_inked(rel)
-            found = self.lib.resolve_stem(stem, entries) if stem is not None else None
+            found = lib.resolve_stem(stem, entries) if stem is not None else None
             if found is None:
                 # 元画像が見当たらない書き出し済み PNG（元画像を消した等）
-                item = self.find(Source("inked", "", "panel", False, None, builtin=True), rel)
+                item = self.find(src, rel)
                 if item is None:
                     return None
                 st = item.path.stat()
                 inked = {"path": rel, "name": "", "mtime": st.st_mtime, "version": st.st_mtime_ns // 1_000_000}
                 return {"name": None, "source": None, "version": "", "inked": inked, "default": inked,
-                        "versions": [inked], "missing": False}
+                        "versions": [inked], "missing": False, **where}
             entry, version = found
-        inked = self._inked_of(entry, version)
+        inked = self._inked_of(lib, entry, version)
         return {"name": entry.name, "source": {"path": entry.name}, "version": version, "inked": inked,
-                "default": self._inked_of(entry), "versions": self._inked_versions(entry),
-                "missing": source == "inked" and inked is None}
+                "default": self._inked_of(lib, entry), "versions": self._inked_versions(lib, entry),
+                "missing": source == "inked" and inked is None, **where}
 
-    def fallback(self, rel: str) -> Item | None:
+    def fallback(self, src: Source, rel: str) -> Item | None:
         """無い白黒版（消された・名前の変わったバージョン）の代わりに出す画像: 既定のバージョン、無ければ元画像"""
         stem = self._split_inked(rel)
-        found = self.lib.resolve_stem(stem) if stem is not None else None
+        lib = self.lib_of(src)
+        found = lib.resolve_stem(stem) if stem is not None else None
         if found is None or found[1] == "":
             return None
         entry = found[0]
-        default = self.lib.export_path(entry)
+        default = lib.export_path(entry)
         if default.is_file():
             return Item(default.name, default, "")
         return Item(entry.name, entry.path, "") if entry.path.is_file() else None
@@ -273,7 +307,8 @@ class Catalog:
         rows = []
         for src in sources.values():
             row = {"name": src.name, "label": src.label, "mode": src.mode, "recursive": src.recursive,
-                   "builtin": src.builtin, "origin": src.origin, "count": len(self.items(src))}
+                   "builtin": src.builtin, "origin": src.origin, "count": len(self.items(src)),
+                   "kind": src.kind, "folder": src.folder if src.builtin else None}
             if src.root is not None:
                 row["path"] = str(src.root)
                 row["missing"] = not src.root.is_dir()
@@ -288,13 +323,14 @@ class Catalog:
         offset = max(0, offset)
         limit = max(1, min(MAX_LIMIT, limit))
         rows = []
-        entries = self.lib.entries() if src.builtin else {}
-        index = self.lib.version_index(entries) if src.builtin and src.name == "source" else None
+        lib = self.lib_of(src)
+        entries = lib.entries() if src.builtin else {}
+        index = lib.version_index(entries) if src.kind == "source" else None
         owners: dict[str, tuple] = {}
-        if src.builtin and src.name == "inked":
+        if src.kind == "inked":
             # 元画像ごとにまとめ、既定のバージョンを先頭にして並べる（同じ元画像のバージョンが隣り合うように）
             for item in items:
-                found = self.lib.resolve_stem(item.rel[:-4], entries)
+                found = lib.resolve_stem(item.rel[:-4], entries)
                 if found is not None:
                     owners[item.rel] = found
             items.sort(key=lambda i: ((owners[i.rel][0].name.casefold(), owners[i.rel][1].casefold())
@@ -309,17 +345,18 @@ class Catalog:
             row = {"path": item.rel, "name": item.path.name, "group": item.group,
                    "width": w, "height": h, "mtime": mtime, "bytes": nbytes, "version": version,
                    "stamp": version}          # stamp = 更新時刻（ミリ秒）。白黒の一覧では version がバージョン名になる
-            if src.builtin and src.name == "source":
+            if src.kind == "source":
                 row["editable"] = item.rel                     # 白黒化の画面で開く画像名
-                row["inked"] = self._inked_of(entries[item.rel]) if item.rel in entries else None
-                row["versions"] = self._inked_versions(entries[item.rel], index) if item.rel in entries else []
-            elif src.builtin and src.name == "inked":
+                row["inked"] = self._inked_of(lib, entries[item.rel]) if item.rel in entries else None
+                row["versions"] = self._inked_versions(lib, entries[item.rel], index) if item.rel in entries else []
+            elif src.kind == "inked":
                 owner = owners.get(item.rel)
                 row["editable"] = owner[0].name if owner else None      # 元画像が無ければ None
                 row["base"] = owner[0].name if owner else None          # 元画像の名前
                 row["version"] = owner[1] if owner else ""              # バージョン名（"" = 既定）
             rows.append(row)
         return {"source": src.name, "label": src.label, "mode": src.mode, "recursive": src.recursive,
+                "kind": src.kind, "folder": src.folder if src.builtin else None,
                 "total": len(items), "offset": offset, "limit": limit, "items": rows}
 
     # ---- 縮小画像（キャッシュつき） ----

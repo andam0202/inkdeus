@@ -16,6 +16,7 @@ from pathlib import Path
 from .assets import MODES as ASSET_MODES
 from .assets import AssetError
 from .assets import validate_name as validate_asset_name
+from . import folders as folders_mod
 from .server import PARAMS_SUFFIX, is_image, read_local_config
 
 PROJECT_FILE = "inkdeus.project.toml"
@@ -35,6 +36,7 @@ class Project:
     out: Path
     created: str
     note: str
+    folders: tuple = ()          # 追加の画像フォルダ（folders.FolderDef）。既定のフォルダは source / masks
 
     @property
     def config(self) -> Path:
@@ -72,7 +74,8 @@ def _toml_string(value: str) -> str:
 
 
 def _write_config(path: Path, name: str, created: str, source: Path | str, masks: Path | str | None,
-                  out: str, note: str, assets: list[dict] | None = None, fonts: dict | None = None) -> None:
+                  out: str, note: str, assets: list[dict] | None = None, fonts: dict | None = None,
+                  folders: list[dict] | None = None) -> None:
     lines = [
         f"name = {_toml_string(name)}",
         f"created = {_toml_string(created)}",
@@ -91,6 +94,11 @@ def _write_config(path: Path, name: str, created: str, source: Path | str, masks
         if isinstance(fonts.get("names"), dict) and fonts["names"]:
             lines += ["", "[fonts.names]"]
             lines += [f"{_toml_string(str(k))} = {_toml_string(str(v))}" for k, v in fonts["names"].items()]
+    for entry in folders or []:                            # 追加の画像フォルダ（書かれている値のまま残す）
+        lines += ["", "[[folders]]"]
+        for key in ("name", "images", "masks", "note"):
+            if isinstance(entry.get(key), str) and (entry[key] or key in ("name", "images")):
+                lines.append(f"{key} = {_toml_string(entry[key])}")
     for entry in assets or []:                             # 漫画の構成で使う追加の素材ソース
         lines += ["", "[[assets]]"]
         for key in ("name", "path", "mode"):
@@ -133,6 +141,7 @@ def create_project(name: str, images: Path | str, masks: Path | str | None = Non
     created = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     assets: list[dict] = []
     fonts: dict | None = None
+    extra: list[dict] = []
     if config.exists():
         if not force:
             raise ProjectError(f"プロジェクトは既にあります: {name}（設定だけ更新するなら --force）")
@@ -141,6 +150,7 @@ def create_project(name: str, images: Path | str, masks: Path | str | None = Non
                 old = tomllib.load(f)
             created = str(old.get("created", created))                    # 作成日時は引き継ぐ
             assets = _raw_assets(old)                                      # 追加の素材ソースも引き継ぐ
+            extra = _raw_folders(old)                                      # 追加の画像フォルダも引き継ぐ
             fonts = old.get("fonts") if isinstance(old.get("fonts"), dict) else None
         except (OSError, tomllib.TOMLDecodeError):
             pass
@@ -155,7 +165,7 @@ def create_project(name: str, images: Path | str, masks: Path | str | None = Non
             _copy_images(masks_dir, path / "masks", only_png_masks=True)
             mask_ref = Path("masks")
     (path / "out").mkdir(exist_ok=True)
-    _write_config(config, name, created, source, mask_ref, "out", note, assets, fonts)
+    _write_config(config, name, created, source, mask_ref, "out", note, assets, fonts, extra)
 
     with_mask = sum(1 for p in files if masks_dir is not None and (masks_dir / f"{p.stem}.png").is_file())
     summary = {"name": name, "path": str(path), "images": len(files),
@@ -176,12 +186,91 @@ def _read_raw(project: Project) -> dict:
         raise ProjectError(f"{project.config} を読めません: {e}") from e
 
 
-def _rewrite_assets(project: Project, data: dict, assets: list[dict]) -> None:
-    """設定ファイルを、素材ソースだけ差し替えて書き直す（他の項目は書かれている値のまま）"""
+def _raw_folders(data: dict) -> list[dict]:
+    raw = data.get("folders")
+    return [dict(e) for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+
+
+def _rewrite_assets(project: Project, data: dict, assets: list[dict], folders: list[dict] | None = None) -> None:
+    """設定ファイルを、素材ソース（と画像フォルダ）だけ差し替えて書き直す（他の項目は書かれている値のまま）"""
     _write_config(project.config, str(data.get("name") or project.name), str(data.get("created", "")),
                   data["source"], data.get("masks") if isinstance(data.get("masks"), str) else None,
                   str(data.get("out") or "out"), str(data.get("note", "")), assets,
-                  data.get("fonts") if isinstance(data.get("fonts"), dict) else None)
+                  data.get("fonts") if isinstance(data.get("fonts"), dict) else None,
+                  _raw_folders(data) if folders is None else folders)
+
+
+def add_folder(project: Project, name: str, images: Path | str, masks: Path | str | None = None,
+               note: str = "") -> dict:
+    """プロジェクトに画像フォルダを足す（同じ名前があればエラー）"""
+    try:
+        folders_mod.validate_name(name)
+    except folders_mod.FolderError as e:
+        raise ProjectError(str(e)) from e
+    images_dir = Path(images).expanduser().resolve()
+    if not images_dir.is_dir():
+        raise ProjectError(f"画像フォルダが見つかりません: {images_dir}")
+    if not list_images(images_dir):
+        raise ProjectError(f"画像が1枚もありません: {images_dir}")
+    masks_dir = None
+    if masks:
+        masks_dir = Path(masks).expanduser().resolve()
+        if not masks_dir.is_dir():
+            raise ProjectError(f"マスクフォルダが見つかりません: {masks_dir}")
+    data = _read_raw(project)
+    existing = _raw_folders(data)
+    if any(e.get("name") == name for e in existing):
+        raise ProjectError(f"その名前の画像フォルダは既にあります: {name}")
+    entry = {"name": name, "images": str(images_dir)}
+    if masks_dir is not None:
+        entry["masks"] = str(masks_dir)
+    if note:
+        entry["note"] = note
+    _rewrite_assets(project, data, _raw_assets(data), existing + [entry])
+    return entry
+
+
+def remove_folder(project: Project, name: str, delete_out: bool = False) -> Path | None:
+    """画像フォルダの登録を外す。delete_out で <out>/@<名前>/（設定と書き出し）も消す。戻り値は消した場所"""
+    data = _read_raw(project)
+    existing = _raw_folders(data)
+    kept = [e for e in existing if e.get("name") != name]
+    if len(kept) == len(existing):
+        known = ", ".join(str(e.get("name")) for e in existing) or "なし"
+        raise ProjectError(f"その名前の画像フォルダはありません: {name}（登録済み: {known}）")
+    _rewrite_assets(project, data, _raw_assets(data), kept)
+    target = folders_mod.out_dir(project.out, folders_mod.validate_name(name))
+    if delete_out and target.is_dir() and target.parent == project.out:
+        shutil.rmtree(target)
+        return target
+    return None
+
+
+def _count(images: Path, masks: Path | None, out: Path) -> dict:
+    row = {"images": 0, "masks": 0, "configured": 0, "exported": 0, "missing": not images.is_dir(), "latest": 0.0}
+    if row["missing"]:
+        return row
+    files = list_images(images)
+    row["images"] = len(files)
+    for p in files:
+        if masks is not None and (masks / f"{p.stem}.png").is_file():
+            row["masks"] += 1
+        for key, target in (("configured", out / f"{p.stem}{PARAMS_SUFFIX}"), ("exported", out / f"{p.stem}.png")):
+            if target.is_file():
+                row[key] += 1
+                row["latest"] = max(row["latest"], target.stat().st_mtime)
+    return row
+
+
+def folder_rows(project: Project) -> list[dict]:
+    """画像フォルダごとの枚数（既定が先頭）"""
+    defs = [folders_mod.FolderDef(folders_mod.DEFAULT, project.source, project.masks, ""), *project.folders]
+    rows = []
+    for d in defs:
+        out = folders_mod.out_dir(project.out, d.name)
+        rows.append({"name": d.name, "images_dir": str(d.images), "masks_dir": str(d.masks) if d.masks else None,
+                     "out": str(out), "note": d.note, **_count(d.images, d.masks, out)})
+    return rows
 
 
 def add_asset_source(project: Project, name: str, path: Path | str, mode: str = "panel",
@@ -249,6 +338,7 @@ def load_project(name_or_path: str, root: Path | None = None, check: bool = True
         out=_resolve_dir(path, str(data.get("out") or "out")),
         created=str(data.get("created", "")),
         note=str(data.get("note", "")),
+        folders=tuple(folders_mod.parse_entries(data.get("folders"), path)[0]),
     )
     if check:
         if not project.source.is_dir():
@@ -270,17 +360,13 @@ def summarize(project: Project) -> dict:
     if not project.source.is_dir():
         row["missing"] = True
         return row
-    files = list_images(project.source)
-    row["images"] = len(files)
+    # 枚数は全フォルダの合計。内訳は folders に入れる（フォルダが1つだけなら従来と同じ数）
+    per = folder_rows(project)
     latest = (project.path / PROJECT_FILE).stat().st_mtime
-    for p in files:
-        if project.masks is not None and (project.masks / f"{p.stem}.png").is_file():
-            row["masks"] += 1
-        for key, target in (("configured", project.out / f"{p.stem}{PARAMS_SUFFIX}"),
-                            ("exported", project.out / f"{p.stem}.png")):
-            if target.is_file():
-                row[key] += 1
-                latest = max(latest, target.stat().st_mtime)
+    for key in ("images", "masks", "configured", "exported"):
+        row[key] = sum(f[key] for f in per)
+    latest = max([latest, *(f["latest"] for f in per)])
+    row["folders"] = [{k: f[k] for k in ("name", "images", "masks", "configured", "exported", "missing")} for f in per]
     row["updated"] = dt.datetime.fromtimestamp(latest).astimezone().isoformat(timespec="seconds")
     return row
 

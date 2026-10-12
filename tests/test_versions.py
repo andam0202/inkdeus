@@ -87,12 +87,12 @@ def test_create_copy_rename_delete(env):
     assert r.status_code == 200 and r.get_json()["copyFrom"] == "" and r.get_json()["copiedExport"] is False
     assert (out / "scene@白背景.inkdeus.json").is_file() and names(client) == ["", "白背景"]
     assert q.get_nowait()["type"] == "params"
-    assert q.get_nowait() == {"type": "versions", "action": "create", "name": "scene.png", "version": "白背景",
+    assert q.get_nowait() == {"type": "versions", "action": "create", "folder": "default", "name": "scene.png", "version": "白背景",
                               "file": "scene@白背景.png", "copyFrom": ""}
     assert client.get("/api/params/scene.png?version=白背景").get_json()["unit"] == 3      # 既定の設定の複製
     # バージョンごとに設定は独立
     r = send(client, "POST", "/api/set/scene.png?version=白背景", {"key": "unit", "value": 5}).get_json()
-    assert r["version"] == "白背景" and q.get_nowait() == {"type": "params", "name": "scene.png", "version": "白背景",
+    assert r["version"] == "白背景" and q.get_nowait() == {"type": "params", "folder": "default", "name": "scene.png", "version": "白背景",
                                                           "rev": r["rev"], "source": None}
     assert client.get("/api/params/scene.png").get_json()["unit"] == 3
     r = send(client, "PATCH", "/api/params/scene.png?version=白背景", {"lines": {"enabled": False}}).get_json()
@@ -117,7 +117,7 @@ def test_create_copy_rename_delete(env):
     assert r.status_code == 200 and names(client) == ["", "白背景", "線だけ"]
     assert not (out / "scene@v2.png").exists() and not (out / "scene@v2.inkdeus.json").exists()
     assert (out / "scene@線だけ.png").read_bytes() == png_bytes(7)
-    assert q.get_nowait() == {"type": "versions", "action": "rename", "name": "scene.png", "version": "v2",
+    assert q.get_nowait() == {"type": "versions", "action": "rename", "folder": "default", "name": "scene.png", "version": "v2",
                               "file": "scene@v2.png", "to": "線だけ", "toFile": "scene@線だけ.png"}
     assert session.scan() == []                                       # サーバ自身の変更は「外部からの変更」にならない
     assert send(client, "PATCH", "/api/versions/scene.png", {"version": "線だけ", "to": "白背景"}).status_code == 409
@@ -125,7 +125,7 @@ def test_create_copy_rename_delete(env):
     # 削除（設定と PNG を消す。既定は消せない）
     assert client.delete("/api/versions/scene.png?version=線だけ").get_json()["deleted"] == "線だけ"
     assert not (out / "scene@線だけ.png").exists() and not (out / "scene@線だけ.inkdeus.json").exists()
-    assert q.get_nowait() == {"type": "versions", "action": "delete", "name": "scene.png", "version": "線だけ",
+    assert q.get_nowait() == {"type": "versions", "action": "delete", "folder": "default", "name": "scene.png", "version": "線だけ",
                               "file": "scene@線だけ.png"}
     assert names(client) == ["", "白背景"] and session.scan() == []
     assert client.delete("/api/versions/scene.png").status_code == 400
@@ -153,8 +153,8 @@ def test_bad_names_are_rejected(env):
     send(client, "POST", "/api/versions/scene.png", {"version": "a"})
     assert send(client, "PATCH", "/api/versions/scene.png", {"version": "a", "to": "b@c"}).status_code == 400
     assert send(client, "PATCH", "/api/versions/scene.png", {"version": "a", "to": "alt"}).status_code == 400
-    assert send(client, "POST", "/api/command", {"type": "open", "name": "scene.png", "version": "nope"}).status_code == 404
-    assert send(client, "POST", "/api/command", {"type": "open", "name": "scene.png", "version": "a/b"}).status_code == 400
+    assert send(client, "POST", "/api/command", {"type": "open", "folder": "default", "name": "scene.png", "version": "nope"}).status_code == 404
+    assert send(client, "POST", "/api/command", {"type": "open", "folder": "default", "name": "scene.png", "version": "a/b"}).status_code == 400
 
 
 def test_export_stats_and_state_per_version(env):

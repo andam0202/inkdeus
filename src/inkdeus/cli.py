@@ -7,6 +7,7 @@
     inkdeus ctl …                                       稼働中のサーバを操作
     inkdeus manga install | status                      漫画の構成に使う漫画エディタを取得する（inkdeus manga --help）
     inkdeus assets add | list | remove <プロジェクト>   漫画の構成で使う素材ソース（画像フォルダ）を登録する
+    inkdeus folders add | list | remove <プロジェクト>  プロジェクトの画像フォルダ（画像セット）を足す・外す
 """
 
 from __future__ import annotations
@@ -18,15 +19,16 @@ import sys
 from pathlib import Path
 
 from . import ctl, manga
+from . import folders as folders_mod
 from . import fonts as fonts_mod
 from .assets import BUILTIN as BUILTIN_ASSETS
 from .assets import MODES as ASSET_MODES
 from .assets import Catalog, read_toml_assets
-from .projects import (ProjectError, add_asset_source, create_project, list_projects, load_project,
-                       projects_root, remove_asset_source)
+from .projects import (ProjectError, add_asset_source, add_folder, create_project, folder_rows, list_projects,
+                       load_project, projects_root, remove_asset_source, remove_folder)
 from .server import create_app, default_local_config
 
-COMMANDS = ("run", "new", "open", "projects", "ctl", "manga", "assets", "fonts")
+COMMANDS = ("run", "new", "open", "projects", "ctl", "manga", "assets", "fonts", "folders")
 
 
 def _server_options(p: argparse.ArgumentParser) -> None:
@@ -46,6 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("input", help="画像ファイル、または画像の入ったフォルダ")
     p.add_argument("--mask-dir", help="人物マスクのフォルダ（<画像と同名>.png、白=人物）")
     p.add_argument("--out-dir", help="書き出しと設定JSONの保存先（既定: <入力フォルダ>/inkdeus_out）")
+    p.add_argument("--add", action="append", default=[], metavar="<名前>=<画像dir>[,<マスクdir>]",
+                   help="追加の画像フォルダ（複数可）。保存先は <出力先>/@<名前>/")
     _server_options(p)
 
     p = sub.add_parser("new", help="プロジェクトを作る（元画像は参照するだけでコピーしない）")
@@ -78,6 +82,22 @@ def build_parser() -> argparse.ArgumentParser:
     a = asub.add_parser("list", help="素材ソースの一覧")
     a.add_argument("project", help="プロジェクト名、またはプロジェクトのフォルダ")
     a.add_argument("--json", action="store_true", help="JSON で出力")
+    p = sub.add_parser("folders", help="プロジェクトの画像フォルダ（画像セット）を足す・一覧・外す")
+    dsub = p.add_subparsers(dest="folders_command", required=True, metavar="<add|list|remove>")
+    a = dsub.add_parser("add", help="画像フォルダを足す（保存先は <out>/@<名前>/）")
+    a.add_argument("project", help="プロジェクト名、またはプロジェクトのフォルダ")
+    a.add_argument("--name", required=True, help="フォルダ名（英数字・かな漢字・_ - で 32 文字まで。default は使えない）")
+    a.add_argument("--images", required=True, help="元画像のフォルダ")
+    a.add_argument("--masks", help="人物マスクのフォルダ")
+    a.add_argument("--note", default="", help="メモ")
+    a = dsub.add_parser("list", help="画像フォルダの一覧と枚数")
+    a.add_argument("project")
+    a.add_argument("--json", action="store_true")
+    a = dsub.add_parser("remove", help="画像フォルダの登録を外す（設定と書き出しは残す）")
+    a.add_argument("project")
+    a.add_argument("--name", required=True)
+    a.add_argument("--delete-out", action="store_true", help="<out>/@<名前>/（設定と書き出した PNG）も消す")
+
     p = sub.add_parser("fonts", help="漫画の構成で使うローカルフォント（設定の [fonts]）を確かめる")
     fsub = p.add_subparsers(dest="fonts_command", required=True, metavar="<command>")
     f = fsub.add_parser("list", help="設定から見つかったフォントの一覧（表示名とファイル）")
@@ -91,6 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def serve(app, host: str, port: int, project=None) -> int:
     lib = app.config["INKDEUS_LIBRARY"]
+    extra = [(n, f) for n, f, _s, _note in app.config["INKDEUS_FOLDERS"].rows() if n != folders_mod.DEFAULT]
     print(f"inkdeus: http://{host}:{port}/")
     if project is not None:
         print(f"  プロジェクト: {project.name}（{project.path}）")
@@ -98,6 +119,9 @@ def serve(app, host: str, port: int, project=None) -> int:
     print(f"  出力: {lib.out_dir}")
     if lib.mask_dir:
         print(f"  マスク: {lib.mask_dir}")
+    for name, flib in extra:
+        print(f"  フォルダ「{name}」: " + ("参照先が見つかりません" if flib is None
+                                         else f"{flib.folder}（{len(flib.entries())} 枚）→ {flib.out_dir}"))
     if host not in ("127.0.0.1", "localhost", "::1"):
         print("  注意: ループバック以外で待ち受けます（同じネットワークから読み書きできます）")
     print(f"  漫画の構成: http://{host}:{port}/manga/" + ("" if manga.installed_dir() else
@@ -115,7 +139,16 @@ def serve(app, host: str, port: int, project=None) -> int:
 
 def cmd_run(args) -> int:
     try:
-        app = create_app(Path(args.input), args.mask_dir, args.out_dir)
+        extra, seen = [], set()
+        for spec in args.add:
+            d = folders_mod.parse_add(spec)
+            if d.name in seen:
+                raise folders_mod.FolderError(f"--add に同じ名前のフォルダがあります: {d.name}")
+            if not d.images.is_dir():
+                raise FileNotFoundError(f"画像フォルダが見つかりません: {d.images}")
+            seen.add(d.name)
+            extra.append(d)
+        app = create_app(Path(args.input), args.mask_dir, args.out_dir, folders=extra)
     except (FileNotFoundError, ValueError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
@@ -162,6 +195,11 @@ def cmd_projects(args) -> int:
         else:
             print(f"  {r['name']}: 画像 {r['images']} / マスク {r['masks']} / 設定済み {r['configured']} / "
                   f"書き出し済み {r['exported']} / 最終更新 {r['updated']}")
+            if len(r.get("folders", [])) > 1:              # 複数フォルダのときは内訳（上の数は合計）
+                for f in r["folders"]:
+                    print(f"      {'既定' if f['name'] == folders_mod.DEFAULT else f['name']}: " + (
+                        "フォルダが見つかりません" if f["missing"] else
+                        f"画像 {f['images']} / マスク {f['masks']} / 設定済み {f['configured']} / 書き出し済み {f['exported']}"))
     return 0
 
 
@@ -209,6 +247,34 @@ def cmd_assets(args) -> int:
     return 0
 
 
+def cmd_folders(args) -> int:
+    project = load_project(args.project, check=False)
+    if args.folders_command == "add":
+        entry = add_folder(project, args.name, args.images, args.masks, args.note)
+        print(f"画像フォルダを足しました: {entry['name']}（{project.name}）")
+        print(f"  元画像: {entry['images']}" + (f" / マスク: {entry['masks']}" if "masks" in entry else ""))
+        print(f"  保存先: {folders_mod.out_dir(project.out, entry['name'])}")
+        return 0
+    if args.folders_command == "remove":
+        removed = remove_folder(project, args.name, args.delete_out)
+        print(f"画像フォルダの登録を外しました: {args.name}（{project.name}）")
+        kept = folders_mod.out_dir(project.out, args.name)
+        print(f"  設定と書き出しも消しました: {removed}" if removed else
+              (f"  設定と書き出しは残っています: {kept}" if kept.is_dir() else ""))
+        return 0
+    rows = [{k: v for k, v in r.items() if k != "latest"} for r in folder_rows(project)]
+    if args.json:
+        print(json.dumps({"project": project.name, "folders": rows}, ensure_ascii=False, indent=2))
+        return 0
+    print(f"画像フォルダ（{project.name}）:")
+    for r in rows:
+        label = "既定" if r["name"] == folders_mod.DEFAULT else r["name"]
+        print(f"  {label}: " + ("フォルダが見つかりません" if r["missing"] else
+                               f"画像 {r['images']} / マスク {r['masks']} / 設定済み {r['configured']} / "
+                               f"書き出し済み {r['exported']}") + f"  {r['images_dir']}")
+    return 0
+
+
 def cmd_fonts(args) -> int:
     configs = [default_local_config()]
     if args.project:
@@ -239,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return {"run": cmd_run, "new": cmd_new, "open": cmd_open, "projects": cmd_projects,
-                "assets": cmd_assets, "fonts": cmd_fonts}[args.command](args)
+                "assets": cmd_assets, "fonts": cmd_fonts, "folders": cmd_folders}[args.command](args)
     except ProjectError as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1

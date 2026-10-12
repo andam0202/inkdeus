@@ -46,7 +46,7 @@ class FakeBrowser(threading.Thread):
 
     def __init__(self, url: str, current: str):
         super().__init__(daemon=True)
-        self.url, self.current, self.version = url, current, ""
+        self.url, self.current, self.version, self.folder = url, current, "", "default"
         self.seen: list[dict] = []
         self.ready = threading.Event()
         self.stream = None
@@ -59,10 +59,11 @@ class FakeBrowser(threading.Thread):
 
     @staticmethod
     def query(ev):
-        return f"?version={quote(ev['version'])}" if ev.get("version") else ""
+        parts = [f"{k}={quote(ev[k])}" for k in ("version", "folder") if ev.get(k)]
+        return "?" + "&".join(parts) if parts else ""
 
     def run(self):
-        self.post("api/state", {"current": self.current, "version": self.version})
+        self.post("api/state", {"current": self.current, "version": self.version, "folder": self.folder})
         self.stream = urllib.request.urlopen(self.url + "api/events", timeout=60)
         try:
             for raw in self.stream:
@@ -73,7 +74,8 @@ class FakeBrowser(threading.Thread):
                     continue
                 ev = json.loads(line[6:])
                 self.seen.append(ev)
-                if ev["type"] == "params" and ev["name"] == self.current and ev.get("version", "") == self.version:
+                if (ev["type"] == "params" and ev["name"] == self.current and ev.get("version", "") == self.version
+                        and ev.get("folder", "default") == self.folder):
                     self.post(f"api/stats/{ev['name']}{self.query(ev)}",
                               {"rev": ev["rev"], "output": {"all": {"blackRatio": 0.5}}})
                 elif ev["type"] == "open":
@@ -81,8 +83,8 @@ class FakeBrowser(threading.Thread):
                         self.version = ev["version"]
                     elif ev["name"] != self.current:
                         self.version = ""
-                    self.current = ev["name"]
-                    self.post("api/state", {"current": self.current, "version": self.version})
+                    self.current, self.folder = ev["name"], ev.get("folder") or self.folder
+                    self.post("api/state", {"current": self.current, "version": self.version, "folder": self.folder})
                 elif ev["type"] == "export":
                     buf = io.BytesIO()
                     Image.new("L", (4, 4), 200).save(buf, "PNG")
