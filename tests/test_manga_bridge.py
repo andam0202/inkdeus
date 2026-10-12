@@ -143,7 +143,9 @@ def apply_template(page) -> None:
         setCanvasGUID();
         loadSVGPlusReset(MangaPanelsImage_Vertical[2].svg);
     }""")
-    page.wait_for_function("() => window.inkdeusBridge.panels().length >= 2 && !isProjectBusy()")
+    # コマの guid は、上流がレイヤー一覧を作り直すときに後から付く。付く前に読むと「コマの指定なし」になってしまうので待つ
+    page.wait_for_function("() => { const p = window.inkdeusBridge.panels();"
+                           " return p.length >= 2 && p.every((x) => !!x.guid) && !isProjectBusy(); }")
     page.evaluate("async () => { flushHistory(); await btmSaveProjectFile(null, false); }")
 
 
