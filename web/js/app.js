@@ -1827,12 +1827,18 @@ async function exportAll({ force = false, defaultOnly = false, allFolders = fals
     state.lastBatch = `${batch.abort ? '中止しました' : '終わりました'}: 書き出し ${r.exported} / 飛ばし ${r.skipped}`
       + ` / 失敗 ${r.failed}（全 ${r.total} 件・${formatSpan(r.elapsed)}）`
       + (r.errors.length ? `\n${r.errors.join('\n')}` : '');
-    await postBatch();
-    // 始める前に開いていたフォルダ・画像・バージョンへ戻る
-    if (state.folder !== startFolder) await switchFolder(startFolder, null, '', { open: false });
-    const back = startName ? state.images.findIndex((x) => x.name === startName) : -1;
-    if (back >= 0 && (state.name !== startName || state.version !== startVersion || !state.remote)) {
-      await openIndex(back, verOf(state.images[back], startVersion) ? startVersion : '');
+    showBatch();
+    try {
+      // 始める前に開いていたフォルダ・画像・バージョンへ戻る
+      if (state.folder !== startFolder) await switchFolder(startFolder, null, '', { open: false });
+      const back = startName ? state.images.findIndex((x) => x.name === startName) : -1;
+      if (back >= 0 && (state.name !== startName || state.version !== startVersion || !state.remote)) {
+        await openIndex(back, verOf(state.images[back], startVersion) ? startVersion : '');
+      }
+    } finally {
+      // 外部（ctl export-all --wait）へ「終わった」と知らせるのは、元の画像へ戻ってから
+      // （知らせた直後の外部操作が、一括書き出しで最後に開いていた画像を相手にしてしまわないように）
+      await postBatch();
     }
     autoExport.dirty = false;
     rebuild();

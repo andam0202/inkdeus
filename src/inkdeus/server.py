@@ -171,10 +171,26 @@ class Library:
         names = self.part_names() if names is None else names
         return [n for n in names if self.part_path(entry, n) is not None]
 
-    def _part_stamps(self, entry: Entry, names: list[str] | None = None) -> list[int]:
+    def part_index(self, names: list[str] | None = None) -> dict[str, dict[str, int]]:
+        """部分名 → {画像の stem → マスクの更新時刻（ns）}。部分ごとにフォルダを 1 回だけ走査する
+        （画像の一覧を作るとき、画像 × 部分の回数だけファイルを確かめずに済むように）"""
+        out: dict[str, dict[str, int]] = {}
+        for name in (self.part_names() if names is None else names):
+            found: dict[str, int] = {}
+            try:
+                with os.scandir(self.parts_dir / name) as it:
+                    for item in it:
+                        if item.name.endswith(".png") and item.is_file():
+                            found[item.name[:-4]] = item.stat().st_mtime_ns
+            except (OSError, TypeError):
+                pass
+            out[name] = found
+        return out
+
+    def _part_stamps(self, entry: Entry) -> list[int]:
         """その画像の部分マスクの更新時刻（部分マスクが変わったら、書き出し済みの白黒版は「古い」）"""
         stamps = []
-        for name in self.parts_of(entry, names):
+        for name in self.parts_of(entry):
             try:
                 stamps.append(self.part_path(entry, name).stat().st_mtime_ns)
             except (OSError, AttributeError):
@@ -297,8 +313,9 @@ class Library:
             index[found[0].name].setdefault(found[1], {})[kind] = st
         return index
 
-    def versions(self, entry: Entry, index: dict | None = None, part_names: list[str] | None = None) -> list[dict]:
-        """その画像のバージョンの一覧（既定が先頭。名前付きは名前順）"""
+    def versions(self, entry: Entry, index: dict | None = None, part_stamps: list[int] | None = None) -> list[dict]:
+        """その画像のバージョンの一覧（既定が先頭。名前付きは名前順）。
+        part_stamps は、その画像の部分マスクの更新時刻（省略時はここで調べる）"""
         found = (self.version_index() if index is None else index).get(entry.name, {})
         try:
             inputs = [entry.path.stat().st_mtime_ns]
@@ -308,7 +325,7 @@ class Library:
         if mask is not None:
             inputs.append(mask.stat().st_mtime_ns)
         if inputs:
-            inputs += self._part_stamps(entry, part_names)
+            inputs += self._part_stamps(entry) if part_stamps is None else part_stamps
         rows = []
         for name in ["", *sorted(v for v in found if v)]:
             rec = found.get(name, {})
@@ -1002,16 +1019,18 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         entries = lib.entries()
         index = lib.version_index(entries)
         part_names, part_warnings = lib.parts()
+        part_index = lib.part_index(part_names)
         for e in entries.values():
             w, h = lib.size(e)
-            versions = lib.versions(e, index, part_names)
+            mine = [n for n in part_names if e.path.stem in part_index[n]]      # その画像にマスクのある部分
+            versions = lib.versions(e, index, [part_index[n][e.path.stem] for n in mine])
             default = versions[0]
             items.append({
                 # 画像単位の項目は既定のバージョンの物（名前付きは versions に並ぶ）
                 "exportFile": default["exportFile"], "exportVersion": default["exportVersion"],
                 "name": e.name, "width": w, "height": h,
                 "hasMask": lib.mask_path(e) is not None,
-                "parts": lib.parts_of(e, part_names),       # その画像にマスクのある部分（髪・肌・服など）
+                "parts": mine,                              # その画像にマスクのある部分（髪・肌・服など）
                 "hasParams": default["hasParams"],
                 "hasExport": default["hasExport"], "exportFresh": default["exportFresh"],
                 "versions": versions,
