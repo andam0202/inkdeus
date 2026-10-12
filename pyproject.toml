@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Browser-based editor that turns a color illustration into black-and-white manga-style line art with layered hatching (WebGL2)."
 readme = "README.md"
 requires-python = ">=3.12"
-license = "PolyForm-Noncommercial-1.0.0"
+license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 dependencies = [
     "flask>=3.0",

@@ -13,7 +13,7 @@ so the preview and the exported PNG are the same pixels.
   暗い所ほど多くの層が重なり、影の中にも段階的な陰影が出ます。
 - 人物マスク（白=人物の PNG）があれば、人物と背景で別々の設定（明るさ補正・ベタ・層）を持てます。背景を「白」「線だけ」にもできます。
 - 稼働中のエディタを外のコマンド（`inkdeus ctl`）から操作でき、変更は開いている画面にすぐ反映されます。
-- ソース公開（非商用ライセンス）のソフトウェアです。
+- GPL-3.0-or-later のフリーソフトウェアです。
 
 ## 起動
 
@@ -167,6 +167,17 @@ uv run pytest
 
 ## License
 
-PolyForm Noncommercial License 1.0.0（非商用のみ）。全文は [LICENSE](LICENSE) を参照してください。
+Copyright (C) 2026 andam0202
 
-Required Notice: Copyright (c) 2026 andam0202 (https://github.com/andam0202/inkdeus)
+This program is free software: you can redistribute it and/or modify it under the terms of the
+GNU General Public License as published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
+even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with this program
+(see [LICENSE](LICENSE)). If not, see <https://www.gnu.org/licenses/>.
+
+以前の版（最初の公開コミットまで）は PolyForm Noncommercial 1.0.0 で公開していました。この版以降は GPL-3.0-or-later です。
