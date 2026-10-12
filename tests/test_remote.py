@@ -284,11 +284,15 @@ def test_region_tabs_in_the_panel(live):
     open_image(page, "scene.png")
     render(page, BASE)
     get = "() => window.inkdeus.getParams().regions"
+    tab_names = "() => [...document.querySelectorAll('.tabs button')].map((b) => b.textContent)"
+    assert page.evaluate(tab_names) == ["人物", "背景"]            # 連動中でもタブ名は変えない
     page.locator('.tabs button[data-tab="background"]').click()
     assert page.locator("#bgLinkedNote").count() == 1 and page.locator("#bgControls.disabled").count() == 0
+    assert page.evaluate(tab_names) == ["人物", "背景"]
     page.locator("#btnUnlink").click()                           # 背景だけ別の設定にする
     regions = page.evaluate(get)
     assert regions["background"]["linked"] is False
+    assert page.evaluate(tab_names) == ["人物", "背景"] and page.locator("#bgLinkedNote").count() == 0
     assert regions["background"]["layers"] == regions["person"]["layers"]      # 人物の設定を写して切り離す
     page.locator("#selPreset").select_option("hatch1")           # 背景タブのスタイルは背景に当たる
     regions = page.evaluate(get)

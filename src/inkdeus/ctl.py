@@ -14,6 +14,10 @@ import urllib.request
 from urllib.parse import quote
 
 
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8770
+
+
 class CtlError(Exception):
     def __init__(self, message: str, detail: dict | None = None, code: int = 1):
         super().__init__(message)
@@ -168,12 +172,17 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="inkdeus ctl",
         description="稼働中の inkdeus サーバを操作する。設定の変更は開いているブラウザにすぐ反映される。出力は JSON")
-    ap.add_argument("--port", type=int, default=8770)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"サーバのポート（既定 {DEFAULT_PORT}）")
+    ap.add_argument("--host", default=DEFAULT_HOST, help=f"サーバのホスト（既定 {DEFAULT_HOST}）")
+    # 接続先はサブコマンドの後ろにも書ける（inkdeus ctl state --port 8771）。
+    # サブコマンド側は「指定されたときだけ」値を持たせ、前に書いた値を既定値で上書きしないようにする
+    target = argparse.ArgumentParser(add_help=False)
+    target.add_argument("--port", type=int, default=argparse.SUPPRESS, help="サーバのポート（サブコマンドの前でも後ろでも可）")
+    target.add_argument("--host", default=argparse.SUPPRESS, help="サーバのホスト（サブコマンドの前でも後ろでも可）")
     sub = ap.add_subparsers(dest="command", required=True, metavar="<command>")
 
     def add(name, func, help_text, **kw):
-        p = sub.add_parser(name, help=help_text, description=help_text, **kw)
+        p = sub.add_parser(name, help=help_text, description=help_text, parents=[target], **kw)
         p.set_defaults(func=func)
         return p
 

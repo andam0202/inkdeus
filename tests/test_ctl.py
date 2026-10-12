@@ -205,6 +205,42 @@ def test_stats_wait_times_out(ctl, live):
         silent.close()
 
 
+def test_port_and_host_before_or_after_the_subcommand(live, capsys):
+    """--port / --host は、サブコマンドの前でも後ろでも同じ意味"""
+    port = str(live["port"])
+
+    def run(*argv):
+        capsys.readouterr()
+        code = cli.main(["ctl", *argv])
+        captured = capsys.readouterr()
+        return code, json.loads(captured.out if code == 0 else captured.err)
+
+    expected = run("--port", port, "state")
+    assert expected[0] == 0 and expected[1]["project"]["name"] == "demo"
+    assert run("state", "--port", port) == expected
+    assert run("--host", "127.0.0.1", "state", "--port", port) == expected
+    assert run("state", "--host", "127.0.0.1", "--port", port) == expected
+    assert run("--port", "1", "state", "--port", port) == expected          # 両方に書いたら後ろが勝つ
+    # 引数を取るサブコマンドでも、どの位置でもよい
+    assert run("get", "--name", "scene.png", "--port", port)[0] == 0
+    assert run("set", "--port", port, "--name", "scene.png", "lines.sigma", "1.2")[0] == 0
+    assert run("--port", port, "get", "--name", "scene.png")[1]["params"]["lines"]["sigma"] == 1.2
+    assert run("set", "lines.sigma", "1.3", "--name", "scene.png", "--port", port)[0] == 0
+    assert run("get", "--port", port, "--name", "scene.png")[1]["params"]["lines"]["sigma"] == 1.3
+
+
+def test_port_and_host_defaults():
+    from inkdeus.ctl import build_parser
+
+    for argv in (["state"], ["stats", "--wait"]):
+        args = build_parser().parse_args(argv)
+        assert (args.host, args.port) == ("127.0.0.1", 8770)
+    args = build_parser().parse_args(["--port", "8771", "state"])            # 前に書いた値を既定値で潰さない
+    assert (args.host, args.port) == ("127.0.0.1", 8771)
+    args = build_parser().parse_args(["--host", "localhost", "state", "--port", "8772"])
+    assert (args.host, args.port) == ("localhost", 8772)
+
+
 def test_connection_error_is_reported(capsys):
     code = cli.main(["ctl", "--port", "1", "state"])
     assert code == 1 and "接続できません" in json.loads(capsys.readouterr().err)["error"]

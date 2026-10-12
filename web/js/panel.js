@@ -243,7 +243,7 @@ function toneSection(ctx) {
   const bg = params.regions.background;
   const tabs = el('div', { class: 'tabs' }, ['person', 'background'].map((r) => el('button', {
     class: tab === r ? 'on' : '', 'data-tab': r, onclick: () => ctx.setTab(r),
-  }, REGION_LABELS[r] + (r === 'background' && bg.linked ? '（人物と同じ）' : ''))));
+  }, REGION_LABELS[r])));
   let body;
   if (tab === 'person') {
     body = [
