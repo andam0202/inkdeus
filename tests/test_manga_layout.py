@@ -480,3 +480,164 @@ def test_mode_enter_and_exit_restore_the_lock_state(lay):
     check_left()
     assert image["guid"] in [x[0] for x in lay.evaluate(state)]
 
+
+# ---- 分割・結合・削除 ----
+
+def L(page, call: str, *args):
+    """inkdeusBridge.layout の関数を呼ぶ（例: L(page, 'split', 1, 'h')）"""
+    return page.evaluate("([name, args]) => window.inkdeusBridge.layout[name](...args)", [call, list(args)])
+
+
+def picture(page, guid: str) -> dict:
+    return next(i for i in linked(page) if i["guid"] == guid)
+
+
+def test_split_keeps_the_image_where_it_is_on_the_side_of_its_center(lay):
+    made = grid(lay, "1,1", gutter={"v": 0.04, "h": 0.03})
+    target = made["cells"][0]
+    image = place(lay, target["guid"])
+    # 絵を右へずらしておく（中心がコマの右半分にある）
+    lay.evaluate("""(g) => { const o = canvas.getObjects().find(x => x.guid === g); o.left += canvas.getWidth() * 0.12;
+        o.setCoords(); saveInitialState(o); canvas.fire('object:modified', {target: o}); }""", image["guid"])
+    before = picture(lay, image["guid"])
+    history = depth(lay)
+    after = L(lay, "split", 1, "h")                                  # 縦の線で左右に割る（等分）
+    assert len(after["cells"]) == 3 and len(panels(lay)) == 3 and matches_layout(lay) and depth(lay) == history + 1
+    cells = {c["id"]: c for c in after["cells"]}
+    left, right = cells[after["first"]], cells[after["second"]]
+    assert left["guid"] == target["guid"] and right["guid"] != target["guid"]
+    assert right["rect"]["x"] > left["rect"]["x"] and right["number"] == 1 and left["number"] == 2      # 右が先に読まれる
+    assert left["rect"]["w"] == pytest.approx(right["rect"]["w"], abs=1e-6)
+    assert right["rect"]["x"] - (left["rect"]["x"] + left["rect"]["w"]) == pytest.approx(0.03 * min(1, after["page"]["height"] / after["page"]["width"]), abs=1e-6)
+    now = picture(lay, image["guid"])
+    assert now["panel"] == right["guid"]                             # 中心のある側（右）に残る
+    assert near((now["left"], now["top"], now["scaleX"], now["w"], now["h"]),
+                (before["left"], before["top"], before["scaleX"], before["w"], before["h"]), tol=1e-6)   # 位置と大きさは不変
+    l, t, r, b = panel_box(lay, right["guid"])
+    assert now["clip"][0] >= l - 0.5 and now["clip"][2] <= r + 0.5   # 切り抜きは新しいコマ
+    owners = lay.evaluate("() => Object.fromEntries(canvas.getObjects().filter(o => o.isPanel).map(p => [p.guid, (p.guids || []).slice()]))")
+    assert owners[right["guid"]] == [image["guid"]] and owners[left["guid"]] == []
+    assert lay.evaluate("([a, b]) => canvas.getObjects().findIndex(o => o.guid === a) > canvas.getObjects().findIndex(o => o.guid === b)",
+                        [image["guid"], right["guid"]])              # 絵はコマより手前
+    # 取り消し 1 回で割る前へ
+    undo(lay)
+    assert len(panels(lay)) == 2 and matches_layout(lay) and picture(lay, image["guid"])["panel"] == target["guid"]
+    undo(lay, "redo")
+    assert len(panels(lay)) == 3 and matches_layout(lay) and picture(lay, image["guid"])["panel"] == right["guid"]
+    # 位置を指定して上下に割る
+    again = L(lay, "split", right["guid"], "v", 0.25)
+    cells = {c["id"]: c for c in again["cells"]}
+    upper, lower = cells[again["first"]], cells[again["second"]]
+    assert lower["rect"]["y"] > upper["rect"]["y"] and upper["rect"]["h"] < lower["rect"]["h"] * 0.5
+    assert (upper["rect"]["y"] + upper["rect"]["h"] + lower["rect"]["y"]) / 2 == pytest.approx(
+        right["rect"]["y"] + right["rect"]["h"] * 0.25, abs=1e-6)
+    assert matches_layout(lay) and len(panels(lay)) == 4
+
+
+def test_split_from_the_panel_and_with_alt_click(lay):
+    grid(lay, "1,1")
+    open_section(lay)
+    lay.click("#ikl-mode")
+    assert lay.is_hidden(".ikl-cell")
+    spots = screen(lay)
+    first = info(lay)["cells"][0]
+    center = spots["cells"][first["id"]]["center"]
+    lay.mouse.click(center["x"], center["y"])                       # コマを押して選ぶ
+    lay.wait_for_selector(".ikl-cell:not([hidden])")
+    assert "コマ 1" in lay.inner_text(".ikl-sel-name") and info(lay)["selected"] == [first["id"]]
+    assert lay.is_disabled("#ikl-merge") and lay.is_hidden("#ikl-unfree")
+    lay.click("#ikl-split-h")                                       # 縦に割る（等分）
+    lay.wait_for_function("() => canvas.getObjects().filter(o => o.isPanel).length === 3")
+    assert matches_layout(lay)
+    lay.click("#ikl-split-v")                                       # 選択は割った元のコマに残っているので、続けて割れる
+    lay.wait_for_function("() => canvas.getObjects().filter(o => o.isPanel).length === 4")
+    assert matches_layout(lay)
+    # Alt+クリック: 押した位置で左右に割る
+    last = info(lay)["cells"][-1]
+    rect = screen(lay)["cells"][last["id"]]["rect"]
+    x = rect["l"] + (rect["r"] - rect["l"]) * 0.3
+    lay.keyboard.down("Alt")
+    lay.mouse.click(x, (rect["t"] + rect["b"]) / 2)
+    lay.keyboard.up("Alt")
+    lay.wait_for_function("() => canvas.getObjects().filter(o => o.isPanel).length === 5")
+    after = info(lay)
+    made = sorted((c for c in after["cells"] if abs(c["rect"]["y"] - last["rect"]["y"]) < 1e-6), key=lambda c: c["rect"]["x"])
+    assert len(made) == 2
+    gap_center = (made[0]["rect"]["x"] + made[0]["rect"]["w"] + made[1]["rect"]["x"]) / 2
+    assert gap_center == pytest.approx(last["rect"]["x"] + last["rect"]["w"] * 0.3, abs=0.004) and matches_layout(lay)
+    # ボタンを Alt+クリック → 次に押した位置で上下に割る
+    lay.click("#ikl-split-v", modifiers=["Alt"])
+    assert "クリックしてください" in lay.inner_text(".ikb-msg")
+    rect = screen(lay)["cells"][made[1]["id"]]["rect"]
+    lay.mouse.click((rect["l"] + rect["r"]) / 2, rect["t"] + (rect["b"] - rect["t"]) * 0.7)
+    lay.wait_for_function("() => canvas.getObjects().filter(o => o.isPanel).length === 6")
+    assert matches_layout(lay) and lay.evaluate("() => window.inkdeusBridge.layout.isActive()")
+    # モードの間に増えたコマも、抜けたら掴める状態（保存どおり）へ戻る
+    lay.keyboard.press("Escape")
+    assert all(p["evented"] and not p["selectable"] for p in panels(lay))
+
+
+def test_merge_keeps_both_images_and_remove_handles_images(lay):
+    made = grid(lay, "3,1", gutter={"v": 0.04, "h": 0.03})
+    a = place(lay, made["cells"][0]["guid"])
+    b = place(lay, made["cells"][1]["guid"], "gradient.png")
+    c = place(lay, made["cells"][2]["guid"])
+    pa, pb = picture(lay, a["guid"]), picture(lay, b["guid"])
+    with pytest.raises(Exception, match="隣り合う"):
+        L(lay, "merge", 1, 3)
+    with pytest.raises(Exception, match="隣り合う"):
+        L(lay, "merge", 1, 4)
+    history = depth(lay)
+    merged = L(lay, "merge", 1, 2)
+    assert len(merged["cells"]) == 3 and len(panels(lay)) == 3 and matches_layout(lay) and depth(lay) == history + 1
+    kept = next(x for x in merged["cells"] if x["id"] == merged["kept"])
+    assert kept["guid"] == made["cells"][1]["guid"]                  # 残るのは左側のコマ
+    assert kept["rect"]["x"] == pytest.approx(made["cells"][1]["rect"]["x"])
+    assert kept["rect"]["x"] + kept["rect"]["w"] == pytest.approx(made["cells"][0]["rect"]["x"] + made["cells"][0]["rect"]["w"])
+    na, nb = picture(lay, a["guid"]), picture(lay, b["guid"])
+    assert na["panel"] == nb["panel"] == kept["guid"]                # 両方の絵が残り、新しいコマで切り抜かれる
+    assert near((na["left"], na["top"], na["scaleX"]), (pa["left"], pa["top"], pa["scaleX"]), tol=1e-6)
+    assert near((nb["left"], nb["top"], nb["scaleX"]), (pb["left"], pb["top"], pb["scaleX"]), tol=1e-6)
+    box = panel_box(lay, kept["guid"])
+    assert na["clip"][2] <= box[2] + 0.5 and nb["clip"][0] >= box[0] - 0.5
+    assert sorted(lay.evaluate("(g) => canvas.getObjects().find(o => o.guid === g).guids", kept["guid"])) == sorted([a["guid"], b["guid"]])
+    undo(lay)
+    assert len(panels(lay)) == 4 and matches_layout(lay) and picture(lay, a["guid"])["panel"] == made["cells"][0]["guid"]
+    undo(lay, "redo")
+    # 画面から: 2 つ選んで（Shift+クリック）結合
+    enter(lay)
+    open_section(lay)
+    cells = info(lay)["cells"]
+    spots = screen(lay)
+    first, second = spots["cells"][cells[0]["id"]]["center"], spots["cells"][cells[1]["id"]]["center"]
+    lay.mouse.click(first["x"], first["y"])
+    lay.keyboard.down("Shift")
+    lay.mouse.click(second["x"], second["y"])
+    lay.keyboard.up("Shift")
+    lay.wait_for_function("() => window.inkdeusBridge.layout.get().selected.length === 2")
+    assert lay.is_enabled("#ikl-merge") and lay.is_disabled("#ikl-split-h") and "コマ 1 と 2" in lay.inner_text(".ikl-sel-name")
+    lay.click("#ikl-merge")
+    lay.wait_for_function("() => canvas.getObjects().filter(o => o.isPanel).length === 2")
+    assert matches_layout(lay) and len(linked(lay)) == 3
+    assert len({i["panel"] for i in linked(lay)}) == 1               # 行が 1 コマになり、3 枚とも同じコマ
+    lay.keyboard.press("Escape")
+    undo(lay)
+    # 削除（既定は画像を残す）: 兄弟が埋め、絵はコマなしの自由な画像になる
+    before = info(lay)
+    gone = before["cells"][1]                                        # 左の（c の入った）コマ
+    removed = L(lay, "remove", 2)
+    assert len(removed["cells"]) == 2 and len(panels(lay)) == 2 and matches_layout(lay)
+    free = picture(lay, c["guid"])
+    assert free["panel"] is None and free["clip"] is None
+    wide = removed["cells"][0]
+    assert wide["rect"]["x"] == pytest.approx(gone["rect"]["x"]) and wide["rect"]["w"] > before["cells"][0]["rect"]["w"]
+    undo(lay)
+    assert len(panels(lay)) == 3 and picture(lay, c["guid"])["panel"] == gone["guid"] and matches_layout(lay)
+    # 「画像も消す」
+    removed = L(lay, "remove", 2, {"images": "delete"})
+    assert len(panels(lay)) == 2 and c["guid"] not in [i["guid"] for i in linked(lay)] and len(linked(lay)) == 2
+    # 最後の 1 つまで消すと、レイアウトは無くなる
+    L(lay, "remove", 1)
+    L(lay, "remove", 1)
+    assert panels(lay) == [] and info(lay)["layout"] is None and len(linked(lay)) == 2
+
