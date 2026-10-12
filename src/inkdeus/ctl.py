@@ -11,7 +11,10 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from urllib.parse import quote
+
+from . import styles as styles_mod
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -43,7 +46,7 @@ class Client:
             except ValueError:
                 detail = {}
             if e.code == 404:
-                raise CtlError("その名前の画像（または設定・バージョン）はありません", detail) from e
+                raise CtlError(detail.get("error") or "その名前の画像（または設定・バージョン）はありません", detail) from e
             raise CtlError(detail.get("error") or f"サーバがエラーを返しました (HTTP {e.code})", detail) from e
         except (urllib.error.URLError, OSError) as e:
             raise CtlError(f"サーバに接続できません: {self.base}（inkdeus を起動していますか？）") from e
@@ -135,6 +138,52 @@ def cmd_preset(c: Client, args) -> dict:
 
 def cmd_presets(c: Client, args) -> dict:
     return c.call("GET", "/api/styles")
+
+
+def _style_path(name: str, scope: str | None = None) -> str:
+    return f"/api/styles/{quote(name, safe='')}" + (f"?scope={quote(scope, safe='')}" if scope else "")
+
+
+def cmd_style(c: Client, args) -> dict:
+    """自分用スタイル（気に入った層の組み合わせを、名前を付けて保存した物）"""
+    if args.action == "list":
+        return c.call("GET", "/api/styles")
+    if args.action == "save":
+        # いま開いている画像の、その領域の設定を保存する
+        params = c.call("GET", _path("params", *c.target(args), resolve=1))["params"]
+        try:
+            data, target = styles_mod.from_region(params, args.region, args.with_levels)
+        except styles_mod.StyleError as e:
+            raise CtlError(str(e), {"problems": e.problems}) from e
+        return c.call("PUT", _style_path(args.style), {
+            "scope": args.scope, "description": args.description, "target": target,
+            "includeLevels": args.with_levels, "data": data})
+    if args.action == "delete":
+        return c.call("DELETE", _style_path(args.style, args.scope))
+    if args.action == "rename":
+        return c.call("PATCH", _style_path(args.style, args.scope), {"to": args.new})
+    if args.action == "export":
+        found = c.call("GET", _style_path(args.style, args.scope))
+        return {"version": styles_mod.FORMAT, "styles": [found["style"]]}
+    # import: styles.json と同じ形（または 1 件だけ）のファイルを読んで保存する
+    try:
+        raw = json.loads(Path(args.file).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise CtlError(f"ファイルを読めません: {e}") from e
+    items = raw.get("styles") if isinstance(raw, dict) and "styles" in raw else [raw]
+    if not isinstance(items, list) or not all(isinstance(i, dict) and isinstance(i.get("name"), str) for i in items):
+        raise CtlError("スタイルのファイルとして読めません（{\"version\": 1, \"styles\": [...]} の形）")
+    existing = {styles_mod.key_of(s["name"]) for s in c.call("GET", "/api/styles")["styles"] if s.get("origin") == args.scope}
+    saved, skipped = [], []
+    for item in items:
+        if styles_mod.key_of(item["name"]) in existing and not args.overwrite:
+            skipped.append(item["name"])                 # 同じ名前がある（--overwrite で上書き）
+            continue
+        body = {k: v for k, v in item.items() if k in ("aliases", "description", "target", "includeLevels", "data")}
+        saved.append(c.call("PUT", _style_path(item["name"]), {**body, "scope": args.scope})["style"]["name"])
+    if skipped and not saved:
+        raise CtlError("同じ名前のスタイルが既にあります（上書きするなら --overwrite）", {"skipped": skipped})
+    return {"scope": args.scope, "saved": saved, "skipped": skipped}
 
 
 def cmd_stats(c: Client, args) -> dict:
@@ -319,7 +368,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("style", help="スタイル名（一覧は presets）")
     p.add_argument("--region", default="person", metavar="<person|background|both|部分名>",
                    help="適用先。部分名（hair など。部分マスクのある部分）を指すと、その部分だけ別の設定になる")
-    add("presets", cmd_presets, "名前付きスタイルの一覧と説明")
+    add("presets", cmd_presets, "名前付きスタイルの一覧と説明（組み込みと自分用。origin が出どころ）")
+    p = add("style", cmd_style, "自分用スタイル（いまの領域の設定に名前を付けた物）の保存・削除・名前変更・書き出し・取り込み")
+    ssub = p.add_subparsers(dest="action", required=True, metavar="<save|delete|rename|export|import|list>")
+    scope_help = "保存先: user = 全プロジェクト共通（既定） / project = このプロジェクト専用"
+    q = with_name(ssub.add_parser("save", parents=[target], help="開いている画像の、その領域の設定をスタイルとして保存する"))
+    q.add_argument("style", metavar="<名前>", help="スタイル名（英数字・かな漢字・_ - ( ) で 32 文字まで。組み込みの名前・別名は不可）")
+    q.add_argument("--region", default="person", metavar="<person|background|部分名>", help="保存する領域")
+    q.add_argument("--scope", choices=["user", "project"], default="user", help=scope_help)
+    q.add_argument("--with-levels", action="store_true", help="明るさ補正（levels）も含める")
+    q.add_argument("--description", default="", help="説明")
+    for action, text in (("delete", "自分用スタイルを削除する"), ("export", "自分用スタイルを JSON で標準出力へ書き出す")):
+        q = ssub.add_parser(action, parents=[target], help=text)
+        q.add_argument("style", metavar="<名前>")
+        q.add_argument("--scope", choices=["user", "project"], default=None,
+                       help="どちらの保存先の物か（省略時は、プロジェクト専用 → 全プロジェクト共通の順に探す）")
+    q = ssub.add_parser("rename", parents=[target], help="自分用スタイルの名前を変える")
+    q.add_argument("style", metavar="<旧>")
+    q.add_argument("new", metavar="<新>")
+    q.add_argument("--scope", choices=["user", "project"], default=None)
+    q = ssub.add_parser("import", parents=[target], help="書き出した JSON（または styles.json）を取り込む")
+    q.add_argument("file", metavar="<ファイル>")
+    q.add_argument("--scope", choices=["user", "project"], default="user", help=scope_help)
+    q.add_argument("--overwrite", action="store_true", help="同じ名前のスタイルがあれば上書きする")
+    ssub.add_parser("list", parents=[target], help="スタイルの一覧（presets と同じ）")
     p = with_name(add("stats", cmd_stats, "描画結果の統計（黒率・濃度・ベタ・層ごとの面積率・輝度の分布）"))
     p.add_argument("--wait", action="store_true", help="いまの設定(rev)に対する統計が届くまで待つ")
     p.add_argument("--timeout", type=float, default=60.0)

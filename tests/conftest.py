@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import copy
+import os
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +15,9 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+# 利用者の設定フォルダ（自分用スタイルの置き場）は、テストの間は一時フォルダへ向ける（実物を読まない・書かない）
+os.environ["INKDEUS_CONFIG"] = tempfile.mkdtemp(prefix="inkdeus-test-config-")
 
 import synth  # noqa: E402
 from inkdeus.server import create_app  # noqa: E402

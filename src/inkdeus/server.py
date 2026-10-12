@@ -29,6 +29,7 @@ from . import fonts as fonts_mod
 from . import manga as manga_mod
 from . import parts as parts_mod
 from . import schema
+from . import styles as styles_mod
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -51,7 +52,7 @@ PAINT_FORMAT = 1
 PAINT_TARGET_RE = re.compile(r"layer-[a-z0-9]{4,16}|solid-[\w\-]{1,32}|lines|all|pen")
 PAINT_ALL = "all-targets"                              # 削除でだけ使える「全部の対象」
 MAX_PAINT_BYTES = 1 << 28
-FEATURES = ["layerIds", "paint", "parts"]              # 画面が、サーバにある機能を確かめるための名前
+FEATURES = ["layerIds", "paint", "parts", "userStyles"]     # 画面が、サーバにある機能を確かめるための名前
 
 
 class VersionError(ValueError):
@@ -680,7 +681,9 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
     """アプリを作る。project はプロジェクトの情報（任意）。
     folders は追加の画像フォルダ（folders.FolderDef の並び。プロジェクトの設定ファイルの [[folders]] とは別に足す分）。
     local_config は共通設定ファイル（省略時はリポジトリ直下の inkdeus.local.toml）、
-    cache_root は漫画エディタのキャッシュ置き場（省略時は INKDEUS_CACHE か既定の場所）"""
+    cache_root は漫画エディタのキャッシュ置き場（省略時は INKDEUS_CACHE か既定の場所）、
+    parts_dir は既定のフォルダの部分マスクの置き場、
+    config_dir は利用者の設定フォルダ（自分用スタイルの置き場。省略時は INKDEUS_CONFIG か ~/.config/inkdeus）"""
     lib = Library(Path(input_path), Path(mask_dir) if mask_dir else None,
                   Path(out_dir) if out_dir else None, Path(parts_dir) if parts_dir else None)
     web = find_web_dir()
@@ -697,6 +700,8 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
     font_configs = [Path(local_config) if local_config else default_local_config(),
                     project_dir / "inkdeus.project.toml" if project_dir else None]
     manga_site = manga_mod.MangaSite(Path(cache_root) if cache_root else None)
+    # 自分用スタイル（利用者共通は設定フォルダ、プロジェクト専用はプロジェクトのフォルダ直下の styles.json）
+    style_store = styles_mod.Store(Path(config_dir) if config_dir else None, project_dir)
     app = Flask(__name__, static_folder=str(web), static_url_path="")
     app.config["MAX_CONTENT_LENGTH"] = MAX_EXPORT_BYTES
     app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
@@ -705,6 +710,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
     app.config["INKDEUS_FOLDERS"] = registry
     app.config["INKDEUS_ASSETS"] = catalog
     app.config["INKDEUS_MANGA_DIR"] = manga_dir
+    app.config["INKDEUS_STYLES"] = style_store
     if watch:
         session.start_watching(registry.sessions)
 
@@ -1128,18 +1134,76 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         try:
             parts = known_parts(lib, base)
             schema.check_region(region, parts)
-            style, definition = schema.style_data(str(body.get("style", "")), region)
+            style, definition, origin = find_style(str(body.get("style", "")), region)
             params = schema.apply_style(base, style, region, parts, definition)
             params, _ = schema.normalize(params, strict=True, parts=parts)
         except schema.ValidationError as e:
             return fail(e.problems)
         rev = fs.write_params(entry, params, None, version)
-        return jsonify({"name": entry.name, "version": version, "rev": rev, "style": style,
+        return jsonify({"name": entry.name, "version": version, "rev": rev, "style": style, "origin": origin,
                         "region": region, "params": params})
+
+    # ---- 名前付きスタイル（組み込み＋自分用）----
+
+    def find_style(name: str, region: str) -> tuple[str, dict, str]:
+        """スタイル名から (名前, 定義, 出どころ) を引く。組み込み → プロジェクト専用 → 利用者共通の順"""
+        key = schema.resolve_style(name, region)
+        if key is not None:
+            return key, schema.load()["styles"][key], "builtin"
+        found = style_store.find(name)
+        if found is None:
+            known = [*schema.load()["styles"], *(r["name"] for r in style_store.rows()[0] if not r["shadowed"])]
+            raise schema.ValidationError([f"スタイルが見つかりません: {name}（{', '.join(known)}）"])
+        entry, origin = found
+        background = region in ("background", "both")
+        if (entry["target"] == "background" and region != "background") or (entry["target"] == "person" and background):
+            where = "背景" if entry["target"] == "background" else "人物・部分"
+            raise schema.ValidationError([f"スタイル「{entry['name']}」は{where}向けです（region: {region}）"])
+        return entry["name"], styles_mod.definition(entry), origin
+
+    def style_fail(e: styles_mod.StyleError):
+        return jsonify({"error": e.problems[0], "problems": e.problems}), e.status
+
+    def styles_changed(action: str, name: str, scope: str) -> None:
+        session.hub.publish({"type": "styles", "action": action, "name": name, "scope": scope,
+                             "source": request.headers.get("X-Inkdeus-Client")})
 
     @app.get("/api/styles")
     def api_styles():
-        return jsonify({"styles": schema.list_styles(), "default": schema.load()["defaultStyle"]})
+        """名前付きスタイルの一覧。組み込み（origin = builtin）に、自分用（project / user）が続く"""
+        rows, problems = style_store.rows()
+        return jsonify({"styles": [*schema.list_styles(), *rows], "default": schema.load()["defaultStyle"],
+                        "problems": problems,
+                        "files": {scope: str(path) if path else None for scope, path in style_store.files.items()}})
+
+    @app.route("/api/styles/<name>", methods=["GET", "PUT", "PATCH", "DELETE"])
+    def api_user_style(name: str):
+        scope = request.args.get("scope") or None
+        try:
+            if request.method == "GET":
+                found = style_store.find(name, scope)
+                if found is None:
+                    abort(404)
+                return jsonify({"style": found[0], "scope": found[1]})
+            if request.method == "PUT":
+                # 保存（同じ名前があれば上書き）。scope は user（全プロジェクト共通）か project（このプロジェクト専用）
+                body = json_body()
+                scope = scope or str(body.pop("scope", "user"))
+                body.pop("scope", None)
+                entry, replaced = style_store.save({**body, "name": name}, scope)
+                styles_changed("save", entry["name"], scope)
+                return jsonify({"style": entry, "scope": scope, "replaced": replaced,
+                                "path": str(style_store.path(scope))})
+            if request.method == "PATCH":
+                body = json_body()                           # 名前の変更
+                entry, found = style_store.rename(name, body.get("to"), scope or body.get("scope") or None)
+                styles_changed("rename", entry["name"], found)
+                return jsonify({"style": entry, "scope": found, "renamedFrom": name})
+            entry, found = style_store.delete(name, scope)
+            styles_changed("delete", entry["name"], found)
+            return jsonify({"deleted": entry["name"], "scope": found})
+        except styles_mod.StyleError as e:
+            return style_fail(e)
 
     # ---- 書き出し ----
 
