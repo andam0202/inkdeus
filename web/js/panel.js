@@ -2,9 +2,12 @@
 // 値の変更は ctx.live()（再描画だけ）と ctx.commit()（履歴に積む・保存する）で通知する。
 
 import {
-  FIELDS, LAYER_FIELDS, SECTION_LABELS, PRESETS, MAX_LAYERS, UNIT_RANGE,
+  SECTIONS, LEVEL_FIELDS, SOLID_FIELDS, BACKGROUND_FIELDS, LAYER_FIELDS, STYLES, MAX_LAYERS, UNIT_RANGE,
   effectiveUnit, newLayer, WATERMARK_FALLBACK_TEXT,
 } from './schema.js';
+
+const SECTION_LABELS = { input: '入力', lines: '線画', tone: 'トーン（ベタ・層）', watermark: '透かし', output: '出力' };
+const REGION_LABELS = { person: '人物', background: '背景' };
 
 const openState = new Map();      // 折りたたみの開閉を作り直しの間も覚えておく
 
@@ -144,23 +147,23 @@ function inputSection(ctx) {
     el('div', { class: 'row', 'data-key': 'unit' },
       el('label', { title: '基準px に掛ける倍率。自動 = 画像の幅 / 1280' }, '画像倍率 unit'),
       el('label', { class: 'check' }, autoBox, '自動'), unitInput),
-    ...Object.entries(FIELDS.input).map(([k, f]) => fieldRow(ctx, f, params.input, k)),
+    ...Object.entries(SECTIONS.input).map(([k, f]) => fieldRow(ctx, f, params.input, k)),
   ]);
 }
 
 function simpleSection(ctx, key, defaultOpen = true) {
   const { params } = ctx.state;
-  return section(key, Object.entries(FIELDS[key]).map(([k, f]) => fieldRow(ctx, f, params[key], k)), defaultOpen);
+  return section(key, Object.entries(SECTIONS[key]).map(([k, f]) => fieldRow(ctx, f, params[key], k)), defaultOpen);
 }
 
-function layerCard(ctx, layer, index) {
-  const { params, solo } = ctx.state;
-  const layers = params.layers;
+function layerCard(ctx, region, layers, layer, index) {
+  const { solo } = ctx.state;
+  const isSolo = !!solo && solo.region === region && solo.index === index;
   const change = (fn) => (e) => {
     e.preventDefault();
     e.stopPropagation();
     fn();
-    ctx.setSolo(-1, false);
+    ctx.setSolo(null, false);
     ctx.live(); ctx.commit(); ctx.rebuild();
   };
   const enabled = el('input', { type: 'checkbox', title: 'この層を表示する' });
@@ -168,8 +171,8 @@ function layerCard(ctx, layer, index) {
   enabled.addEventListener('click', (e) => e.stopPropagation());
   enabled.addEventListener('change', () => { layer.enabled = enabled.checked; ctx.live(); ctx.commit(); ctx.rebuild(); });
   const soloBtn = el('button', {
-    class: solo === index ? 'on' : '', title: 'ソロ表示（この層だけを見る）',
-    onclick: (e) => { e.preventDefault(); e.stopPropagation(); ctx.setSolo(solo === index ? -1 : index, true); },
+    class: isSolo ? 'on' : '', title: 'ソロ表示（この層だけを見る）',
+    onclick: (e) => { e.preventDefault(); e.stopPropagation(); ctx.setSolo(isSolo ? null : { region, index }, true); },
   }, 'ソロ');
   const summary = el('summary', {},
     enabled,
@@ -186,56 +189,106 @@ function layerCard(ctx, layer, index) {
     Object.entries(LAYER_FIELDS)
       .filter(([k]) => k !== 'enabled' && k !== 'type')
       .map(([k, f]) => fieldRow(ctx, f, layer, k)));
-  const cls = ['layer', layer.enabled ? '' : 'off', solo === index ? 'solo' : ''].join(' ');
-  const card = fold(`layer:${index}`, summary, body, cls, index === 0);
+  const cls = ['layer', layer.enabled ? '' : 'off', isSolo ? 'solo' : ''].join(' ');
+  const card = fold(`layer:${region}:${index}`, summary, body, cls, index === 0);
   card.dataset.layer = index;
   return card;
 }
 
-function layersSection(ctx) {
-  const { params, solo } = ctx.state;
-  const preset = el('select', { id: 'selPreset' },
-    el('option', { value: '' }, 'プリセットを選ぶ…'),
-    Object.entries(PRESETS).map(([value, p]) => el('option', { value }, p.label)));
-  preset.addEventListener('change', () => { if (preset.value) ctx.preset(preset.value); });
+function styleSelect(ctx, region) {
+  const sel = el('select', { id: 'selPreset', title: `${REGION_LABELS[region]}に名前付きスタイルを当てる` },
+    el('option', { value: '' }, 'スタイルを選ぶ…'),
+    Object.entries(STYLES).map(([value, st]) => el('option', { value, title: st.description }, st.label)));
+  sel.addEventListener('change', () => { if (sel.value) ctx.style(sel.value, region); });
+  return sel;
+}
+
+/** 領域（人物 / 背景）の 明るさ補正・ベタ・層 */
+function regionTone(ctx, region, target) {
+  const { solo } = ctx.state;
+  const layers = target.layers;
   const add = el('button', {
-    id: 'btnAddLayer', disabled: params.layers.length >= MAX_LAYERS,
+    id: 'btnAddLayer', disabled: layers.length >= MAX_LAYERS,
     onclick: () => {
       // 新しい層は、いちばん暗い層よりさらに暗い所に置く
-      const last = params.layers[params.layers.length - 1];
-      params.layers.push(newLayer(last ? {
+      const last = layers[layers.length - 1];
+      layers.push(newLayer(last ? {
         threshold: Math.max(0.05, Number((last.threshold * 0.75).toFixed(3))),
         angle: (last.angle + 45) % 180, spacing: last.spacing, width: last.width,
       } : { threshold: 0.6 }));
-      ctx.setSolo(-1, false);
+      ctx.setSolo(null, false);
       ctx.live(); ctx.commit(); ctx.rebuild();
     },
   }, '層を追加');
-  return section('layers', [
-    el('div', { class: 'buttons' }, preset, add,
-      el('span', { class: 'note' }, `${params.layers.length} / ${MAX_LAYERS} 層`)),
+  const levels = fold(`levels:${region}`,
+    el('summary', {}, `${REGION_LABELS[region]}の明るさ補正（トーン分けだけに効く）`),
+    el('div', { class: 'body' }, Object.entries(LEVEL_FIELDS).map(([k, f]) => fieldRow(ctx, f, target.levels, k))),
+    'sub', false);
+  levels.dataset.group = 'levels';
+  return [
+    levels,
+    el('div', { 'data-group': 'solid', class: 'body' },
+      Object.entries(SOLID_FIELDS).map(([k, f]) => fieldRow(ctx, f, target.solid, k))),
+    el('div', { class: 'buttons' }, add, el('span', { class: 'note' }, `${layers.length} / ${MAX_LAYERS} 層`)),
     el('div', { class: 'note' }, '平滑化した輝度がしきい値未満の所に線を引きます。暗い所ほど多くの層が重なります。'),
-    solo >= 0 ? el('div', { class: 'note warn' }, `層${solo + 1} をソロ表示中（ベタと線画も隠しています）`) : null,
-    ...params.layers.map((l, i) => layerCard(ctx, l, i)),
-  ]);
+    solo && solo.region === region
+      ? el('div', { class: 'note warn' }, `層${solo.index + 1} をソロ表示中（ベタと線画も隠しています）`) : null,
+    ...layers.map((l, i) => layerCard(ctx, region, layers, l, i)),
+  ];
 }
 
-function backgroundSection(ctx) {
-  const { params, hasMask } = ctx.state;
-  const rows = Object.entries(FIELDS.background).map(([k, f]) => fieldRow(ctx, f, params.background, k));
-  return section('background', [
-    el('div', { class: 'buttons' },
-      el('button', { onclick: () => ctx.openMask() }, 'マスクを開く'),
-      el('span', { class: hasMask ? 'note' : 'note warn', id: 'maskNote' },
-        hasMask ? 'マスクあり（白=人物）' : 'マスクが無いため背景処理は無効です')),
-    el('div', { class: hasMask ? '' : 'disabled', id: 'bgControls' }, el('div', { class: 'body' }, rows)),
-  ]);
+function toneSection(ctx) {
+  const { params, hasMask, tab } = ctx.state;
+  const person = params.regions.person;
+  const bg = params.regions.background;
+  const tabs = el('div', { class: 'tabs' }, ['person', 'background'].map((r) => el('button', {
+    class: tab === r ? 'on' : '', 'data-tab': r, onclick: () => ctx.setTab(r),
+  }, REGION_LABELS[r] + (r === 'background' && bg.linked ? '（人物と同じ）' : ''))));
+  let body;
+  if (tab === 'person') {
+    body = [
+      el('div', { class: 'buttons' }, styleSelect(ctx, 'person'),
+        el('span', { class: 'note' }, hasMask ? 'マスクの内側' : 'マスクが無いので画像全体')),
+      ...regionTone(ctx, 'person', person),
+    ];
+  } else {
+    const general = ['mode', 'grow', 'silhouetteWidth', 'lineStrength']
+      .map((k) => fieldRow(ctx, BACKGROUND_FIELDS[k], bg, k));
+    general[0].querySelector('select').addEventListener('change', () => ctx.rebuild());
+    const link = bg.linked
+      ? [el('div', { class: 'note', id: 'bgLinkedNote' }, '背景は人物と同じ 明るさ補正・ベタ・層 で描いています。'),
+        el('div', { class: 'buttons' }, el('button', {
+          id: 'btnUnlink',
+          onclick: () => {
+            // いまの人物の設定を写してから切り離す（切り離した瞬間に見た目が変わらないように）
+            bg.levels = { ...person.levels };
+            bg.solid = { ...person.solid };
+            bg.layers = person.layers.map((l) => ({ ...l }));
+            bg.linked = false;
+            ctx.live(); ctx.commit(); ctx.rebuild();
+          },
+        }, '背景だけ別の設定にする'))]
+      : [el('div', { class: 'buttons' }, styleSelect(ctx, 'background'), el('button', {
+        id: 'btnLink',
+        onclick: () => { bg.linked = true; ctx.setSolo(null, false); ctx.live(); ctx.commit(); ctx.rebuild(); },
+      }, '人物と同じに戻す')),
+      bg.mode !== 'keep' ? el('div', { class: 'note warn' }, '背景の描き方が「そのまま」以外なので、下のベタと層は使われません。') : null,
+      ...regionTone(ctx, 'background', bg)];
+    body = [
+      el('div', { class: 'buttons' },
+        el('button', { onclick: () => ctx.openMask() }, 'マスクを開く'),
+        el('span', { class: hasMask ? 'note' : 'note warn', id: 'maskNote' },
+          hasMask ? 'マスクあり（白=人物）' : 'マスクが無いため背景の設定は無効です（全体が人物扱い）')),
+      el('div', { class: hasMask ? '' : 'disabled', id: 'bgControls' }, el('div', { class: 'body' }, [...general, ...link])),
+    ];
+  }
+  return section('tone', [tabs, ...body]);
 }
 
 function watermarkSection(ctx) {
   const { params, owner } = ctx.state;
   const w = params.watermark;
-  const f = FIELDS.watermark;
+  const f = SECTIONS.watermark;
   const rows = [];
   if (owner) {
     rows.push(boolRow(ctx, f.enabled, w, 'enabled', () => ctx.rebuild()));
@@ -256,7 +309,7 @@ function watermarkSection(ctx) {
 function outputSection(ctx) {
   const { params, lastExport, server } = ctx.state;
   return section('output', [
-    ...Object.entries(FIELDS.output).map(([k, f]) => fieldRow(ctx, f, params.output, k)),
+    ...Object.entries(SECTIONS.output).map(([k, f]) => fieldRow(ctx, f, params.output, k)),
     el('div', { class: 'buttons' },
       el('button', { class: 'primary', id: 'btnExport', onclick: () => ctx.exportNow() }, 'PNG を書き出す'),
       el('span', { class: 'note' }, server ? 'フル解像度・グレースケール' : 'フル解像度・グレースケール（ダウンロード）')),
@@ -265,7 +318,7 @@ function outputSection(ctx) {
       el('button', { id: 'btnSaveJSON', onclick: () => ctx.saveJSON() }, '設定を保存 (JSON)'),
       el('button', { id: 'btnOpenJSON', onclick: () => ctx.openJSON() }, '設定を開く')),
     el('div', { class: 'note' }, server
-      ? '設定は変更のたびに画像ごとに自動保存されます。'
+      ? '設定は変更のたびに画像ごとに自動保存されます。設定ファイルを外から書き換えると、この画面にも反映されます。'
       : 'サーバなしで動作中です。設定は JSON で保存・読み込みしてください。'),
   ]);
 }
@@ -275,9 +328,7 @@ export function buildPanel(root, ctx) {
   root.replaceChildren(
     inputSection(ctx),
     simpleSection(ctx, 'lines'),
-    simpleSection(ctx, 'solid'),
-    layersSection(ctx),
-    backgroundSection(ctx),
+    toneSection(ctx),
     watermarkSection(ctx),
     outputSection(ctx),
   );

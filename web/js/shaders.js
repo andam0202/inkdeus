@@ -148,22 +148,29 @@ void main() {
 }`;
 
 // 5. 合成: 白地 → トーン層 → ベタ → 線画（乗算）→ 背景処理 → 透かし（→ 純2値）
+// トーン（明るさ補正・ベタ・層）は「人物」と「背景」で別々の設定を持てる（配列の 0..7 が人物、8..15 が背景）。
+// uMode: 0 = 出力、1 / 2 = 統計用（縮小した格子で画素を抜き出し、数値を RGBA に詰める）
 export const FS_COMPOSITE = HEAD + `
 uniform sampler2D uLum;      // 平滑化した輝度（トーン分け用）
 uniform sampler2D uBlur;     // RG = G(σ), G(1.6σ)
 uniform sampler2D uSdf;
 uniform sampler2D uWm;       // R = 文字, G = 文字の縁取り
-uniform int uCount;
-uniform vec4 uA[8];          // しきい値, ぼかし幅, sin(角度), cos(角度)
-uniform vec4 uB[8];          // 間隔px, 太さpx, 暗さで太さ, 濃さ
-uniform vec4 uC[8];          // 位相, -, -, -
-uniform vec4 uSolid;         // 有効, しきい値, ぼかし幅
+uniform ivec2 uCount;        // 層の数（人物, 背景）
+uniform vec4 uA[16];         // しきい値, ぼかし幅, sin(角度), cos(角度)
+uniform vec4 uB[16];         // 間隔px, 太さpx, 暗さで太さ, 濃さ
+uniform vec4 uC[16];         // 位相, -, -, -
+uniform vec4 uLevels[2];     // 明るさ, コントラスト, 1/ガンマ
+uniform vec4 uSolid[2];      // 有効, しきい値, ぼかし幅
 uniform vec4 uLine;          // 濃さ, τ, ε, φ
 uniform int uLineOn;         // 線画の計算が必要か（ぼかしテクスチャが有効か）
-uniform vec4 uBg;            // モード(0 そのまま /1 白 /2 線だけ), 広げ量px, シルエット線px, 背景の線の濃さ
+uniform int uHasMask;
+uniform vec4 uBg;            // 背景の描き方(0 層で描く /1 白 /2 線だけ), 広げ量px, シルエット線px, 背景の線の濃さ
 uniform vec4 uWmRect;        // 透かしの矩形 x, y, w, h（px）
 uniform vec4 uWmP;           // モード(0 なし /1 1か所 /2 タイル), 濃さ, タイル周期 x, y
 uniform int uBinary;
+uniform int uMode;
+uniform vec2 uSampleScale;   // 統計用: 格子1マスが何画素か
+uniform ivec2 uSize;
 out vec4 o;
 
 // 輝度 L がしきい値 th 未満なら 1。soft > 0 なら境界をなだらかにする
@@ -172,31 +179,49 @@ float below(float L, float th, float soft) {
   return L < th ? 1.0 : 0.0;
 }
 
-// 4x4 のベイヤー行列（0..1）。純2値のときに透かしの濃さを点の密度で表す
 const int BAYER[16] = int[16](0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5);
+// 4x4 のベイヤー行列（0..1）。純2値のときに透かしの濃さを点の密度で表す
 float bayer(vec2 p) {
   ivec2 q = ivec2(p) & 3;
   return (float(BAYER[q.y * 4 + q.x]) + 0.5) / 16.0;
 }
 
-void main() {
-  ivec2 ip = ivec2(gl_FragCoord.xy);
-  vec2 p = gl_FragCoord.xy;
-  float L = texelFetch(uLum, ip, 0).r;
+vec2 hash2(vec2 c) {
+  vec3 q = fract(vec3(c.xyx) * vec3(0.1031, 0.1030, 0.0973));
+  q += dot(q, q.yzx + 33.33);
+  return fract((q.xx + q.yz) * q.zy);
+}
 
-  // --- トーン層（重ねがけ）: 残る白 = Π(1 − ink_i) ---
+// 領域ごとの明るさ補正（トーン分けに使う輝度だけに掛かる。線画には影響しない）
+float adjust(float L, vec4 lv) {
+  return pow(clamp((L - 0.5) * lv.y + 0.5 + lv.x, 0.0, 1.0), lv.z);
+}
+
+struct Tone {
+  float v;       // 残る白（1 = 白）
+  float bits;    // 描かれた層のビット集合（統計用）
+  float solid;   // ベタの量
+  float L;       // 補正後の輝度
+};
+
+// 領域 r（0 人物 / 1 背景）のトーン層とベタ。重ねがけ: 残る白 = Π(1 − ink_i)
+Tone tone(float L0, int r, vec2 p) {
+  float L = adjust(L0, uLevels[r]);
+  int n = r == 0 ? uCount.x : uCount.y;
   float white = 1.0;
+  float bits = 0.0;
   for (int i = 0; i < 8; i++) {
-    if (i >= uCount) break;
-    vec4 A = uA[i];
-    vec4 B = uB[i];
+    if (i >= n) break;
+    vec4 A = uA[r * 8 + i];
+    vec4 B = uB[r * 8 + i];
     float m = below(L, A.x, A.y);
     if (m <= 0.0) continue;
+    if (m > 0.5) bits += exp2(float(i));
     // しきい値からどれだけ暗いか（0 = しきい値ちょうど、1 = 真っ黒）
     float t = clamp((A.x - L) / max(A.x, 1e-4), 0.0, 1.0);
     // 境界のぼかしは線を細らせて表す（灰色にはしない）
     float w = min(B.y * (1.0 + B.z * (2.0 * t - 1.0)) * m, B.x);
-    float u = dot(p, A.zw) / B.x + uC[i].x;
+    float u = dot(p, A.zw) / B.x + uC[r * 8 + i].x;
     u -= floor(u + 0.5);
     float dist = abs(u) * B.x;                 // 最寄りの線中心までの距離
     float h = 0.5 * w;
@@ -204,10 +229,28 @@ void main() {
     float ink = clamp(min(dist + 0.5, h) - max(dist - 0.5, -h), 0.0, 1.0);
     white *= 1.0 - ink * B.w;
   }
-  float v = white;
+  float s = uSolid[r].x > 0.5 ? below(L, uSolid[r].y, uSolid[r].z) : 0.0;
+  return Tone(white * (1.0 - s), bits, s, L);
+}
 
-  // --- ベタ ---
-  if (uSolid.x > 0.5) v *= 1.0 - below(L, uSolid.y, uSolid.z);
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  if (uMode != 0) {
+    // 格子の各マスの中から決まった位置の1画素を抜き出す（ハッチの周期と干渉しないよう位置をずらす）
+    vec2 cell = floor(gl_FragCoord.xy);
+    ip = clamp(ivec2((cell + hash2(cell)) * uSampleScale), ivec2(0), uSize - 1);
+  }
+  vec2 p = vec2(ip) + 0.5;
+  float L0 = texelFetch(uLum, ip, 0).r;
+
+  // --- 人物の重み（マスクが無ければ全体が人物） ---
+  float sd = 30000.0;
+  float pw = 1.0;
+  if (uHasMask == 1) {
+    sd = texelFetch(uSdf, ip, 0).r + uBg.y;
+    pw = clamp(sd + 0.5, 0.0, 1.0);
+  }
+  int mode = int(uBg.x + 0.5);
 
   // --- 線画 (XDoG) ---
   float line = 0.0;
@@ -216,19 +259,22 @@ void main() {
     float D = g.r - uLine.y * g.g;
     line = clamp(-tanh(uLine.w * (D - uLine.z)), 0.0, 1.0);
   }
-  v *= 1.0 - uLine.x * line;
+  float lineInk = uLine.x * line;
 
-  // --- 背景処理 ---
-  if (uBg.x > 0.5) {
-    float sd = texelFetch(uSdf, ip, 0).r + uBg.y;
-    float person = clamp(sd + 0.5, 0.0, 1.0);
-    if (uBg.x < 1.5) {
-      v = mix(1.0, v, person);
-      if (uBg.z > 0.0) v *= 1.0 - clamp(uBg.z - sd + 0.5, 0.0, 1.0) * person;
-    } else {
-      v = mix(1.0 - uBg.w * line, v, person);
-    }
+  // --- 人物 / 背景それぞれのトーンを作って、人物の重みで混ぜる ---
+  Tone tp = Tone(1.0, 0.0, 0.0, L0);
+  Tone tb = Tone(1.0, 0.0, 0.0, adjust(L0, uLevels[1]));
+  if (pw > 0.0) tp = tone(L0, 0, p);
+  float bgLine = lineInk;
+  if (mode == 0) {
+    if (pw < 1.0) tb = tone(L0, 1, p);
+  } else if (mode == 2) {
+    bgLine = uBg.w * line;
+  } else {
+    bgLine = 0.0;
   }
+  float v = mix(tb.v * (1.0 - bgLine), tp.v * (1.0 - lineInk), pw);
+  if (mode == 1 && uBg.z > 0.0) v *= 1.0 - clamp(uBg.z - sd + 0.5, 0.0, 1.0) * pw;   // シルエット線
 
   if (uBinary == 1) v = v >= 0.5 ? 1.0 : 0.0;
 
@@ -254,7 +300,17 @@ void main() {
     }
   }
 
-  o = vec4(v, 0.0, 0.0, 1.0);
+  if (uMode == 0) {
+    o = vec4(v, 0.0, 0.0, 1.0);
+  } else if (uMode == 1) {
+    // 出力値, 人物の重み, 線画の濃さ, ベタの量（画素が属する領域のもの）
+    bool person = pw >= 0.5;
+    o = vec4(v, pw, person ? lineInk : bgLine, person ? tp.solid : tb.solid);
+  } else {
+    // 元の輝度, 補正後の輝度, 描かれた層のビット集合（画素が属する領域のもの）
+    bool person = pw >= 0.5;
+    o = vec4(L0, person ? tp.L : tb.L, (person ? tp.bits : tb.bits) / 255.0, 1.0);
+  }
 }`;
 
 // 6. 表示: 出力テクスチャ（ミップマップ付き）を拡大縮小・移動して描く

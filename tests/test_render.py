@@ -175,7 +175,7 @@ def test_only_changed_passes_are_recomputed(page):
     assert {"smooth", "blur", "composite"} <= set(first)
     # ε・φ・濃さ・層の設定は合成パスだけ
     patch = {"lines": {"epsilon": -0.02, "phi": 50, "strength": 0.8, "tau": 0.97},
-             "layers": [layer(threshold=0.6)], "solid": {"threshold": 0.2}}
+             "layers": [layer(threshold=0.6)], "solid": {"threshold": 0.2}, "levels": {"brightness": 0.1}}
     cur = deep_merge(defaults, patch)
     assert page.evaluate(set_params, cur) == ["composite"]
     cur = deep_merge(cur, {"lines": {"sigma": 1.2}})             # σ はぼかしから
@@ -260,6 +260,7 @@ def test_background_disabled_without_mask(page):
     a = render(page, deep_merge(base, {"background": {"mode": "keep"}}))
     b = render(page, deep_merge(base, {"background": {"mode": "white"}}))
     assert (a == b).all()
+    page.locator('.tabs button[data-tab="background"]').click()
     assert page.locator("#bgControls.disabled").count() == 1
 
 
@@ -293,7 +294,7 @@ def test_params_save_and_reload_give_same_output(browser, owner_site):
     page.evaluate("() => window.inkdeus.save()")
     saved = json.loads((owner_site.out / "halves.inkdeus.json").read_text(encoding="utf-8"))
     assert saved == page.evaluate("() => window.inkdeus.getParams()")
-    assert saved["layers"][0]["angle"] == 30 and saved["version"] == 1
+    assert saved["regions"]["person"]["layers"][0]["angle"] == 30 and saved["version"] == 2
     page.close()
 
     page = open_page(browser, owner_site.url)       # 開き直して保存済みの設定を読む
@@ -319,30 +320,56 @@ def test_binary_output_is_pure_black_and_white(page):
 def test_unknown_keys_are_reported_and_missing_keys_filled(page):
     open_image(page, "white.png")
     result = page.evaluate("""() => window.inkdeus.setParams({
-        version: 1, mystery: 1, lines: { sigma: 1.0, bogus: true, phi: 'x' },
-        layers: [{ type: 'kakeami', threshold: 0.4, extra: 0 }], solid: { threshold: 9 },
+        version: 2, mystery: 1, lines: { sigma: 1.0, bogus: true, phi: 'x' },
+        regions: {
+            person: { layers: [{ type: 'kakeami', threshold: 0.4, extra: 0 }], solid: { threshold: 9 }, hue: 1 },
+            sky: {},
+        },
     })""")
     text = "\n".join(result["warnings"])
-    for needle in ("未知のキー: mystery", "未知のキー: lines.bogus", "lines.phi", "layers[0].type",
-                   "未知のキー: layers[0].extra", "solid.threshold"):
+    for needle in ("未知のキー: mystery", "未知のキー: lines.bogus", "lines.phi", "regions.person.layers[0].type",
+                   "未知のキー: regions.person.layers[0].extra", "regions.person.solid.threshold",
+                   "未知のキー: regions.person.hue", "未知のキー: regions.sky"):
         assert needle in text, text
     params = page.evaluate("() => window.inkdeus.getParams()")
     defaults = page.evaluate("() => window.inkdeus.defaults()")
     assert params["lines"]["sigma"] == 1.0 and params["lines"]["phi"] == defaults["lines"]["phi"]
-    assert params["background"] == defaults["background"]
-    assert params["layers"][0]["type"] == "hatch" and params["layers"][0]["threshold"] == 0.4
-    assert params["solid"]["threshold"] == 1
+    assert params["regions"]["background"] == defaults["regions"]["background"]
+    person = params["regions"]["person"]
+    assert person["layers"][0]["type"] == "hatch" and person["layers"][0]["threshold"] == 0.4
+    assert person["solid"]["threshold"] == 1
+    assert person["levels"] == {"brightness": 0, "contrast": 1, "gamma": 1}
     assert page.locator("#messages .msg").count() >= 1      # 画面にも警告が出る
+
+
+def test_old_format_is_migrated(page):
+    """旧形式（トップレベルに solid / layers / background）は人物・背景の領域へ移して読む"""
+    open_image(page, "scene.png")
+    old = {"version": 1, "unit": 1, "solid": {"enabled": True, "threshold": 0.3},
+           "layers": [layer(threshold=0.66, angle=20)],
+           "background": {"mode": "white", "grow": 7, "silhouetteWidth": 2, "lineStrength": 0.4}}
+    result = page.evaluate("(p) => window.inkdeus.setParams(p)", old)
+    assert result["warnings"] == []
+    params = page.evaluate("() => window.inkdeus.getParams()")
+    assert params["version"] == 2 and "layers" not in params and "solid" not in params
+    assert params["regions"]["person"]["solid"]["threshold"] == 0.3
+    assert [l["angle"] for l in params["regions"]["person"]["layers"]] == [20]
+    bg = params["regions"]["background"]
+    assert (bg["mode"], bg["grow"], bg["lineStrength"], bg["linked"]) == ("white", 7, 0.4, True)
 
 
 def test_default_preset_values(page):
     d = page.evaluate("() => window.inkdeus.defaults()")
-    got = [(l["threshold"], l["angle"], l["spacing"], l["width"]) for l in d["layers"]]
+    person = d["regions"]["person"]
+    got = [(l["threshold"], l["angle"], l["spacing"], l["width"]) for l in person["layers"]]
     assert got == [(0.72, 45, 2.0, 0.5), (0.52, 135, 2.0, 0.5), (0.38, 0, 2.0, 0.5), (0.27, 90, 2.0, 0.5)]
-    assert d["layers"][0]["widthByDarkness"] == 0.6
-    assert d["solid"]["threshold"] == 0.15 and d["solid"]["enabled"] is True
-    assert all(l["type"] == "hatch" for l in d["layers"])
-    assert page.evaluate("() => window.inkdeus.presets()") == ["kasane4", "single", "lineonly"]
+    assert person["layers"][0]["widthByDarkness"] == 0.6
+    assert person["solid"]["threshold"] == 0.15 and person["solid"]["enabled"] is True
+    assert all(l["type"] == "hatch" for l in person["layers"])
+    assert d["regions"]["background"]["linked"] is True and d["regions"]["background"]["mode"] == "keep"
+    styles = page.evaluate("() => window.inkdeus.styles()")
+    assert {"hatch1", "hatch1-fine", "crosshatch", "crosshatch-fine", "crosshatch-ultrafine",
+            "lines-only", "white"} <= set(styles)
     assert d["unit"] is None
     open_image(page, "scene.png")
     page.evaluate("() => window.inkdeus.setParams({})")
@@ -437,7 +464,7 @@ def test_watermark_lower_limits(plain_page, site):
                            deep_merge(BLANK, {"watermark": {"enabled": False, "text": "   ", "size": 1, "opacity": 0}}))
     assert any("watermark.size" in w for w in result["warnings"])
     assert any("watermark.opacity" in w for w in result["warnings"])
-    fields = page.evaluate("() => window.inkdeus.fields().watermark")
+    fields = page.evaluate("() => window.inkdeus.schema().sections.watermark")
     wm = page.evaluate("() => window.inkdeus.watermark()")
     assert fields["size"]["min"] >= 8 and fields["opacity"]["min"] >= 0.15
     assert wm["size"] >= fields["size"]["min"] and wm["opacity"] >= fields["opacity"]["min"]
@@ -478,19 +505,19 @@ def test_undo_redo_and_slider_reset(page):
     page.keyboard.press("Control+y")
     assert page.evaluate(get_sigma) == 2
     row.locator("label").dblclick()                 # ダブルクリックで既定値
-    assert page.evaluate(get_sigma) == page.evaluate("() => window.inkdeus.fields().lines.sigma.def")
+    assert page.evaluate(get_sigma) == page.evaluate("() => window.inkdeus.schema().sections.lines.sigma.def")
 
 
 def test_layer_list_editing(page):
     open_image(page, "gray.png")
     page.evaluate("() => window.inkdeus.setParams({ unit: 1 })")
-    count = "() => window.inkdeus.getParams().layers.length"
+    count = "() => window.inkdeus.getParams().regions.person.layers.length"
     assert page.evaluate(count) == 4
     page.locator("#btnAddLayer").click()
     assert page.evaluate(count) == 5
     first = page.locator('.layer[data-layer="0"]')
     first.get_by_title("複製").click()
-    layers = page.evaluate("() => window.inkdeus.getParams().layers")
+    layers = page.evaluate("() => window.inkdeus.getParams().regions.person.layers")
     assert len(layers) == 6 and layers[0] == layers[1]
     page.locator('.layer[data-layer="0"]').get_by_title("下へ").click()
     page.locator('.layer[data-layer="5"]').get_by_title("削除").click()
@@ -506,9 +533,9 @@ def test_layer_list_editing(page):
     page.evaluate("() => window.inkdeus.render()")
     assert (pixels(page) == normal).all()
     # プリセット
-    page.locator("#selPreset").select_option("lineonly")
+    page.locator("#selPreset").select_option("lines-only")
     assert page.evaluate(count) == 0
-    assert page.evaluate("() => window.inkdeus.getParams().solid.enabled") is False
+    assert page.evaluate("() => window.inkdeus.getParams().regions.person.solid.enabled") is False
     for _ in range(9):                              # 層は最大 8
         if page.locator("#btnAddLayer").is_enabled():
             page.locator("#btnAddLayer").click()
@@ -561,7 +588,7 @@ def test_standalone_mode_without_api(browser, site, tmp_path):
             "background": {"mode": "white", "grow": 4}, "watermark": {"enabled": False},
             "layers": [layer(threshold=0.6)]})), encoding="utf-8")
         page.set_input_files("#fileParams", str(params_file))
-        page.wait_for_function("() => window.inkdeus.getParams().background.mode === 'white'")
+        page.wait_for_function("() => window.inkdeus.getParams().regions.background.mode === 'white'")
         page.evaluate("() => window.inkdeus.render()")
         img = pixels(page)
         wm = page.evaluate("() => window.inkdeus.watermark()")
@@ -616,6 +643,12 @@ def test_large_image_end_to_end(browser, owner_site, capsys):
                               deep_merge(params, {"layers": [layer(threshold=0.6, widthByDarkness=0.5)]}))
         t_tweak = time.time() - t0
         assert tweak["passes"] == ["composite"]
+        t0 = time.time()
+        heavy = page.evaluate("(p) => window.inkdeus.setParams(p)",
+                              deep_merge(params, {"lines": {"sigma": 1.0}, "input": {"smoothRadius": 2.5}}))
+        t_heavy = time.time() - t0
+        assert set(heavy["passes"]) == {"smooth", "blur", "composite"}
+        page.evaluate("(p) => window.inkdeus.setParams(p)", params)
         stats = page.evaluate("""() => {
             const px = window.inkdeus.readPixels(0, 1800, 5120, 64);
             let sum = 0, dark = 0;
@@ -640,9 +673,10 @@ def test_large_image_end_to_end(browser, owner_site, capsys):
         assert page.errors == []
         with capsys.disabled():
             print(f"\n[5120x3840] renderer={info['renderer']}"
-                  f"\n  読み込み〜最初の描画: {t_load:.1f}s / 全パス再描画: {t_render:.1f}s"
-                  f"（内部計測 {first['ms']:.0f}ms, passes={first['passes']}）"
+                  f"\n  読み込み〜最初の描画（距離場の作成を含む）: {t_load:.1f}s"
+                  f"\n  設定変更後の再描画: {t_render:.1f}s（内部計測 {first['ms']:.0f}ms, passes={first['passes']}）"
                   f"\n  合成だけの再描画: {t_tweak:.1f}s（内部計測 {tweak['ms']:.0f}ms）"
+                  f"\n  平滑化＋ぼかし＋合成の再描画: {t_heavy:.1f}s（内部計測 {heavy['ms']:.0f}ms）"
                   f"\n  書き出し（PNG 化＋保存）: {t_export:.1f}s / {path.stat().st_size / 1e6:.1f} MB")
     finally:
         page.close()

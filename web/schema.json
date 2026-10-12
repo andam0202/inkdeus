@@ -1,0 +1,145 @@
+{
+  "version": 2,
+  "maxLayers": 8,
+  "unitBaseWidth": 1280,
+  "unitRange": { "min": 0.1, "max": 16 },
+  "watermarkFallbackText": "inkdeus",
+  "sections": {
+    "input": {
+      "autoLevel": { "type": "bool", "def": true, "label": "自動レベル補正（1〜99%）" },
+      "smoothRadius": { "type": "range", "def": 2.0, "min": 0, "max": 12, "step": 0.1, "px": true, "label": "平滑化の半径" },
+      "smoothStrength": { "type": "range", "def": 0.1, "min": 0, "max": 0.5, "step": 0.005, "label": "平滑化の強さ" }
+    },
+    "lines": {
+      "enabled": { "type": "bool", "def": true, "label": "線画を描く" },
+      "sigma": { "type": "range", "def": 0.8, "min": 0.2, "max": 4, "step": 0.05, "px": true, "label": "線の太さ σ" },
+      "tau": { "type": "range", "def": 0.98, "min": 0.8, "max": 1.0, "step": 0.001, "label": "τ（大きいほど線が増える）" },
+      "epsilon": { "type": "range", "def": -0.01, "min": -0.1, "max": 0.05, "step": 0.001, "label": "しきい値 ε" },
+      "phi": { "type": "range", "def": 100, "min": 1, "max": 400, "step": 1, "label": "鋭さ φ" },
+      "strength": { "type": "range", "def": 1.0, "min": 0, "max": 1, "step": 0.01, "label": "濃さ" }
+    },
+    "watermark": {
+      "enabled": { "type": "bool", "def": true, "ownerDef": false, "label": "透かしを入れる" },
+      "text": { "type": "text", "def": "inkdeus", "maxLength": 64, "label": "文字列" },
+      "position": {
+        "type": "select", "def": "br", "label": "位置",
+        "options": [["br", "右下"], ["bl", "左下"], ["tr", "右上"], ["tl", "左上"], ["center", "中央"], ["tile", "タイル状の繰り返し"]]
+      },
+      "size": { "type": "range", "def": 14, "min": 8, "max": 120, "step": 1, "px": true, "label": "大きさ" },
+      "opacity": { "type": "range", "def": 0.35, "min": 0.15, "max": 1, "step": 0.01, "label": "濃さ" }
+    },
+    "output": {
+      "binary": { "type": "bool", "def": false, "label": "純2値（白と黒だけ）" }
+    }
+  },
+  "levels": {
+    "brightness": { "type": "range", "def": 0, "min": -1, "max": 1, "step": 0.01, "label": "明るさ" },
+    "contrast": { "type": "range", "def": 1, "min": 0, "max": 3, "step": 0.01, "label": "コントラスト" },
+    "gamma": { "type": "range", "def": 1, "min": 0.2, "max": 5, "step": 0.01, "label": "ガンマ（大きいほど明るい）" }
+  },
+  "solid": {
+    "enabled": { "type": "bool", "def": true, "label": "ベタを塗る" },
+    "threshold": { "type": "range", "def": 0.15, "min": 0, "max": 1, "step": 0.005, "label": "ベタのしきい値" },
+    "soft": { "type": "range", "def": 0.0, "min": 0, "max": 0.3, "step": 0.005, "label": "ベタの境界のぼかし幅" }
+  },
+  "background": {
+    "mode": {
+      "type": "select", "def": "keep", "label": "背景の描き方",
+      "options": [["keep", "そのまま（層で描く）"], ["white", "白"], ["lines", "線だけ"]]
+    },
+    "linked": { "type": "bool", "def": true, "label": "人物と同じ設定を使う" },
+    "grow": { "type": "range", "def": 3.0, "min": -20, "max": 40, "step": 0.5, "px": true, "label": "マスクの広げ/縮め" },
+    "silhouetteWidth": { "type": "range", "def": 1.5, "min": 0, "max": 10, "step": 0.1, "px": true, "label": "シルエット線の太さ" },
+    "lineStrength": { "type": "range", "def": 0.6, "min": 0, "max": 1, "step": 0.01, "label": "背景の線の濃さ（線だけ）" }
+  },
+  "layer": {
+    "type": { "type": "select", "def": "hatch", "label": "種類", "options": [["hatch", "ハッチ"]] },
+    "enabled": { "type": "bool", "def": true, "label": "表示" },
+    "threshold": { "type": "range", "def": 0.5, "min": 0, "max": 1, "step": 0.005, "label": "しきい値" },
+    "soft": { "type": "range", "def": 0.03, "min": 0, "max": 0.3, "step": 0.005, "label": "境界のぼかし幅" },
+    "angle": { "type": "range", "def": 45, "min": 0, "max": 180, "step": 1, "label": "角度 (°)" },
+    "spacing": { "type": "range", "def": 2.0, "min": 0.5, "max": 20, "step": 0.1, "px": true, "label": "線の間隔" },
+    "width": { "type": "range", "def": 0.5, "min": 0.05, "max": 10, "step": 0.05, "px": true, "label": "線の太さ" },
+    "widthByDarkness": { "type": "range", "def": 0.0, "min": 0, "max": 1, "step": 0.01, "label": "暗さで太さを変える" },
+    "opacity": { "type": "range", "def": 1.0, "min": 0, "max": 1, "step": 0.01, "label": "濃さ" },
+    "phase": { "type": "range", "def": 0.0, "min": 0, "max": 1, "step": 0.01, "label": "位相ずらし" }
+  },
+  "defaultStyle": "crosshatch",
+  "styles": {
+    "hatch1": {
+      "label": "ハッチ1層",
+      "aliases": ["ハッチ(1)", "ハッチ（1）", "ハッチ1", "ハッチ", "hatch(1)", "hatch"],
+      "description": "平行線1層。暗いほど線が太くなる。ベタは濃い所だけ",
+      "backgroundMode": "keep",
+      "solid": { "enabled": true, "threshold": 0.12, "soft": 0 },
+      "layers": [
+        { "type": "hatch", "threshold": 0.72, "angle": 45, "spacing": 2.0, "width": 0.5, "widthByDarkness": 0.8 }
+      ]
+    },
+    "hatch1-fine": {
+      "label": "単層の細ハッチ",
+      "aliases": ["ハッチ(1)細", "ハッチ1細", "細ハッチ", "単層の細ハッチ"],
+      "description": "平行線1層・細かい間隔（1.5）",
+      "backgroundMode": "keep",
+      "solid": { "enabled": true, "threshold": 0.12, "soft": 0 },
+      "layers": [
+        { "type": "hatch", "threshold": 0.72, "angle": 45, "spacing": 1.5, "width": 0.4, "widthByDarkness": 0.8 }
+      ]
+    },
+    "crosshatch": {
+      "label": "重ねがけ4段",
+      "aliases": ["クロスハッチ", "重ねがけ", "重ねがけ4段", "crosshatch4"],
+      "description": "4方向の平行線を暗さに応じて重ねる（既定）。間隔 2.0",
+      "backgroundMode": "keep",
+      "solid": { "enabled": true, "threshold": 0.15, "soft": 0 },
+      "layers": [
+        { "type": "hatch", "threshold": 0.72, "angle": 45, "spacing": 2.0, "width": 0.5, "widthByDarkness": 0.6 },
+        { "type": "hatch", "threshold": 0.52, "angle": 135, "spacing": 2.0, "width": 0.5 },
+        { "type": "hatch", "threshold": 0.38, "angle": 0, "spacing": 2.0, "width": 0.5 },
+        { "type": "hatch", "threshold": 0.27, "angle": 90, "spacing": 2.0, "width": 0.5 }
+      ]
+    },
+    "crosshatch-fine": {
+      "label": "重ねがけ4段・細",
+      "aliases": ["クロスハッチ細", "クロスハッチ(細)", "重ねがけ細"],
+      "description": "重ねがけ4段の細かい版。間隔 1.5",
+      "backgroundMode": "keep",
+      "solid": { "enabled": true, "threshold": 0.15, "soft": 0 },
+      "layers": [
+        { "type": "hatch", "threshold": 0.72, "angle": 45, "spacing": 1.5, "width": 0.38, "widthByDarkness": 0.6 },
+        { "type": "hatch", "threshold": 0.52, "angle": 135, "spacing": 1.5, "width": 0.38 },
+        { "type": "hatch", "threshold": 0.38, "angle": 0, "spacing": 1.5, "width": 0.38 },
+        { "type": "hatch", "threshold": 0.27, "angle": 90, "spacing": 1.5, "width": 0.38 }
+      ]
+    },
+    "crosshatch-ultrafine": {
+      "label": "重ねがけ4段・極細",
+      "aliases": ["クロスハッチ極細", "クロスハッチ(極細)", "重ねがけ極細", "極細クロスハッチ"],
+      "description": "重ねがけ4段の極細版。間隔 1.0",
+      "backgroundMode": "keep",
+      "solid": { "enabled": true, "threshold": 0.15, "soft": 0 },
+      "layers": [
+        { "type": "hatch", "threshold": 0.72, "angle": 45, "spacing": 1.0, "width": 0.25, "widthByDarkness": 0.6 },
+        { "type": "hatch", "threshold": 0.52, "angle": 135, "spacing": 1.0, "width": 0.25 },
+        { "type": "hatch", "threshold": 0.38, "angle": 0, "spacing": 1.0, "width": 0.25 },
+        { "type": "hatch", "threshold": 0.27, "angle": 90, "spacing": 1.0, "width": 0.25 }
+      ]
+    },
+    "lines-only": {
+      "label": "網点なし・線画のみ",
+      "aliases": ["線だけ", "線画のみ", "線のみ", "lines"],
+      "description": "トーンもベタも無し。背景に当てると「線だけ」になる",
+      "backgroundMode": "lines",
+      "solid": { "enabled": false, "threshold": 0.15, "soft": 0 },
+      "layers": []
+    },
+    "white": {
+      "label": "白",
+      "aliases": ["白", "白抜き", "真っ白"],
+      "description": "背景に当てると完全な白（人物のシルエット線つき）。人物に当てるとトーンとベタ無し",
+      "backgroundMode": "white",
+      "solid": { "enabled": false, "threshold": 0.15, "soft": 0 },
+      "layers": []
+    }
+  }
+}

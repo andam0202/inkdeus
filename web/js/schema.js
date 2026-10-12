@@ -1,112 +1,29 @@
-// 設定JSONの真実の源: キー・既定値・値域・UI ラベルはすべてここで定義する。
-// px: true の値は「基準px」（実際の描画では unit 倍される）。
+// 設定JSONの扱い（既定値で補う・検証・旧形式の移行・スタイルの適用）。
+// キー・既定値・値域・ラベル・名前付きスタイルの定義は web/schema.json が真実の源で、
+// サーバ側（src/inkdeus/schema.py）も同じファイルを読む。
 
-export const VERSION = 1;
-export const MAX_LAYERS = 8;
-export const UNIT_BASE_WIDTH = 1280;      // unit の自動値 = 画像の幅 / これ
-export const UNIT_RANGE = { min: 0.1, max: 16 };
-export const WATERMARK_FALLBACK_TEXT = 'inkdeus';
+export const SCHEMA = await (await fetch(new URL('../schema.json', import.meta.url), { cache: 'no-store' })).json();
 
-const range = (def, min, max, step, label, extra = {}) =>
-  ({ type: 'range', def, min, max, step, label, ...extra });
-const bool = (def, label, extra = {}) => ({ type: 'bool', def, label, ...extra });
-const select = (def, options, label) => ({ type: 'select', def, options, label });
-const text = (def, label, maxLength = 64) => ({ type: 'text', def, label, maxLength });
-
-export const FIELDS = {
-  input: {
-    autoLevel: bool(true, '自動レベル補正（1〜99%）'),
-    smoothRadius: range(2.0, 0, 12, 0.1, '平滑化の半径', { px: true }),
-    smoothStrength: range(0.10, 0, 0.5, 0.005, '平滑化の強さ'),
-  },
-  lines: {
-    enabled: bool(true, '線画を描く'),
-    sigma: range(0.8, 0.2, 4, 0.05, '線の太さ σ', { px: true }),
-    tau: range(0.98, 0.8, 1.0, 0.001, 'τ（大きいほど線が増える）'),
-    epsilon: range(-0.01, -0.1, 0.05, 0.001, 'しきい値 ε'),
-    phi: range(100, 1, 400, 1, '鋭さ φ'),
-    strength: range(1.0, 0, 1, 0.01, '濃さ'),
-  },
-  solid: {
-    enabled: bool(true, 'ベタを塗る'),
-    threshold: range(0.15, 0, 1, 0.005, 'しきい値'),
-    soft: range(0.0, 0, 0.3, 0.005, '境界のぼかし幅'),
-  },
-  background: {
-    mode: select('keep', [['keep', 'そのまま'], ['white', '白'], ['lines', '線だけ']], '背景'),
-    grow: range(3.0, -20, 40, 0.5, 'マスクの広げ/縮め', { px: true }),
-    silhouetteWidth: range(1.5, 0, 10, 0.1, 'シルエット線の太さ', { px: true }),
-    lineStrength: range(0.6, 0, 1, 0.01, '背景の線の濃さ'),
-  },
-  watermark: {
-    // enabled は所有者モードのときだけ意味を持つ（それ以外では常に透かしを入れる）。
-    // 大きさと濃さの下限は「見えなくできない」ための下限。
-    enabled: bool(true, '透かしを入れる', { ownerDef: false }),
-    text: text(WATERMARK_FALLBACK_TEXT, '文字列'),
-    position: select('br', [['br', '右下'], ['bl', '左下'], ['tr', '右上'], ['tl', '左上'],
-      ['center', '中央'], ['tile', 'タイル状の繰り返し']], '位置'),
-    size: range(14, 8, 120, 1, '大きさ', { px: true }),
-    opacity: range(0.35, 0.15, 1, 0.01, '濃さ'),
-  },
-  output: {
-    binary: bool(false, '純2値（白と黒だけ）'),
-  },
-};
-
-export const LAYER_FIELDS = {
-  type: select('hatch', [['hatch', 'ハッチ']], '種類'),
-  enabled: bool(true, '表示'),
-  threshold: range(0.5, 0, 1, 0.005, 'しきい値'),
-  soft: range(0.03, 0, 0.3, 0.005, '境界のぼかし幅'),
-  angle: range(45, 0, 180, 1, '角度 (°)'),
-  spacing: range(2.0, 0.5, 20, 0.1, '線の間隔', { px: true }),
-  width: range(0.5, 0.05, 10, 0.05, '線の太さ', { px: true }),
-  widthByDarkness: range(0.0, 0, 1, 0.01, '暗さで太さを変える'),
-  opacity: range(1.0, 0, 1, 0.01, '濃さ'),
-  phase: range(0.0, 0, 1, 0.01, '位相ずらし'),
-};
-
-export const SECTION_LABELS = {
-  input: '入力', lines: '線画', solid: 'ベタ', layers: 'トーン層',
-  background: '背景', watermark: '透かし', output: '出力',
-};
-
-const layer = (o) => ({ type: 'hatch', ...o });
-
-// プリセットは「トーン層とベタ」だけを差し替える（線画・背景・透かしはそのまま）
-export const PRESETS = {
-  kasane4: {
-    label: '重ねがけ4段',
-    solid: { enabled: true, threshold: 0.15, soft: 0 },
-    layers: [
-      layer({ threshold: 0.72, angle: 45, spacing: 2.0, width: 0.5, widthByDarkness: 0.6 }),
-      layer({ threshold: 0.52, angle: 135, spacing: 2.0, width: 0.5 }),
-      layer({ threshold: 0.38, angle: 0, spacing: 2.0, width: 0.5 }),
-      layer({ threshold: 0.27, angle: 90, spacing: 2.0, width: 0.5 }),
-    ],
-  },
-  single: {
-    label: '単層の細ハッチ',
-    solid: { enabled: true, threshold: 0.22, soft: 0 },
-    layers: [
-      layer({ threshold: 0.72, angle: 45, spacing: 2.0, width: 0.5, widthByDarkness: 0.8 }),
-    ],
-  },
-  lineonly: {
-    label: '網点なし・線画のみ',
-    solid: { enabled: false, threshold: 0.15, soft: 0 },
-    layers: [],
-  },
-};
-export const DEFAULT_PRESET = 'kasane4';
+export const VERSION = SCHEMA.version;
+export const MAX_LAYERS = SCHEMA.maxLayers;
+export const UNIT_RANGE = SCHEMA.unitRange;
+export const WATERMARK_FALLBACK_TEXT = SCHEMA.watermarkFallbackText;
+export const SECTIONS = SCHEMA.sections;          // input / lines / watermark / output
+export const LEVEL_FIELDS = SCHEMA.levels;
+export const SOLID_FIELDS = SCHEMA.solid;
+export const BACKGROUND_FIELDS = SCHEMA.background;
+export const LAYER_FIELDS = SCHEMA.layer;
+export const STYLES = SCHEMA.styles;
+export const REGIONS = ['person', 'background'];
 
 const isObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
+const clone = (v) => JSON.parse(JSON.stringify(v));
 
-function fieldDefault(f, owner) {
+export function fieldDefault(f, owner) {
   return owner && 'ownerDef' in f ? f.ownerDef : f.def;
 }
 
-function normValue(v, f, path, warnings, owner) {
+function normValue(v, f, path, problems, owner) {
   const def = fieldDefault(f, owner);
   if (v === undefined) return def;
   switch (f.type) {
@@ -116,7 +33,7 @@ function normValue(v, f, path, warnings, owner) {
     case 'range':
       if (typeof v === 'number' && Number.isFinite(v)) {
         const c = Math.min(f.max, Math.max(f.min, v));
-        if (c !== v) warnings.push(`${path}: ${v} は範囲外のため ${c} に丸めました`);
+        if (c !== v) problems.push(`${path}: ${v} は範囲外（${f.min}〜${f.max}）のため ${c} に丸めました`);
         return c;
       }
       break;
@@ -127,37 +44,73 @@ function normValue(v, f, path, warnings, owner) {
       if (typeof v === 'string') return v.slice(0, f.maxLength);
       break;
   }
-  warnings.push(`${path}: 値 ${JSON.stringify(v)} は使えないため既定値にしました`);
+  problems.push(`${path}: 値 ${JSON.stringify(v)} は使えないため既定値にしました`);
   return def;
 }
 
-function normSection(raw, fields, path, warnings, owner) {
+/** raw（オブジェクト）を fields に従って整える。extra は fields 以外に許すキー */
+function normFields(raw, fields, path, problems, owner, extra = []) {
   if (raw !== undefined && !isObject(raw)) {
-    warnings.push(`${path}: オブジェクトではないため既定値にしました`);
+    problems.push(`${path}: オブジェクトではないため既定値にしました`);
     raw = undefined;
   }
   const src = raw || {};
   for (const key of Object.keys(src)) {
-    if (!(key in fields)) warnings.push(`未知のキー: ${path}.${key}`);
+    if (!(key in fields) && !extra.includes(key)) problems.push(`未知のキー: ${path}.${key}`);
   }
   const out = {};
   for (const [key, f] of Object.entries(fields)) {
-    out[key] = normValue(src[key], f, `${path}.${key}`, warnings, owner);
+    out[key] = normValue(src[key], f, `${path}.${key}`, problems, owner);
   }
   return out;
+}
+
+function normLayers(raw, path, problems, fallback) {
+  let layers = raw === undefined ? fallback : raw;
+  if (!Array.isArray(layers)) {
+    problems.push(`${path}: 配列ではないため既定値にしました`);
+    layers = fallback;
+  }
+  if (layers.length > MAX_LAYERS) {
+    problems.push(`${path}: ${layers.length} 層あります。先頭の ${MAX_LAYERS} 層だけ使います`);
+    layers = layers.slice(0, MAX_LAYERS);
+  }
+  return layers.map((l, i) => normFields(l, LAYER_FIELDS, `${path}[${i}]`, problems, false));
+}
+
+/** 領域（人物 / 背景）に共通の levels・solid・layers を out に足す */
+function normRegionTone(src, out, path, problems) {
+  const style = STYLES[SCHEMA.defaultStyle];
+  out.levels = normFields(src.levels, LEVEL_FIELDS, `${path}.levels`, problems, false);
+  out.solid = normFields(src.solid === undefined ? style.solid : src.solid, SOLID_FIELDS, `${path}.solid`, problems, false);
+  out.layers = normLayers(src.layers, `${path}.layers`, problems, style.layers);
+}
+
+/** 旧形式（version 1: トップレベルに solid / layers / background）を領域別の形へ移す */
+export function migrate(raw) {
+  if (!isObject(raw)) return raw;
+  const old = 'solid' in raw || 'layers' in raw || 'background' in raw || raw.version === 1;
+  if (!old || 'regions' in raw) return raw;
+  const { solid, layers, background, ...rest } = raw;
+  const person = {};
+  if (solid !== undefined) person.solid = solid;
+  if (layers !== undefined) person.layers = layers;
+  return { ...rest, version: VERSION, regions: { person, background: background === undefined ? {} : background } };
 }
 
 /**
  * 任意の JSON を設定オブジェクトに整える。欠けたキーは既定値で補い、
  * 未知のキー・使えない値は warnings に積む（黙って無視しない）。
  */
-export function normalize(raw, { owner = false } = {}) {
+export function normalize(input, { owner = false } = {}) {
   const warnings = [];
+  let raw = input;
   if (!isObject(raw)) {
     if (raw !== undefined && raw !== null) warnings.push('設定がオブジェクトではないため既定値にしました');
     raw = {};
   }
-  const known = new Set(['version', 'unit', 'layers', ...Object.keys(FIELDS)]);
+  raw = migrate(raw);
+  const known = new Set(['version', 'unit', 'regions', ...Object.keys(SECTIONS)]);
   for (const key of Object.keys(raw)) {
     if (!known.has(key)) warnings.push(`未知のキー: ${key}`);
   }
@@ -168,27 +121,32 @@ export function normalize(raw, { owner = false } = {}) {
   if (raw.unit !== undefined && raw.unit !== null) {
     if (typeof raw.unit === 'number' && Number.isFinite(raw.unit) && raw.unit > 0) {
       params.unit = Math.min(UNIT_RANGE.max, Math.max(UNIT_RANGE.min, raw.unit));
+      if (params.unit !== raw.unit) warnings.push(`unit: ${raw.unit} は範囲外のため ${params.unit} に丸めました`);
     } else {
       warnings.push(`unit: 値 ${JSON.stringify(raw.unit)} は使えないため自動にしました`);
     }
   }
-  const preset = PRESETS[DEFAULT_PRESET];
-  for (const [section, fields] of Object.entries(FIELDS)) {
-    const src = raw[section] === undefined && section === 'solid' ? preset.solid : raw[section];
-    params[section] = normSection(src, fields, section, warnings, owner);
-    if (section === 'solid') {
-      let layers = raw.layers === undefined ? preset.layers : raw.layers;
-      if (!Array.isArray(layers)) {
-        warnings.push('layers: 配列ではないため既定値にしました');
-        layers = preset.layers;
-      }
-      if (layers.length > MAX_LAYERS) {
-        warnings.push(`layers: ${layers.length} 層あります。先頭の ${MAX_LAYERS} 層だけ使います`);
-        layers = layers.slice(0, MAX_LAYERS);
-      }
-      params.layers = layers.map((l, i) => normSection(l, LAYER_FIELDS, `layers[${i}]`, warnings, owner));
-    }
+  params.input = normFields(raw.input, SECTIONS.input, 'input', warnings, owner);
+  params.lines = normFields(raw.lines, SECTIONS.lines, 'lines', warnings, owner);
+
+  let regions = raw.regions;
+  if (regions !== undefined && !isObject(regions)) {
+    warnings.push('regions: オブジェクトではないため既定値にしました');
+    regions = undefined;
   }
+  regions = regions || {};
+  for (const key of Object.keys(regions)) {
+    if (!REGIONS.includes(key)) warnings.push(`未知のキー: regions.${key}`);
+  }
+  const tone = ['levels', 'solid', 'layers'];
+  const personSrc = normFields(regions.person, {}, 'regions.person', warnings, owner, tone);
+  normRegionTone(isObject(regions.person) ? regions.person : {}, personSrc, 'regions.person', warnings);
+  const bg = normFields(regions.background, BACKGROUND_FIELDS, 'regions.background', warnings, owner, tone);
+  normRegionTone(isObject(regions.background) ? regions.background : {}, bg, 'regions.background', warnings);
+  params.regions = { person: personSrc, background: bg };
+
+  params.watermark = normFields(raw.watermark, SECTIONS.watermark, 'watermark', warnings, owner);
+  params.output = normFields(raw.output, SECTIONS.output, 'output', warnings, owner);
   return { params, warnings };
 }
 
@@ -197,20 +155,64 @@ export function defaultParams(opts) {
 }
 
 export function newLayer(overrides = {}) {
-  return normSection(overrides, LAYER_FIELDS, 'layer', [], false);
+  return normFields(overrides, LAYER_FIELDS, 'layer', [], false);
 }
 
-/** プリセットを適用した新しい設定を返す（トーン層とベタだけ差し替え） */
-export function applyPreset(params, key, opts) {
-  const p = PRESETS[key];
-  if (!p) return params;
-  return normalize({ ...params, solid: p.solid, layers: p.layers }, opts).params;
+const styleKeyOf = (s) => String(s).normalize('NFKC').toLowerCase().replace(/[\s_]/g, '');
+
+/** スタイル名（キーまたは別名）からキーを引く。無ければ null */
+export function resolveStyle(name) {
+  const want = styleKeyOf(name);
+  for (const [key, style] of Object.entries(STYLES)) {
+    if (styleKeyOf(key) === want || styleKeyOf(style.label) === want
+      || (style.aliases || []).some((a) => styleKeyOf(a) === want)) return key;
+  }
+  return null;
+}
+
+/**
+ * 名前付きスタイルを領域に適用した新しい設定を返す。
+ * 人物: ベタと層を差し替える。背景: 人物との連動を切り、描き方・ベタ・層を差し替える。
+ */
+export function applyStyle(params, name, region = 'person') {
+  const key = resolveStyle(name);
+  if (!key) throw new Error(`スタイルが見つかりません: ${name}`);
+  const style = STYLES[key];
+  const next = clone(params);
+  const fill = (target) => {
+    target.solid = { ...target.solid, ...clone(style.solid) };
+    target.layers = style.layers.map((l) => newLayer(l));
+  };
+  if (region === 'person' || region === 'both') fill(next.regions.person);
+  if (region === 'background' || region === 'both') {
+    const bg = next.regions.background;
+    if (bg.linked) bg.levels = clone(next.regions.person.levels);
+    bg.linked = false;
+    bg.mode = style.backgroundMode;
+    fill(bg);
+  }
+  return next;
 }
 
 /** 実際に使う unit（null なら画像の幅から自動） */
 export function effectiveUnit(params, imageWidth) {
   if (typeof params.unit === 'number') return params.unit;
-  return Math.max(UNIT_RANGE.min, (imageWidth || UNIT_BASE_WIDTH) / UNIT_BASE_WIDTH);
+  return Math.max(UNIT_RANGE.min, (imageWidth || SCHEMA.unitBaseWidth) / SCHEMA.unitBaseWidth);
+}
+
+/**
+ * 実際に描く領域別の設定。マスクが無ければ全体が人物扱い。
+ * 背景が人物と連動（linked）している間は、背景も人物の levels / solid / layers を使う。
+ */
+export function effectiveRegions(params, hasMask) {
+  const { person, background } = params.regions;
+  const mode = hasMask ? background.mode : 'keep';
+  const tone = background.linked || !hasMask ? person : background;
+  return {
+    mode,
+    person: { levels: person.levels, solid: person.solid, layers: person.layers },
+    background: { levels: tone.levels, solid: tone.solid, layers: tone.layers, linked: tone === person },
+  };
 }
 
 /**
@@ -218,7 +220,7 @@ export function effectiveUnit(params, imageWidth) {
  * 文字列は空にできず、大きさ・濃さは下限未満にならない。
  */
 export function effectiveWatermark(params, owner) {
-  const f = FIELDS.watermark;
+  const f = SECTIONS.watermark;
   const w = params.watermark;
   const txt = (w.text || '').trim();
   return {
@@ -228,14 +230,4 @@ export function effectiveWatermark(params, owner) {
     size: Math.max(f.size.min, w.size),
     opacity: Math.max(f.opacity.min, w.opacity),
   };
-}
-
-/** README 用: キー一覧を「セクション.キー: 既定値」の配列で返す */
-export function describeKeys() {
-  const lines = [];
-  for (const [section, fields] of Object.entries(FIELDS)) {
-    for (const [key, f] of Object.entries(fields)) lines.push(`${section}.${key}: ${JSON.stringify(f.def)}`);
-  }
-  for (const [key, f] of Object.entries(LAYER_FIELDS)) lines.push(`layers[].${key}: ${JSON.stringify(f.def)}`);
-  return lines;
 }

@@ -4,12 +4,15 @@ import { Renderer } from './renderer.js';
 import { encodeGrayPNG } from './png.js';
 import { buildPanel } from './panel.js';
 import {
-  normalize, defaultParams, applyPreset, effectiveUnit, effectiveWatermark, PRESETS, FIELDS,
+  SCHEMA, normalize, defaultParams, applyStyle, effectiveUnit, effectiveWatermark, STYLES,
 } from './schema.js';
 
 const $ = (id) => document.getElementById(id);
 const BITMAP_OPTS = { premultiplyAlpha: 'none', colorSpaceConversion: 'none' };
 const SAVE_DELAY_MS = 700;
+const STATS_DELAY_MS = 400;
+// このブラウザ画面の ID。自分の保存で出たイベントを「外部からの変更」と取り違えないために使う
+const CLIENT_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 const HISTORY_MAX = 200;
 const ZOOM_MIN = 0.02;
 const ZOOM_MAX = 32;
@@ -22,8 +25,11 @@ const state = {
   name: null,           // 表示中の画像名
   remote: false,        // 表示中の画像がサーバの一覧のものか（ドロップした画像は false）
   params: null,
+  rev: null,            // 表示中の設定に対応する設定ファイルの版（未保存の変更があるときは古い）
   hasMask: false,
-  solo: -1,
+  solo: null,           // { region, index } でその層だけ表示
+  tab: 'person',        // トーンのパネルで開いているタブ
+  project: null,
   lastExport: '',
   view: { zoom: 1, cx: 0, cy: 0 },
   compare: false,
@@ -35,6 +41,9 @@ let renderer = null;
 let history = [];
 let hpos = -1;
 let saveTimer = null;
+let saving = false;
+let statsTimer = null;
+let lastStats = null;
 let renderPending = false;
 let drawPending = false;
 let lastRenderMs = 0;
@@ -122,6 +131,7 @@ function renderNow() {
   }
   drawNow();
   setBusy(false);
+  scheduleStats();
   return result;
 }
 
@@ -270,13 +280,14 @@ const ctx = {
   live: () => requestRender(),
   commit: () => commit(),
   rebuild: () => rebuild(),
-  setSolo: (index, redraw) => {
-    state.solo = index;
+  setSolo: (solo, redraw) => {
+    state.solo = solo;
     if (redraw) { requestRender(); rebuild(); }
   },
-  preset: (key) => {
-    state.params = applyPreset(state.params, key, { owner: state.owner });
-    state.solo = -1;
+  setTab: (tab) => { state.tab = tab; rebuild(); },
+  style: (key, region) => {
+    state.params = applyStyle(state.params, key, region);
+    state.solo = null;
     commit(); rebuild(); requestRender();
   },
   exportNow: () => exportNow(),
@@ -297,7 +308,8 @@ function resetHistory() {
   hpos = 0;
 }
 
-function commit() {
+/** いまの設定を履歴に積む。save=false は「すでにファイルと同じ内容」のとき（外部からの更新） */
+function commit(save = true) {
   const snap = JSON.stringify(state.params);
   if (snap === history[hpos]) return;
   history.length = hpos + 1;
@@ -306,7 +318,7 @@ function commit() {
   hpos = history.length - 1;
   $('btnUndo').disabled = hpos <= 0;
   $('btnRedo').disabled = true;
-  scheduleSave();
+  if (save) scheduleSave();
 }
 
 function stepHistory(delta) {
@@ -314,7 +326,7 @@ function stepHistory(delta) {
   if (next < 0 || next >= history.length) return;
   hpos = next;
   state.params = JSON.parse(history[hpos]);
-  state.solo = -1;
+  state.solo = null;
   rebuild();
   requestRender();
   scheduleSave();
@@ -323,12 +335,12 @@ const undo = () => stepHistory(-1);
 const redo = () => stepHistory(1);
 
 /** 任意の JSON を設定として読み込む（警告があれば表示する） */
-function loadParams(raw, { fresh = false } = {}) {
+function loadParams(raw, { fresh = false, save = true } = {}) {
   const { params, warnings } = normalize(raw, { owner: state.owner });
   state.params = params;
-  state.solo = -1;
+  state.solo = null;
   if (warnings.length) showMessage(`設定の読み込みで気になる点がありました:\n・${warnings.join('\n・')}`, 'info', 20000);
-  if (fresh) resetHistory(); else commit();
+  if (fresh) resetHistory(); else commit(save);
   rebuild();
   return warnings;
 }
@@ -347,17 +359,24 @@ function scheduleSave() {
 async function saveNow() {
   if (!canAutoSave()) return;
   const name = state.name;
+  saving = true;
   try {
     const r = await fetch(apiPath('params', name), {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(state.params),
+      method: 'PUT', body: JSON.stringify(state.params),
+      headers: { 'Content-Type': 'application/json', 'X-Inkdeus-Client': CLIENT_ID },
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
     const item = state.images.find((i) => i.name === name);
     if (item) item.hasParams = true;
+    if (name === state.name) state.rev = j.rev;
     if (!saveTimer) setSaveState('保存済み');
   } catch (e) {
     setSaveState('保存に失敗');
     showMessage(`設定を保存できませんでした: ${e.message}`, 'error');
+  } finally {
+    saving = false;
+    scheduleStats();
   }
 }
 
@@ -366,6 +385,108 @@ async function flushSave() {
   clearTimeout(saveTimer);
   saveTimer = null;
   await saveNow();
+}
+
+// ---- 外部との連携（統計の送信・設定ファイルの外部変更・指示の受け取り） ----
+
+/** 再描画が落ち着いたら、描画結果の統計をサーバへ送る（どの版の設定に対する物かを添えて） */
+function scheduleStats() {
+  if (!canAutoSave()) return;
+  clearTimeout(statsTimer);
+  statsTimer = setTimeout(postStats, STATS_DELAY_MS);
+}
+
+function computeStats() {
+  if (!renderer || !renderer.W) return null;
+  const stats = renderer.stats(state.params, { solo: state.solo, owner: state.owner });
+  return { name: state.name, rev: state.rev, renderMs: Math.round(lastRenderMs * 10) / 10, ...stats };
+}
+
+async function postStats() {
+  statsTimer = null;
+  // 未保存の変更があるうちは送らない（保存が済むと改めて呼ばれる）
+  if (!canAutoSave() || saveTimer || saving || renderPending || state.solo) return;
+  const name = state.name;
+  try {
+    const stats = computeStats();
+    if (!stats) return;
+    lastStats = stats;
+    await fetch(apiPath('stats', name), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(stats),
+    });
+  } catch (e) {
+    console.warn('統計を送れませんでした', e);
+  }
+}
+
+function postState() {
+  if (!state.server) return;
+  fetch('api/state', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ current: state.remote ? state.name : null, client: CLIENT_ID }),
+  }).catch(() => {});
+}
+
+/** 設定ファイルが外から書き換えられたときに読み直す（取り消し履歴にも1件として積む） */
+async function onExternalParams(ev) {
+  const item = state.images.find((i) => i.name === ev.name);
+  if (item) item.hasParams = ev.rev !== null;
+  if (ev.source === CLIENT_ID || !state.remote || ev.name !== state.name) return;
+  if (ev.rev === null || ev.rev === state.rev) return;
+  const r = await fetch(apiPath('params', ev.name), { cache: 'no-store' });
+  if (!r.ok || ev.name !== state.name) return;
+  const rev = r.headers.get('X-Inkdeus-Rev');
+  if (rev === state.rev) return;
+  let raw;
+  try {
+    raw = await r.json();
+  } catch {
+    showMessage('外部から書き換えられた設定ファイルが JSON として読めません', 'error');
+    return;
+  }
+  clearTimeout(saveTimer);        // 手元の未保存の変更より外部の変更を優先する
+  saveTimer = null;
+  loadParams(raw, { save: false });
+  state.rev = rev;
+  setSaveState('外部から更新');
+  renderNow();
+}
+
+function connectEvents() {
+  if (!state.server || typeof EventSource === 'undefined') return;
+  const source = new EventSource('api/events');
+  source.onmessage = (msg) => {
+    let ev;
+    try { ev = JSON.parse(msg.data); } catch { return; }
+    if (ev.type === 'params') onExternalParams(ev).catch((e) => console.warn(e));
+    else if (ev.type === 'open') openByName(ev.name);
+    else if (ev.type === 'export') openByName(ev.name).then(() => exportNow()).catch((e) => console.warn(e));
+  };
+}
+
+async function openByName(name) {
+  if (state.remote && state.name === name) return;
+  let index = state.images.findIndex((i) => i.name === name);
+  if (index < 0) {
+    await refreshImages();          // 起動後に増えた画像かもしれない
+    index = state.images.findIndex((i) => i.name === name);
+  }
+  if (index >= 0) await openIndex(index);
+}
+
+async function refreshImages() {
+  const list = await getJSON('api/images');
+  if (!list || !Array.isArray(list.images)) return;
+  state.images = list.images;
+  const sel = $('selImage');
+  sel.replaceChildren(...state.images.map((item) => {
+    const opt = document.createElement('option');
+    opt.value = item.name;
+    opt.textContent = `${item.name}${item.hasMask ? '  [マスク]' : ''}`;
+    return opt;
+  }));
+  if (state.remote && state.name) sel.value = state.name;
+  $('nav').hidden = state.images.length < 2;
 }
 
 // ---- 画像・マスクの読み込み ----
@@ -381,7 +502,8 @@ async function setImageBlob(blob, name, remote) {
   state.remote = remote;
   state.hasMask = false;
   state.lastExport = '';
-  state.solo = -1;
+  state.solo = null;
+  state.rev = null;
   $('dropHint').hidden = true;
   document.title = `${name} — inkdeus`;
   setSaveState('');
@@ -424,14 +546,19 @@ async function openIndex(i) {
       if (m.ok) await setMaskBlob(await m.blob());
     }
     // 保存済みの設定があればそれを、無ければ直前の設定を引き継ぐ
-    const saved = item.hasParams ? await getJSON(apiPath('params', item.name)) : null;
-    if (saved) {
-      loadParams(saved, { fresh: true });
+    const saved = item.hasParams ? await fetch(apiPath('params', item.name), { cache: 'no-store' }) : null;
+    if (saved && saved.ok) {
+      const rev = saved.headers.get('X-Inkdeus-Rev');
+      loadParams(await saved.json(), { fresh: true });
+      state.rev = rev;
       setSaveState('保存済み');
     } else {
       resetHistory();
       rebuild();
+      // 既定値と違う設定を引き継いだときは、サーバ（と外部の操作）にも分かるようすぐ保存する
+      if (JSON.stringify(state.params) !== JSON.stringify(defaultParams({ owner: state.owner }))) await saveNow();
     }
+    postState();
     renderNow();
   } catch (e) {
     showMessage(`${item.name} を開けませんでした: ${e.message}`, 'error');
@@ -447,6 +574,7 @@ async function openLocalImage(file) {
   setBusy(true);
   try {
     await setImageBlob(file, file.name, false);
+    postState();
     resetHistory();
     rebuild();
     renderNow();
@@ -524,7 +652,7 @@ async function exportNow() {
   setBusy(true);
   await new Promise((resolve) => setTimeout(resolve, 0));
   try {
-    if (state.solo >= 0) state.solo = -1;       // ソロ表示のまま書き出さない
+    state.solo = null;                          // ソロ表示のまま書き出さない
     renderNow();
     setBusy(true);
     const { W, H } = renderer;
@@ -532,7 +660,8 @@ async function exportNow() {
     let result;
     if (state.server && state.remote) {
       const r = await fetch(apiPath('export', state.name), {
-        method: 'POST', headers: { 'Content-Type': 'image/png' }, body: blob,
+        method: 'POST', body: blob,
+        headers: { 'Content-Type': 'image/png', ...(state.rev ? { 'X-Inkdeus-Rev': state.rev } : {}) },
       });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const j = await r.json();
@@ -568,6 +697,12 @@ async function init() {
   state.server = !!(list && Array.isArray(list.images));
   state.owner = !!(state.server && config && config.owner === true);
   state.images = state.server ? list.images : [];
+  state.project = state.server && config && config.project ? config.project : null;
+  if (state.project) {
+    $('projectName').textContent = state.project.name;
+    $('projectName').title = `プロジェクト: ${state.project.path}`;
+    $('projectName').hidden = false;
+  }
   state.params = defaultParams({ owner: state.owner });
   resetHistory();
   $('modeBadge').textContent = state.server ? (state.owner ? 'サーバ・所有者モード' : 'サーバ') : 'サーバなし';
@@ -577,15 +712,9 @@ async function init() {
   rebuild();
   resizeCanvas();
 
+  connectEvents();
   if (state.images.length) {
-    const sel = $('selImage');
-    for (const item of state.images) {
-      const opt = document.createElement('option');
-      opt.value = item.name;
-      opt.textContent = `${item.name}${item.hasMask ? '  [マスク]' : ''}`;
-      sel.append(opt);
-    }
-    $('nav').hidden = state.images.length < 2;
+    await refreshImages();
     await openIndex(0);
   } else if (state.server) {
     showMessage('入力フォルダに画像がありません', 'error');
@@ -606,8 +735,13 @@ const hooks = {
       return ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
     })(),
   }),
-  presets: () => Object.keys(PRESETS),
-  fields: () => FIELDS,
+  clientId: CLIENT_ID,
+  styles: () => Object.keys(STYLES),
+  schema: () => SCHEMA,
+  rev: () => state.rev,
+  /** 描画結果の統計をその場で計算して返す（サーバへ送る物と同じ形） */
+  stats: () => computeStats(),
+  lastPostedStats: () => lastStats,
   defaults: () => defaultParams({ owner: state.owner }),
   getParams: () => JSON.parse(JSON.stringify(state.params)),
   /** 設定を差し替えてその場で描画する。戻り値は { ms, passes, warnings } */

@@ -123,24 +123,39 @@ def plain_page(browser, site):
     p.close()
 
 
-def deep_merge(base: dict, patch: dict) -> dict:
+def _merge(base: dict, patch: dict) -> dict:
     out = copy.deepcopy(base)
     for k, v in patch.items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = deep_merge(out[k], v)
+            out[k] = _merge(out[k], v)
         else:
             out[k] = copy.deepcopy(v)
     return out
 
 
+def deep_merge(base: dict, patch: dict) -> dict:
+    """設定に差分を重ねる。テストを短く書くための省略形として、差分のトップレベルの
+    layers / solid / levels は人物（regions.person）、background は背景（regions.background）に入れる"""
+    patch = copy.deepcopy(patch)
+    regions = patch.setdefault("regions", {})
+    for key in ("layers", "solid", "levels"):
+        if key in patch:
+            regions.setdefault("person", {})[key] = patch.pop(key)
+    if "background" in patch:
+        regions["background"] = _merge(regions.get("background", {}), patch.pop("background"))
+    return _merge(base, patch)
+
+
 # 線画・ベタ・トーン・透かしをすべて切った「何も描かない」設定（テストはここへ必要な物だけ足す）
 BLANK = {
-    "version": 1,
+    "version": 2,
     "unit": 1,
     "input": {"autoLevel": False, "smoothRadius": 0},
     "lines": {"enabled": False},
-    "solid": {"enabled": False},
-    "layers": [],
+    "regions": {
+        "person": {"solid": {"enabled": False}, "layers": []},
+        "background": {"mode": "keep", "linked": True},
+    },
     "watermark": {"enabled": False},
     "output": {"binary": False},
 }

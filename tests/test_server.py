@@ -139,21 +139,21 @@ def test_static_index(client):
 # ---- 所有者モード ----
 
 def test_config_default_is_not_owner(client, tmp_path):
-    assert client.get("/api/config").get_json() == {"owner": False}
+    assert client.get("/api/config").get_json() == {"owner": False, "project": None}
     assert resolve_owner(False, {}, tmp_path / "missing.toml") is False
 
 
 def test_owner_by_flag(dirs, tmp_path):
     _, images, _ = dirs
-    args = build_parser().parse_args([str(images), "--owner"])
+    args = build_parser().parse_args(["run", str(images), "--owner"])
     owner = resolve_owner(args.owner, {}, tmp_path / "missing.toml")
-    assert create_app(images, owner=owner).test_client().get("/api/config").get_json() == {"owner": True}
+    assert create_app(images, owner=owner).test_client().get("/api/config").get_json()["owner"] is True
 
 
 def test_owner_by_env(dirs, tmp_path):
     _, images, _ = dirs
     owner = resolve_owner(False, {"INKDEUS_OWNER": "1"}, tmp_path / "missing.toml")
-    assert create_app(images, owner=owner).test_client().get("/api/config").get_json() == {"owner": True}
+    assert create_app(images, owner=owner).test_client().get("/api/config").get_json()["owner"] is True
     assert resolve_owner(False, {"INKDEUS_OWNER": "0"}, tmp_path / "missing.toml") is False
 
 
@@ -162,8 +162,124 @@ def test_owner_by_local_toml(dirs, tmp_path):
     cfg = tmp_path / "inkdeus.local.toml"
     cfg.write_text("owner = true\n", encoding="utf-8")
     owner = resolve_owner(False, {}, cfg)
-    assert create_app(images, owner=owner).test_client().get("/api/config").get_json() == {"owner": True}
+    assert create_app(images, owner=owner).test_client().get("/api/config").get_json()["owner"] is True
     cfg.write_text("owner = false\n", encoding="utf-8")
     assert resolve_owner(False, {}, cfg) is False
     cfg.write_text("this is not toml = = =", encoding="utf-8")
     assert resolve_owner(False, {}, cfg) is False
+
+
+# ---- 外部からの操作: 設定の部分更新・状態・統計・監視 ----
+
+def test_resolve_returns_defaults_when_no_file(client):
+    r = client.get("/api/params/scene.png?resolve=1").get_json()
+    assert r["exists"] is False and r["rev"] is None
+    assert r["params"]["version"] == 2 and len(r["params"]["regions"]["person"]["layers"]) == 4
+
+
+def test_patch_validates_and_writes(client, dirs):
+    _, images, _ = dirs
+    patch = {"regions": {"background": {"linked": False, "levels": {"brightness": 0.25}}}}
+    r = client.patch("/api/params/scene.png", data=json.dumps(patch))
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["params"]["regions"]["background"]["levels"]["brightness"] == 0.25
+    saved = json.loads((images / "inkdeus_out" / "scene.inkdeus.json").read_text(encoding="utf-8"))
+    assert saved == body["params"]
+    got = client.get("/api/params/scene.png")
+    assert got.headers["X-Inkdeus-Rev"] == body["rev"]
+    assert client.get("/api/params/scene.png?resolve=1").get_json()["rev"] == body["rev"]
+    # 検証に通らない変更は何も書かない
+    bad = client.patch("/api/params/scene.png", data=json.dumps({"lines": {"sigma": 99, "nope": 1}}))
+    assert bad.status_code == 400
+    problems = "\n".join(bad.get_json()["problems"])
+    assert "lines.sigma" in problems and "未知のキー: lines.nope" in problems
+    assert client.get("/api/params/scene.png").headers["X-Inkdeus-Rev"] == body["rev"]
+    assert client.patch("/api/params/missing.png", data=b"{}").status_code == 404
+
+
+def test_set_and_style_endpoints(client):
+    r = client.post("/api/set/scene.png", data=json.dumps({"key": "regions.person.layers.0.angle", "value": 60}))
+    assert r.status_code == 200 and r.get_json()["params"]["regions"]["person"]["layers"][0]["angle"] == 60
+    assert client.post("/api/set/scene.png", data=json.dumps({"key": "lines.sigma", "value": "thick"})).status_code == 400
+    assert client.post("/api/set/scene.png", data=json.dumps({"key": "lines.sigma"})).status_code == 400
+    r = client.post("/api/style/scene.png", data=json.dumps({"style": "ハッチ(1)", "region": "background"}))
+    body = r.get_json()
+    assert r.status_code == 200 and body["style"] == "hatch1"
+    assert len(body["params"]["regions"]["background"]["layers"]) == 1
+    assert body["params"]["regions"]["person"]["layers"][0]["angle"] == 60          # 先の変更は残る
+    assert client.post("/api/style/scene.png", data=json.dumps({"style": "nope"})).status_code == 400
+    names = [s["name"] for s in client.get("/api/styles").get_json()["styles"]]
+    assert "crosshatch-ultrafine" in names
+
+
+def test_state_roundtrip(client, dirs):
+    _, images, masks = dirs
+    s = client.get("/api/state").get_json()
+    assert s["current"] is None and s["images"] == 2 and s["owner"] is False and s["clients"] == 0
+    assert s["source"] == str(images) and s["masks"] == str(masks) and s["out"] == str(images / "inkdeus_out")
+    assert s["project"] is None
+    assert client.post("/api/state", data=json.dumps({"current": "scene.png"})).get_json()["current"] == "scene.png"
+    assert client.get("/api/state").get_json()["current"] == "scene.png"
+    assert client.post("/api/state", data=json.dumps({"current": "missing.png"})).status_code == 404
+
+
+def test_stats_roundtrip_carries_rev(client):
+    empty = client.get("/api/stats/scene.png").get_json()
+    assert empty["stats"] is None and empty["fresh"] is False and empty["currentRev"] is None
+    rev = client.patch("/api/params/scene.png", data=b"{}").get_json()["rev"]
+    stats = {"rev": rev, "renderMs": 12.5, "output": {"all": {"blackRatio": 0.3}}}
+    assert client.post("/api/stats/scene.png", data=json.dumps(stats)).status_code == 200
+    got = client.get("/api/stats/scene.png").get_json()
+    assert got["fresh"] is True and got["currentRev"] == rev
+    assert got["stats"]["output"] == stats["output"] and got["stats"]["name"] == "scene.png"
+    # 設定が変わると、手元の統計は「古い」と分かる
+    client.post("/api/set/scene.png", data=json.dumps({"key": "lines.sigma", "value": 1.5}))
+    assert client.get("/api/stats/scene.png").get_json()["fresh"] is False
+    assert client.post("/api/stats/missing.png", data=b"{}").status_code == 404
+
+
+def test_events_for_own_and_external_changes(dirs):
+    _, images, _ = dirs
+    app = create_app(images, watch=False)
+    session = app.config["INKDEUS_SESSION"]
+    client = app.test_client()
+    q = session.hub.subscribe()
+    session.scan()                                   # 起動時点の記録（イベントは出ない）
+    assert q.empty()
+    # ブラウザ自身の保存: 送り主の ID が付く
+    rev = client.put("/api/params/scene.png", data=b'{"version": 2}', headers={"X-Inkdeus-Client": "tab-1"}).get_json()["rev"]
+    assert q.get_nowait() == {"type": "params", "name": "scene.png", "rev": rev, "source": "tab-1"}
+    assert session.scan() == [] and q.empty()        # サーバ自身が書いた物は外部変更として数えない
+    # 外部（エディタなど）がファイルを書き換えた
+    path = images / "inkdeus_out" / "scene.inkdeus.json"
+    path.write_text('{"version": 2, "unit": 3}', encoding="utf-8")
+    events = session.scan()
+    assert len(events) == 1 and events[0]["source"] is None and events[0]["name"] == "scene.png"
+    assert events[0]["rev"] != rev and q.get_nowait() == events[0]
+    assert session.scan() == []                      # 同じ内容では二度出ない
+    # 外部からの PATCH も source なしで届く
+    r = client.patch("/api/params/scene.png", data=b'{"unit": 2}').get_json()
+    assert q.get_nowait() == {"type": "params", "name": "scene.png", "rev": r["rev"], "source": None}
+    # 画像の切り替え・書き出しの指示
+    assert client.post("/api/command", data=json.dumps({"type": "open", "name": "plain.png"})).get_json()["clients"] == 1
+    assert q.get_nowait() == {"type": "open", "name": "plain.png"}
+    assert client.post("/api/command", data=json.dumps({"type": "explode", "name": "plain.png"})).status_code == 400
+    assert client.post("/api/command", data=json.dumps({"type": "open", "name": "nope.png"})).status_code == 404
+    session.hub.unsubscribe(q)
+    assert session.hub.count() == 0
+
+
+def test_sse_stream_format(dirs):
+    _, images, _ = dirs
+    app = create_app(images, watch=False)
+    client = app.test_client()
+    resp = client.get("/api/events", buffered=False)
+    assert resp.mimetype == "text/event-stream"
+    chunks = resp.response
+    assert next(chunks).startswith(b":")
+    client.patch("/api/params/scene.png", data=b"{}")
+    line = next(chunks).decode("utf-8")
+    assert line.startswith("data: ") and line.endswith("\n\n")
+    assert json.loads(line[6:])["type"] == "params"
+    resp.close()

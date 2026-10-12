@@ -2,7 +2,7 @@
 // 依存する設定が変わったパスだけを再計算する（各パスが「何から作ったか」のキーを覚えている）。
 
 import * as S from './shaders.js';
-import { effectiveUnit, effectiveWatermark, MAX_LAYERS } from './schema.js';
+import { effectiveUnit, effectiveRegions, effectiveWatermark, MAX_LAYERS } from './schema.js';
 
 const MAX_SMOOTH_RADIUS = 64;
 const MAX_BLUR_RADIUS = 128;
@@ -328,29 +328,41 @@ export class Renderer {
   // ---- 描画 ----
 
   /**
-   * 設定どおりに出力テクスチャを作り直す。
-   * opts.solo: この番号のトーン層だけを表示（ベタ・線画も隠す）。opts.owner: 所有者モード
+   * 設定から合成パスのユニフォーム一式を作り、必要な前段のパスを用意する。
+   * opts.solo: { region, index } でそのトーン層だけを表示（ベタ・線画も隠す）。opts.owner: 所有者モード
    */
-  render(params, { solo = -1, owner = false } = {}) {
-    if (!this.W) return { ms: 0, passes: [] };
-    const gl = this.gl;
-    const t0 = performance.now();
-    this.lastPasses = [];
+  prepare(params, { solo = null, owner = false } = {}) {
     const { W, H } = this;
     const unit = effectiveUnit(params, W);
-
-    const layers = params.layers
-      .map((l, i) => ({ l, i }))
-      .filter(({ l, i }) => l.type === 'hatch' && (solo >= 0 ? i === solo : l.enabled))
-      .slice(0, MAX_LAYERS);
-    const soloing = solo >= 0;
-    const solidOn = params.solid.enabled && !soloing;
-    const bgMode = this.hasMask ? { keep: 0, white: 1, lines: 2 }[params.background.mode] || 0 : 0;
+    const regions = effectiveRegions(params, this.hasMask);
+    const bg = params.regions.background;
+    const soloing = !!solo;
+    const mode = soloing ? 0 : { keep: 0, white: 1, lines: 2 }[regions.mode] || 0;
     const lineStrength = params.lines.enabled && !soloing ? params.lines.strength : 0;
-    const needLines = lineStrength > 0 || bgMode === 2;
+    const needLines = lineStrength > 0 || mode === 2;
+
+    const sets = ['person', 'background'].map((name, r) => {
+      const reg = regions[name];
+      // ソロ表示は、連動中の背景なら人物の層として扱う
+      const soloHere = soloing && (solo.region === name || (name === 'background' && reg.linked && solo.region === 'person'));
+      const layers = reg.layers
+        .map((l, i) => ({ l, i }))
+        .filter(({ l, i }) => l.type === 'hatch' && (soloing ? soloHere && i === solo.index : l.enabled))
+        .slice(0, MAX_LAYERS);
+      const active = r === 0 || mode === 0;        // 背景の層とベタは「層で描く」ときだけ
+      return {
+        layers: active ? layers : [],
+        solidOn: active && reg.solid.enabled && !soloing,
+        solid: reg.solid,
+        levels: reg.levels,
+        // 統計用: 設定上の層番号（無効な層は飛ばして詰めてあるため）
+        index: (active ? layers : []).map(({ i }) => i),
+      };
+    });
 
     const lumKey = this.ensureLum(params.input.autoLevel);
-    const tone = layers.length || solidOn
+    const needTone = sets.some((x) => x.layers.length || x.solidOn);
+    const tone = needTone
       ? this.ensureSmooth(lumKey, params.input.smoothRadius * unit, params.input.smoothStrength)
       : this.tex.lum;
     const blur = needLines ? this.ensureBlur(lumKey, params.lines.sigma * unit) : null;
@@ -385,42 +397,151 @@ export class Renderer {
       }
     }
 
-    const A = new Float32Array(MAX_LAYERS * 4);
-    const B = new Float32Array(MAX_LAYERS * 4);
-    const C = new Float32Array(MAX_LAYERS * 4);
-    layers.forEach(({ l }, k) => {
-      const a = (l.angle * Math.PI) / 180;
-      const spacing = Math.max(0.25, l.spacing * unit);
-      A.set([l.threshold, l.soft, Math.sin(a), Math.cos(a)], k * 4);
-      B.set([spacing, l.width * unit, l.widthByDarkness, l.opacity], k * 4);
-      C.set([l.phase, 0, 0, 0], k * 4);
+    const A = new Float32Array(MAX_LAYERS * 8);
+    const B = new Float32Array(MAX_LAYERS * 8);
+    const C = new Float32Array(MAX_LAYERS * 8);
+    const levels = new Float32Array(8);
+    const solid = new Float32Array(8);
+    sets.forEach((set, r) => {
+      set.layers.forEach(({ l }, k) => {
+        const a = (l.angle * Math.PI) / 180;
+        const spacing = Math.max(0.25, l.spacing * unit);
+        const at = (r * MAX_LAYERS + k) * 4;
+        A.set([l.threshold, l.soft, Math.sin(a), Math.cos(a)], at);
+        B.set([spacing, l.width * unit, l.widthByDarkness, l.opacity], at);
+        C.set([l.phase, 0, 0, 0], at);
+      });
+      levels.set([set.levels.brightness, set.levels.contrast, 1 / Math.max(0.01, set.levels.gamma), 0], r * 4);
+      solid.set([set.solidOn ? 1 : 0, set.solid.threshold, set.solid.soft, 0], r * 4);
     });
 
-    this.pass('composite', S.FS_COMPOSITE, this.tex.out, W, H, (p) => {
+    const gl = this.gl;
+    const apply = (p, statMode, sw, sh) => {
       this.sampler(p, 'uLum', tone);
       this.sampler(p, 'uBlur', blur || this.tex.lum);
       this.sampler(p, 'uSdf', this.tex.sdf || this.tex.lum);
       this.sampler(p, 'uWm', wmTex || this.tex.lum);
-      gl.uniform1i(p.loc('uCount'), layers.length);
+      gl.uniform2i(p.loc('uCount'), sets[0].layers.length, sets[1].layers.length);
       gl.uniform4fv(p.loc('uA'), A);
       gl.uniform4fv(p.loc('uB'), B);
       gl.uniform4fv(p.loc('uC'), C);
-      gl.uniform4f(p.loc('uSolid'), solidOn ? 1 : 0, params.solid.threshold, params.solid.soft, 0);
+      gl.uniform4fv(p.loc('uLevels'), levels);
+      gl.uniform4fv(p.loc('uSolid'), solid);
       gl.uniform4f(p.loc('uLine'), lineStrength, params.lines.tau, params.lines.epsilon, params.lines.phi);
       gl.uniform1i(p.loc('uLineOn'), blur ? 1 : 0);
-      gl.uniform4f(p.loc('uBg'), bgMode, params.background.grow * unit,
-        params.background.silhouetteWidth * unit, params.background.lineStrength);
+      gl.uniform1i(p.loc('uHasMask'), this.hasMask ? 1 : 0);
+      gl.uniform4f(p.loc('uBg'), mode, bg.grow * unit, bg.silhouetteWidth * unit, bg.lineStrength);
       gl.uniform4f(p.loc('uWmRect'), rect[0], rect[1], rect[2], rect[3]);
       gl.uniform4f(p.loc('uWmP'), wmMode, wm.opacity, period[0], period[1]);
       gl.uniform1i(p.loc('uBinary'), params.output.binary ? 1 : 0);
-    });
+      gl.uniform1i(p.loc('uMode'), statMode);
+      gl.uniform2f(p.loc('uSampleScale'), statMode ? W / sw : 1, statMode ? H / sh : 1);
+      gl.uniform2i(p.loc('uSize'), W, H);
+    };
+    return { apply, unit, sets, mode };
+  }
+
+  /** 設定どおりに出力テクスチャを作り直す */
+  render(params, opts = {}) {
+    if (!this.W) return { ms: 0, passes: [] };
+    const gl = this.gl;
+    const t0 = performance.now();
+    this.lastPasses = [];
+    const { W, H } = this;
+    const prep = this.prepare(params, opts);
+    this.pass('composite', S.FS_COMPOSITE, this.tex.out, W, H, (p) => prep.apply(p, 0, W, H));
     this.lastPasses.push('composite');
     // 1画素読んで GPU の完了を待つ（所要時間を正しく測るため）
     gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
     gl.bindTexture(gl.TEXTURE_2D, this.tex.out);
     gl.generateMipmap(gl.TEXTURE_2D);
-    return { ms: performance.now() - t0, passes: this.lastPasses.slice(), unit };
+    return { ms: performance.now() - t0, passes: this.lastPasses.slice(), unit: prep.unit };
+  }
+
+  /**
+   * 描画結果の統計（画像を見ずに数値で調整するためのもの）。
+   * 縮小した格子で画素を抜き出して数える（出力そのものは読まない）。
+   */
+  stats(params, opts = {}) {
+    if (!this.W) return null;
+    const gl = this.gl;
+    const { W, H } = this;
+    const s = Math.min(1, STAT_SIZE / Math.max(W, H));
+    const sw = Math.max(1, Math.round(W * s));
+    const sh = Math.max(1, Math.round(H * s));
+    const before = this.lastPasses;
+    this.lastPasses = [];
+    const prep = this.prepare(params, opts);
+    this.lastPasses = before;
+    const tmp = this.createTexture(gl.RGBA8, sw, sh);
+    const read = (mode) => {
+      this.pass('composite', S.FS_COMPOSITE, tmp, sw, sh, (p) => prep.apply(p, mode, sw, sh));
+      const buf = new Uint8Array(sw * sh * 4);
+      gl.readPixels(0, 0, sw, sh, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      return buf;
+    };
+    const a = read(1);
+    const b = read(2);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
+    gl.deleteTexture(tmp);
+
+    const make = () => ({
+      n: 0, black: 0, density: 0, solid: 0, line: 0, layers: new Float64Array(MAX_LAYERS),
+      lum: new Uint32Array(256), adjusted: new Uint32Array(256),
+    });
+    const acc = { all: make(), person: make(), background: make() };
+    const n = sw * sh;
+    for (let i = 0; i < n; i++) {
+      const v = a[i * 4];
+      const person = a[i * 4 + 1] >= 128;
+      const bits = b[i * 4 + 2];
+      for (const t of [acc.all, person ? acc.person : acc.background]) {
+        t.n += 1;
+        if (v < 128) t.black += 1;
+        t.density += 255 - v;
+        if (a[i * 4 + 3] >= 128) t.solid += 1;
+        if (a[i * 4 + 2] >= 128) t.line += 1;
+        t.lum[b[i * 4]] += 1;
+        t.adjusted[b[i * 4 + 1]] += 1;
+        if (t !== acc.all) for (let k = 0; k < MAX_LAYERS; k++) if (bits & (1 << k)) t.layers[k] += 1;
+      }
+    }
+    const round = (x) => Math.round(x * 10000) / 10000;
+    const summary = (hist, count) => {
+      if (!count) return null;
+      let sum = 0;
+      for (let k = 0; k < 256; k++) sum += hist[k] * k;
+      const at = (frac) => {
+        let c = 0;
+        for (let k = 0; k < 256; k++) { c += hist[k]; if (c >= frac * count) return round(k / 255); }
+        return 1;
+      };
+      return { mean: round(sum / count / 255), p10: at(0.1), p25: at(0.25), median: at(0.5), p75: at(0.75), p90: at(0.9) };
+    };
+    const output = {};
+    const input = {};
+    ['all', 'person', 'background'].forEach((name) => {
+      const t = acc[name];
+      const o = {
+        areaRatio: round(t.n / n),
+        blackRatio: t.n ? round(t.black / t.n) : null,
+        meanDensity: t.n ? round(t.density / t.n / 255) : null,
+        solidRatio: t.n ? round(t.solid / t.n) : null,
+        lineRatio: t.n ? round(t.line / t.n) : null,
+      };
+      if (name !== 'all') {
+        const set = prep.sets[name === 'person' ? 0 : 1];
+        // 層ごとの「描かれている画素の割合」（その領域の中で）。layer は設定上の層番号
+        o.layers = set.index.map((layerIndex, k) => ({ layer: layerIndex, coverage: t.n ? round(t.layers[k] / t.n) : null }));
+      }
+      output[name] = o;
+      input[name] = { luminance: summary(t.lum, t.n), adjusted: summary(t.adjusted, t.n) };
+    });
+    return {
+      width: W, height: H, unit: round(prep.unit), hasMask: this.hasMask, samples: n,
+      backgroundMode: ['keep', 'white', 'lines'][prep.mode], output, input,
+    };
   }
 
   /** 画面のキャンバスへ表示する。view = { zoom, cx, cy, original, split }（split は x のデバイスpx、無ければ -1） */
