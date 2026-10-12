@@ -314,3 +314,169 @@ def test_positions_follow_the_window_size_and_do_not_roll_back(lay):
     pic = next(i for i in linked(lay) if i["guid"] == image["guid"])
     assert_covers(lay, pic, changed["cells"][0]["guid"])
 
+
+# ---- 境界線のドラッグ（コマ割りモード） ----
+
+def screen(page) -> dict:
+    return page.evaluate("() => window.inkdeusBridge.layout.screen()")
+
+
+def drag(page, start: dict, dx: float, dy: float, shift: bool = False, steps: int = 6) -> None:
+    page.mouse.move(start["x"], start["y"])
+    page.mouse.down()
+    if shift:
+        page.keyboard.down("Shift")
+    for i in range(1, steps + 1):
+        page.mouse.move(start["x"] + dx * i / steps, start["y"] + dy * i / steps)
+    page.mouse.up()
+    if shift:
+        page.keyboard.up("Shift")
+    page.wait_for_timeout(60)
+
+
+def depth(page) -> int:
+    return page.evaluate("() => { flushHistory(); return stateStack.length; }")
+
+
+def enter(page) -> None:
+    assert page.evaluate("() => window.inkdeusBridge.layout.enter()") is True
+
+
+def test_dragging_a_boundary_moves_both_sides_and_keeps_the_gutter(lay):
+    made = grid(lay, "1,2", gutter={"v": 0.04, "h": 0.03})
+    enter(lay)
+    before = info(lay)
+    row = next(b for b in before["bounds"] if b["dir"] == "v")
+    col = next(b for b in before["bounds"] if b["dir"] == "h")
+    spots = screen(lay)
+    scale = spots["scale"]
+    history = depth(lay)
+    drag(lay, spots["bounds"][row["key"]]["mid"], 0, 70)
+    after = info(lay)
+    b0, b1 = boxes(before["cells"]), boxes(after["cells"])
+    page_h = before["page"]["height"]
+    moved = 70 / scale / page_h
+    assert b1[1][3] - b0[1][3] == pytest.approx(moved, abs=0.002)             # 上のコマが伸びる
+    assert b1[2][1] - b0[2][1] == pytest.approx(moved, abs=0.002) and b1[3][1] == pytest.approx(b1[2][1])   # 下の 2 コマが縮む
+    assert b1[2][1] - b1[1][3] == pytest.approx(b0[2][1] - b0[1][3], abs=1e-6)       # 間隔は同じ
+    assert b1[2][3] == pytest.approx(b0[2][3]) and matches_layout(lay)
+    assert depth(lay) == history + 1                                           # ドラッグ 1 回 = 履歴 1 件
+    # 列の境界は左右に動く
+    drag(lay, screen(lay)["bounds"][col["key"]]["mid"], -50, 0)
+    b2 = boxes(info(lay)["cells"])
+    assert b2[2][0] - b1[2][0] == pytest.approx(-50 / scale / before["page"]["width"], abs=0.002)
+    assert b2[2][0] - b2[3][2] == pytest.approx(b1[2][0] - b1[3][2], abs=1e-6) and near(b2[1], b1[1], tol=1e-6)
+    assert matches_layout(lay) and depth(lay) == history + 2
+    # 取り消し 1 回で 1 つ前のドラッグの後へ、もう 1 回で最初へ。やり直しも効く
+    undo(lay)
+    assert near(boxes(info(lay)["cells"]), b1, tol=1e-6) and matches_layout(lay)
+    undo(lay)
+    assert near(boxes(info(lay)["cells"]), b0, tol=1e-6) and matches_layout(lay)
+    undo(lay, "redo")
+    assert near(boxes(info(lay)["cells"]), b1, tol=1e-6) and matches_layout(lay)
+    # モードの間に取り消しても、モードは続いていて、また掴める
+    assert lay.evaluate("() => window.inkdeusBridge.layout.isActive()")
+    drag(lay, screen(lay)["bounds"][row["key"]]["mid"], 0, -30)
+    assert boxes(info(lay)["cells"])[1][3] < b1[1][3] and matches_layout(lay)
+    assert made["cells"][0]["guid"] == info(lay)["cells"][0]["guid"]
+
+
+def test_boundary_drag_stops_at_the_minimum_and_snaps_with_shift(lay):
+    grid(lay, "1,1,1", gutter={"v": 0.03, "h": 0.02})
+    enter(lay)
+    before = info(lay)
+    first, second = sorted((b for b in before["bounds"]), key=lambda b: b["pos"])
+    spots = screen(lay)
+    drag(lay, spots["bounds"][first["key"]]["mid"], 0, 2000)                   # ずっと下まで引いても、隣のコマは最小の高さで止まる
+    after = info(lay)
+    cells = boxes(after["cells"])
+    short = min(after["page"]["width"], after["page"]["height"])
+    minimum = lay.evaluate("() => window.inkdeusBridge.layout.core.MIN_CELL")
+    assert (cells[2][3] - cells[2][1]) * after["page"]["height"] == pytest.approx(minimum * short, abs=0.6)
+    assert near(cells[3], boxes(before["cells"])[3], tol=1e-6) and matches_layout(lay)
+    undo(lay)
+    # Shift: ページの 1/2 の近くで離すと、ちょうど 1/2 に吸い付く
+    spots = screen(lay)
+    target = (0.5 - first["pos"]) * before["page"]["height"] * spots["scale"]
+    drag(lay, spots["bounds"][first["key"]]["mid"], 0, target + 6, shift=True)
+    assert next(b for b in info(lay)["bounds"] if b["key"] == first["key"])["pos"] == pytest.approx(0.5, abs=1e-6)
+    undo(lay)
+    drag(lay, screen(lay)["bounds"][first["key"]]["mid"], 0, target + 6)
+    assert next(b for b in info(lay)["bounds"] if b["key"] == first["key"])["pos"] != pytest.approx(0.5, abs=1e-4)
+
+
+def test_dragging_a_boundary_end_makes_trapezoids_and_double_click_straightens(lay):
+    grid(lay, "1,1", gutter={"v": 0.04, "h": 0.03})
+    enter(lay)
+    key = info(lay)["bounds"][0]["key"]
+    spots = screen(lay)
+    history = depth(lay)
+    drag(lay, spots["bounds"][key]["ends"][1], 0, 50)                           # 右端を下げる
+    after = info(lay)
+    bound = after["bounds"][0]
+    assert bound["tilt"][0] == 0 and bound["tilt"][1] > 0.02 and depth(lay) == history + 1
+    top, bottom = after["cells"][0]["points"], after["cells"][1]["points"]     # 左上・右上・右下・左下
+    assert top[0][1] == pytest.approx(top[1][1]) and top[2][1] > top[3][1] + 0.02           # 上のコマは下辺が斜めの台形
+    assert bottom[1][1] > bottom[0][1] + 0.02 and bottom[2][1] == pytest.approx(bottom[3][1])
+    assert bottom[0][1] - top[3][1] == pytest.approx(bottom[1][1] - top[2][1], abs=1e-6)     # 間隔は両端で同じ
+    assert matches_layout(lay) and len(panels(lay)[0]["pts"]) == 4
+    # ダブルクリックでまっすぐに戻る
+    end = screen(lay)["bounds"][key]["ends"][1]
+    lay.mouse.dblclick(end["x"], end["y"])
+    lay.wait_for_function("() => window.inkdeusBridge.layout.get().bounds[0].tilt.every(t => t === 0)")
+    top = info(lay)["cells"][0]["points"]
+    assert top[2][1] == pytest.approx(top[3][1]) and matches_layout(lay)
+    undo(lay)
+    assert info(lay)["bounds"][0]["tilt"][1] > 0.02 and matches_layout(lay)
+
+
+def test_mode_enter_and_exit_restore_the_lock_state(lay):
+    made = grid(lay, "1,1")
+    image = place(lay, made["cells"][0]["guid"])
+    lay.evaluate("(g) => { const p = canvas.getObjects().find(o => o.guid === g); p.selectable = true; }", made["cells"][1]["guid"])
+    state = "() => canvas.getObjects().map(o => [o.guid, o.selectable, o.evented, !!o._modeLockBackup])"
+    before = lay.evaluate(state)
+    assert sorted(x[1] for x in before) == [False, True, True] and all(x[2] and not x[3] for x in before)
+
+    def active() -> bool:
+        return lay.evaluate("() => window.inkdeusBridge.layout.isActive()")
+
+    def check_left() -> None:
+        assert not active() and lay.evaluate(state) == before
+        assert lay.evaluate("() => [ModeManager.getCurrent(), canvas.selection, canvas.defaultCursor]") == ["select", True, "default"]
+        assert lay.evaluate("() => document.querySelector('.ikl-overlay').hidden")
+        assert not lay.evaluate("() => document.getElementById('canvas-help-text').classList.contains('active')")
+
+    open_section(lay)
+    lay.click("#ikl-mode")
+    assert active() and lay.get_attribute("#ikl-mode", "aria-pressed") == "true"
+    # モードの間は掴めない（保存される selectable は変えない）
+    inside = lay.evaluate(state)
+    assert [x[1] for x in inside] == [x[1] for x in before] and not any(x[2] for x in inside)
+    assert lay.evaluate("() => [ModeManager.getCurrent(), canvas.selection]") == ["ikLayout", False]
+    assert "コマ割りモード" in lay.inner_text("#canvas-help-text")
+    assert lay.evaluate("() => document.getElementById('clearMode').classList.contains('selected')")
+    assert not lay.evaluate("() => document.querySelector('.ikl-overlay').hidden")
+    # モードの間に保存される状態にも、ロックは入らない
+    saved = lay.evaluate("() => JSON.parse(JSON.stringify(customToJSON())).objects.map(o => o.selectable)")
+    assert sorted(saved) == [False, True, True]
+    lay.keyboard.press("Escape")                                    # ESC
+    check_left()
+    enter(lay)
+    lay.evaluate("() => document.activeElement && document.activeElement.blur()")
+    lay.keyboard.press("Escape")                                    # キャンバス側にフォーカスがあるときの ESC（上流のショートカット）
+    check_left()
+    lay.click("#ikl-mode")
+    assert active()
+    lay.click("#clearMode")                                         # 「モード解除」のボタン
+    check_left()
+    enter(lay)
+    lay.evaluate("() => ModeManager.knife.enable()")                # ほかのモードへ切り替える
+    assert not active() and lay.evaluate("() => ModeManager.getCurrent()") == "knife"
+    lay.evaluate("() => ModeManager.clearAll()")
+    check_left()
+    enter(lay)
+    lay.click("#ikl-mode")                                          # もう一度押す
+    check_left()
+    assert image["guid"] in [x[0] for x in lay.evaluate(state)]
+
