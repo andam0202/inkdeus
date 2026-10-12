@@ -3,11 +3,10 @@
 
 import {
   SECTIONS, LEVEL_FIELDS, SOLID_FIELDS, BACKGROUND_FIELDS, LAYER_FIELDS, STYLES, MAX_LAYERS, UNIT_RANGE,
-  effectiveUnit, newLayer, newId, layerIds, WATERMARK_FALLBACK_TEXT,
+  effectiveUnit, newLayer, newId, layerIds, WATERMARK_FALLBACK_TEXT, regionLabel, newPart,
 } from './schema.js';
 
 const SECTION_LABELS = { input: '入力', lines: '線画', tone: 'トーン（ベタ・層）', watermark: '透かし', output: '出力' };
-const REGION_LABELS = { person: '人物', background: '背景' };
 
 const openState = new Map();      // 折りたたみの開閉を作り直しの間も覚えておく
 
@@ -212,14 +211,17 @@ function layerCard(ctx, region, layers, layer, index) {
 }
 
 function styleSelect(ctx, region) {
-  const sel = el('select', { id: 'selPreset', title: `${REGION_LABELS[region]}に名前付きスタイルを当てる` },
+  const part = region !== 'person' && region !== 'background';
+  const sel = el('select', { id: 'selPreset', title: `${regionLabel(region)}に名前付きスタイルを当てる` },
     el('option', { value: '' }, 'スタイルを選ぶ…'),
-    Object.entries(STYLES).map(([value, st]) => el('option', { value, title: st.description }, st.label)));
+    // 部分には、背景向けの意味を持つスタイル（白・線だけ）は出さない（「白抜き」を使う）
+    Object.entries(STYLES).filter(([, st]) => !(part && st.backgroundOnly))
+      .map(([value, st]) => el('option', { value, title: st.description }, st.label)));
   sel.addEventListener('change', () => { if (sel.value) ctx.style(sel.value, region); });
   return sel;
 }
 
-/** 領域（人物 / 背景）の 明るさ補正・ベタ・層 */
+/** 領域（人物 / 背景 / 部分）の 明るさ補正・ベタ・層 */
 function regionTone(ctx, region, target) {
   const { solo } = ctx.state;
   const layers = target.layers;
@@ -237,15 +239,17 @@ function regionTone(ctx, region, target) {
     },
   }, '層を追加');
   const levels = fold(`levels:${region}`,
-    el('summary', {}, `${REGION_LABELS[region]}の明るさ補正（トーン分けだけに効く）`),
+    el('summary', {}, `${regionLabel(region)}の明るさ補正（トーン分けだけに効く）`),
     el('div', { class: 'body' }, Object.entries(LEVEL_FIELDS).map(([k, f]) => fieldRow(ctx, f, target.levels, k))),
     'sub', false);
   levels.dataset.group = 'levels';
   return [
     levels,
     el('div', { 'data-group': 'solid', class: 'body' },
-      Object.entries(SOLID_FIELDS).map(([k, f]) => fieldRow(ctx, f, target.solid, k)),
-      erasedMark(ctx, `solid-${region}`, `${REGION_LABELS[region]}のベタには、消しゴムで消した所があります`)),
+      // 「ベタの中の線画を白抜き」は、それを知らない古いサーバにつないでいる間は出さない
+      Object.entries(SOLID_FIELDS).filter(([k]) => k !== 'lineKnockout' || ctx.state.partsOK)
+        .map(([k, f]) => fieldRow(ctx, f, target.solid, k)),
+      erasedMark(ctx, `solid-${region}`, `${regionLabel(region)}のベタには、消しゴムで消した所があります`)),
     el('div', { class: 'buttons' }, add, el('span', { class: 'note' }, `${layers.length} / ${MAX_LAYERS} 層`)),
     el('div', { class: 'note' }, '平滑化した輝度がしきい値未満の所に線を引きます。暗い所ほど多くの層が重なります。'),
     solo && solo.region === region
@@ -254,15 +258,55 @@ function regionTone(ctx, region, target) {
   ];
 }
 
+/** 部分（髪・肌・服など）のタブの中身。背景タブと同じ流儀: 最初は人物と同じ設定で描き、切り離すと独自の設定を持つ */
+function partBody(ctx, name) {
+  const { params } = ctx.state;
+  const own = params.regions[name];
+  const label = regionLabel(name);
+  if (!own || own.linked !== false) {
+    return [
+      el('div', { class: 'note', id: 'partLinkedNote' }, `${label}は人物と同じ設定で描いています。`),
+      el('div', { class: 'buttons' }, el('button', {
+        id: 'btnUnlinkPart',
+        onclick: () => {
+          // いまの人物の設定を写してから切り離す（切り離した瞬間に見た目が変わらないように）
+          params.regions[name] = newPart(params, false);
+          ctx.live(); ctx.commit(); ctx.rebuild();
+        },
+      }, 'この部分だけ別の設定にする')),
+    ];
+  }
+  return [
+    el('div', { class: 'buttons' }, styleSelect(ctx, name), el('button', {
+      id: 'btnLinkPart',
+      onclick: () => { own.linked = true; ctx.setSolo(null, false); ctx.live(); ctx.commit(); ctx.rebuild(); },
+    }, '人物と同じに戻す')),
+    ...regionTone(ctx, name, own),
+  ];
+}
+
 function toneSection(ctx) {
-  const { params, hasMask, tab } = ctx.state;
+  const { params, hasMask } = ctx.state;
   const person = params.regions.person;
   const bg = params.regions.background;
-  const tabs = el('div', { class: 'tabs' }, ['person', 'background'].map((r) => el('button', {
+  // タブは「人物 / 背景 / その画像にマスクのある部分…」
+  const names = ['person', 'background', ...(ctx.state.parts || [])];
+  const tab = names.includes(ctx.state.tab) ? ctx.state.tab : 'person';
+  const tabs = el('div', { class: 'tabs' }, names.map((r) => el('button', {
     class: tab === r ? 'on' : '', 'data-tab': r, onclick: () => ctx.setTab(r),
-  }, REGION_LABELS[r])));
+    title: r === 'person' || r === 'background' ? null : `部分「${r}」（部分マスクのある領域）`,
+  }, regionLabel(r))));
+  // 押している間、その領域を色つきで重ねて見せる（マスクの出来を目で確かめる）
+  const hi = el('button', { id: 'btnHighlight', type: 'button',
+    title: '押している間、このタブの領域を色つきで重ねて見せます（マスクの出来を確かめる）。プレビューを Alt+クリックすると、その場所の領域のタブへ切り替わります' },
+  'この領域を強調表示');
+  hi.addEventListener('pointerdown', () => ctx.highlight(tab));
+  for (const ev of ['pointerup', 'pointerleave', 'pointercancel', 'blur']) hi.addEventListener(ev, () => ctx.highlight(null));
+  const hiRow = ctx.highlight ? el('div', { class: 'buttons' }, hi) : null;
   let body;
-  if (tab === 'person') {
+  if (tab !== 'person' && tab !== 'background') {
+    body = partBody(ctx, tab);
+  } else if (tab === 'person') {
     body = [
       el('div', { class: 'buttons' }, styleSelect(ctx, 'person'),
         el('span', { class: 'note' }, hasMask ? 'マスクの内側' : 'マスクが無いので画像全体')),
@@ -300,7 +344,7 @@ function toneSection(ctx) {
       el('div', { class: hasMask ? '' : 'disabled', id: 'bgControls' }, el('div', { class: 'body' }, [...general, ...link])),
     ];
   }
-  return section('tone', [tabs, ...body]);
+  return section('tone', [tabs, hiRow, ...body]);
 }
 
 function watermarkSection(ctx) {

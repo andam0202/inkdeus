@@ -147,22 +147,46 @@ void main() {
   o = vec4(inside ? d + 0.5 : 0.5 - d, 0.0, 0.0, 1.0);
 }`;
 
+// 4d. 部分マップ: 部分マスク（255 = その部分）を、部分の番号（1〜）として1枚の R8 に重ねて書く。
+// マスクの大きさが画像と違うときは、滑らかに拡大してしきい値 0.5 で切る
+export const FS_PARTMAP = HEAD + `
+uniform sampler2D uMask;
+uniform vec2 uSize;
+uniform float uCode;
+out vec4 o;
+void main() {
+  if (texture(uMask, gl_FragCoord.xy / uSize).r < 0.5) discard;
+  o = vec4(uCode / 255.0, 0.0, 0.0, 1.0);
+}`;
+
+export const MAX_SETS = 8;           // 領域の数の上限（人物・背景・部分 6）
+export const LAYER_CAPACITIES = [16, 32, 48, 64];
+// 合成パスが使う uniform の本数の見積もり（層 1 つにつき vec4 が 3 本、それ以外をまとめて 44 本と見る）
+export const uniformVectors = (capacity) => 3 * capacity + 44;
+
 // 5. 合成: 白地 → トーン層 → ベタ → 線画（乗算）→ 背景処理 → 消しゴム「すべて」→ ペン（→ 純2値）→ 透かし
 // 消しゴム: 対象（各層 / ベタ / 線画 / すべて）ごとの消去マスク（0 = そのまま、1 = 消す）を、そのインク量に掛ける。
 // マスクは RGBA テクスチャの各チャンネルに1対象ずつ入っていて、スロット = テクスチャ番号 × 4 + チャンネル（無ければ -1）。
-// トーン（明るさ補正・ベタ・層）は「人物」と「背景」で別々の設定を持てる（配列の 0..7 が人物、8..15 が背景）。
+// トーン（明るさ補正・ベタ・層）は領域ごとに別々の設定を持てる（領域 0 = 人物、1 = 背景、2〜 = 別の設定にした部分）。
+// 層は、使う物だけを 1 本の配列に詰めてあり、領域ごとに「先頭の番号と数」で引く（配列の長さ NL は使う層の総数で選ぶ）。
+// 1 画素が計算するトーンは、人物側（人物か、その画素の部分）と背景側の高々 2 領域ぶんで、領域の数には比例しない。
 // uMode: 0 = 出力、1 / 2 = 統計用（縮小した格子で画素を抜き出し、数値を RGBA に詰める）
-export const FS_COMPOSITE = HEAD + `
+export const composite = (capacity) => HEAD + `
+#define NL ${capacity}
+#define NS ${MAX_SETS}
 uniform sampler2D uLum;      // 平滑化した輝度（トーン分け用）
 uniform sampler2D uBlur;     // RG = G(σ), G(1.6σ)
 uniform sampler2D uSdf;
 uniform sampler2D uWm;       // R = 文字, G = 文字の縁取り
-uniform ivec2 uCount;        // 層の数（人物, 背景）
-uniform vec4 uA[16];         // しきい値, ぼかし幅, sin(角度), cos(角度)
-uniform vec4 uB[16];         // 間隔px, 太さpx, 暗さで太さ, 濃さ
-uniform vec4 uC[16];         // 位相, -, -, -
-uniform vec4 uLevels[2];     // 明るさ, コントラスト, 1/ガンマ
-uniform vec4 uSolid[2];      // 有効, しきい値, ぼかし幅
+uniform sampler2D uPartMap;  // 部分の番号（0 = どの部分でもない）
+uniform int uPartOn;
+uniform ivec4 uPartSet[2];   // 部分の番号 → 領域の番号（0 = 人物と同じ設定で描く）
+uniform ivec2 uRange[NS];    // 領域ごとの層の範囲（先頭の番号, 数）
+uniform vec4 uA[NL];         // しきい値, ぼかし幅, sin(角度), cos(角度)
+uniform vec4 uB[NL];         // 間隔px, 太さpx, 暗さで太さ, 濃さ
+uniform vec4 uC[NL];         // 位相, 消去マスクのスロット, -, -
+uniform vec4 uLevels[NS];    // 明るさ, コントラスト, 1/ガンマ, ベタの消去マスクのスロット
+uniform vec4 uSolid[NS];     // 有効, しきい値, ぼかし幅, ベタの中の線画の白抜き
 uniform vec4 uLine;          // 濃さ, τ, ε, φ
 uniform int uLineOn;         // 線画の計算が必要か（ぼかしテクスチャが有効か）
 uniform int uHasMask;
@@ -182,8 +206,7 @@ uniform sampler2D uEr5;
 uniform sampler2D uEr6;
 uniform sampler2D uEr7;
 uniform int uErN;
-uniform int uErLayer[16];    // 各層（詰めた番号。0..7 人物、8..15 背景）のスロット
-uniform ivec4 uErMisc;       // ベタ（人物）, ベタ（背景）, 線画, すべて のスロット
+uniform ivec4 uErMisc;       // -, -, 線画, すべて のスロット
 uniform sampler2D uPen;      // ペン: R = 黒の量, G = 白（修正液）の量
 uniform int uPenOn;
 out vec4 o;
@@ -237,25 +260,28 @@ struct Tone {
   float L;       // 補正後の輝度
 };
 
-// 領域 r（0 人物 / 1 背景）のトーン層とベタ。重ねがけ: 残る白 = Π(1 − ink_i)
+// 領域 r（0 人物 / 1 背景 / 2〜 部分）のトーン層とベタ。重ねがけ: 残る白 = Π(1 − ink_i)
 Tone tone(float L0, int r, vec2 p) {
-  float L = adjust(L0, uLevels[r]);
-  int n = r == 0 ? uCount.x : uCount.y;
+  vec4 lv = uLevels[r];
+  float L = adjust(L0, lv);
+  ivec2 range = uRange[r];
   float white = 1.0;
   float bits = 0.0;
   for (int i = 0; i < 8; i++) {
-    if (i >= n) break;
-    vec4 A = uA[r * 8 + i];
-    vec4 B = uB[r * 8 + i];
+    if (i >= range.y) break;
+    int j = range.x + i;
+    vec4 A = uA[j];
+    vec4 B = uB[j];
+    vec4 C = uC[j];
     float m = below(L, A.x, A.y);
     if (m <= 0.0) continue;
-    float k = keep(uErLayer[r * 8 + i]);
+    float k = keep(int(C.y));
     if (m > 0.5 && k > 0.5) bits += exp2(float(i));
     // しきい値からどれだけ暗いか（0 = しきい値ちょうど、1 = 真っ黒）
     float t = clamp((A.x - L) / max(A.x, 1e-4), 0.0, 1.0);
     // 境界のぼかしは線を細らせて表す（灰色にはしない）
     float w = min(B.y * (1.0 + B.z * (2.0 * t - 1.0)) * m, B.x);
-    float u = dot(p, A.zw) / B.x + uC[r * 8 + i].x;
+    float u = dot(p, A.zw) / B.x + C.x;
     u -= floor(u + 0.5);
     float dist = abs(u) * B.x;                 // 最寄りの線中心までの距離
     float h = 0.5 * w;
@@ -263,7 +289,9 @@ Tone tone(float L0, int r, vec2 p) {
     float ink = clamp(min(dist + 0.5, h) - max(dist - 0.5, -h), 0.0, 1.0);
     white *= 1.0 - ink * B.w * k;
   }
-  float s = uSolid[r].x > 0.5 ? below(L, uSolid[r].y, uSolid[r].z) * keep(uErMisc[r]) : 0.0;
+  vec4 so = uSolid[r];
+  // しきい値 1 は「全面ベタ」（輝度がちょうど 1 の画素も塗る）
+  float s = so.x > 0.5 ? (so.y >= 1.0 ? 1.0 : below(L, so.y, so.z)) * keep(int(lv.w)) : 0.0;
   return Tone(white * (1.0 - s), bits, s, L);
 }
 
@@ -288,6 +316,13 @@ void main() {
   }
   int mode = int(uBg.x + 0.5);
 
+  // --- 部分（髪・肌・服など）: その画素の部分の番号から、人物側の領域を決める ---
+  // 別の設定にした部分（領域 2〜）の画素は、人物マスクの広げ/縮めに関わらずその部分として描く（部分の境界は生のマスクのまま）
+  int part = 0;
+  if (uPartOn == 1) part = int(texelFetch(uPartMap, ip, 0).r * 255.0 + 0.5);
+  int rp = part > 0 ? uPartSet[part >> 2][part & 3] : 0;
+  float pwE = rp >= 2 ? 1.0 : pw;
+
   // --- 線画 (XDoG) ---
   float line = 0.0;
   if (uLineOn == 1) {
@@ -301,16 +336,19 @@ void main() {
   // --- 人物 / 背景それぞれのトーンを作って、人物の重みで混ぜる ---
   Tone tp = Tone(1.0, 0.0, 0.0, L0);
   Tone tb = Tone(1.0, 0.0, 0.0, adjust(L0, uLevels[1]));
-  if (pw > 0.0) tp = tone(L0, 0, p);
+  if (pwE > 0.0) tp = tone(L0, rp, p);
   float bgLine = lineInk;
   if (mode == 0) {
-    if (pw < 1.0) tb = tone(L0, 1, p);
+    if (pwE < 1.0) tb = tone(L0, 1, p);
   } else if (mode == 2) {
     bgLine = uBg.w * line * keepLine;
   } else {
     bgLine = 0.0;
   }
-  float v = mix(tb.v * (1.0 - bgLine), tp.v * (1.0 - lineInk), pw);
+  // ベタの中の線画の白抜き: ベタで塗られた所の線画を、白で描く（強さ 0 なら何も足さない）
+  float knock = line * keepLine;
+  float v = mix(tb.v * (1.0 - bgLine) + tb.solid * knock * uSolid[1].w,
+                tp.v * (1.0 - lineInk) + tp.solid * knock * uSolid[rp].w, pwE);
   if (mode == 1 && uBg.z > 0.0) v *= 1.0 - clamp(uBg.z - sd + 0.5, 0.0, 1.0) * pw * keepLine;   // シルエット線
 
   // --- 消しゴム「すべて」: その場所を白にする（トーン・ベタ・線画をまとめて消す） ---
@@ -350,15 +388,17 @@ void main() {
   if (uMode == 0) {
     o = vec4(v, 0.0, 0.0, 1.0);
   } else if (uMode == 1) {
-    // 出力値, 人物の重み, 線画の濃さ, ベタの量（画素が属する領域のもの）
-    bool person = pw >= 0.5;
-    o = vec4(v, pw, person ? lineInk : bgLine, person ? tp.solid : tb.solid);
+    // 出力値, 人物側の重み, 線画の濃さ, ベタの量（画素が属する領域のもの）
+    bool person = pwE >= 0.5;
+    o = vec4(v, pwE, person ? lineInk : bgLine, person ? tp.solid : tb.solid);
   } else {
-    // 元の輝度, 補正後の輝度, 描かれた層のビット集合（画素が属する領域のもの）
-    bool person = pw >= 0.5;
-    o = vec4(L0, person ? tp.L : tb.L, (person ? tp.bits : tb.bits) / 255.0, 1.0);
+    // 元の輝度, 補正後の輝度, 描かれた層のビット集合（画素が属する領域のもの）, 部分の番号
+    bool person = pwE >= 0.5;
+    o = vec4(L0, person ? tp.L : tb.L, (person ? tp.bits : tb.bits) / 255.0, float(part) / 255.0);
   }
 }`;
+
+export const FS_COMPOSITE = composite(LAYER_CAPACITIES[0]);
 
 // 6. 表示: 出力テクスチャ（ミップマップ付き）を拡大縮小・移動して描く
 export const FS_DISPLAY = HEAD + `
@@ -370,6 +410,11 @@ uniform float uZoom;         // 画像1px が何デバイスpx か
 uniform vec2 uImg;
 uniform float uSplit;        // 比較の仕切りの x（デバイスpx）。負なら無し
 uniform int uOriginal;       // 1: 元画像を表示
+uniform sampler2D uSdf;
+uniform sampler2D uPartMap;
+uniform ivec4 uHi;           // 領域の強調表示: 種類（0 なし /1 人物 /2 背景 /3 部分）, 部分の番号, マスクあり, 部分マップあり
+uniform float uHiGrow;       // 人物マスクの広げ量（px）
+uniform int uHiOwn;          // 別の設定にした部分のビット集合（その画素は、人物・背景の強調には入れない）
 out vec4 o;
 void main() {
   vec2 fc = vec2(gl_FragCoord.x, uCanvas.y - gl_FragCoord.y);
@@ -377,6 +422,14 @@ void main() {
   vec3 src = texture(uSrc, uv).rgb;
   float outv = texture(uOut, uv).r;
   vec3 col = (uOriginal == 1 || fc.x < uSplit) ? src : vec3(outv);
+  if (uHi.x != 0) {
+    ivec2 ip = clamp(ivec2(floor(uv * uImg)), ivec2(0), ivec2(uImg) - 1);
+    int part = uHi.w == 1 ? int(texelFetch(uPartMap, ip, 0).r * 255.0 + 0.5) : 0;
+    bool own = part > 0 && ((uHiOwn >> part) & 1) == 1;
+    bool inside = uHi.z == 1 ? texelFetch(uSdf, ip, 0).r + uHiGrow >= 0.0 : true;
+    bool hit = uHi.x == 3 ? part == uHi.y : (!own && (uHi.x == 1) == inside);
+    if (hit) col = mix(col, vec3(1.0, 0.25, 0.55), 0.55);
+  }
   if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) col = vec3(0.16, 0.16, 0.18);
   if (uSplit >= 0.0 && abs(fc.x - uSplit) < 1.0) col = vec3(0.95, 0.45, 0.1);
   o = vec4(col, 1.0);

@@ -15,6 +15,27 @@ export const BACKGROUND_FIELDS = SCHEMA.background;
 export const LAYER_FIELDS = SCHEMA.layer;
 export const STYLES = SCHEMA.styles;
 export const REGIONS = ['person', 'background'];
+// 部分（髪・肌・服など。部分マスクのある領域）。設定は regions.<部分名> = { linked, levels, solid, layers }
+export const PART_FIELDS = SCHEMA.part || { linked: { type: 'bool', def: true, label: '人物と同じ設定を使う' } };
+const PARTS = SCHEMA.parts || { max: 6, reserved: ['person', 'background', 'all'], labels: {} };
+export const MAX_PARTS = PARTS.max;
+const PART_NAME_RE = /^[\p{L}\p{N}_-]{1,32}$/u;
+const REGION_LABELS = { person: '人物', background: '背景' };
+
+export const isPartName = (name) => typeof name === 'string' && PART_NAME_RE.test(name) && !PARTS.reserved.includes(name);
+
+/** 領域の表示名（hair → 髪 などは既定の対訳。それ以外の部分は名前そのまま） */
+export const regionLabel = (name) => REGION_LABELS[name] || PARTS.labels[name] || name;
+
+/** 設定の regions にある、部分の項目の名前 */
+export function partKeys(params) {
+  const regions = params && params.regions;
+  if (!isObject(regions)) return [];
+  return Object.keys(regions).filter((k) => !REGIONS.includes(k) && isPartName(k) && isObject(regions[k]));
+}
+
+/** 層を持つ領域の名前（人物・背景・部分） */
+export const regionNames = (params) => [...REGIONS, ...partKeys(params)];
 
 const isObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
 const clone = (v) => JSON.parse(JSON.stringify(v));
@@ -31,10 +52,10 @@ export function newId(taken = null) {
   }
 }
 
-/** 設定に含まれる層の id（人物・背景の両方） */
+/** 設定に含まれる層の id（人物・背景・部分のすべて） */
 export function layerIds(params) {
   const out = new Set();
-  for (const r of REGIONS) {
+  for (const r of regionNames(params)) {
     for (const l of (params && params.regions && params.regions[r] && params.regions[r].layers) || []) {
       if (l && l.id) out.add(l.id);
     }
@@ -44,7 +65,20 @@ export function layerIds(params) {
 
 /** 層の id を除いた設定（id だけが違う設定を「同じ」と見なすための比較用、と、id を知らない古いサーバへの保存用） */
 export function withoutIds(params) {
-  return JSON.parse(JSON.stringify(params, (key, value) => (key === 'id' ? undefined : value)));
+  return JSON.parse(JSON.stringify(params, (key, value) => (key === 'id' && typeof value === 'string' ? undefined : value)));
+}
+
+/**
+ * 部分まわりの項目（regions.<部分名>、solid.lineKnockout）を除いた設定。
+ * それらを知らない古いサーバへ保存するときに使う（知らないキーがあると、外部操作（ctl）が設定を受け付けなくなる）
+ */
+export function withoutParts(params) {
+  const out = clone(params);
+  for (const key of partKeys(out)) delete out.regions[key];
+  for (const r of REGIONS) {
+    if (out.regions && out.regions[r] && isObject(out.regions[r].solid)) delete out.regions[r].solid.lineKnockout;
+  }
+  return out;
 }
 
 function normValue(v, f, path, problems) {
@@ -139,7 +173,7 @@ export function migrate(raw) {
  * 任意の JSON を設定オブジェクトに整える。欠けたキーは既定値で補い、
  * 未知のキー・使えない値は warnings に積む（黙って無視しない）。
  */
-export function normalize(input) {
+export function normalize(input, knownParts = []) {
   const warnings = [];
   let raw = input;
   if (!isObject(raw)) {
@@ -172,16 +206,26 @@ export function normalize(input) {
     regions = undefined;
   }
   regions = regions || {};
+  // 部分の項目は、知っている部分名（部分マスクのある部分）か、部分の項目の形（linked を持つ）をしていれば残す
+  // （その画像に無い部分の設定も、別の画像へ引き継いだときのために残す。警告しない）
+  const parts = [];
   for (const key of Object.keys(regions)) {
-    if (!REGIONS.includes(key)) warnings.push(`未知のキー: regions.${key}`);
+    if (REGIONS.includes(key)) continue;
+    if (isPartName(key) && (knownParts.includes(key) || (isObject(regions[key]) && 'linked' in regions[key]))) parts.push(key);
+    else warnings.push(`未知のキー: regions.${key}`);
   }
   const tone = ['levels', 'solid', 'layers'];
-  const ids = { taken: new Set(), filled: false };   // 層の id は、人物・背景を通して重複させない
+  const ids = { taken: new Set(), filled: false };   // 層の id は、人物・背景・部分を通して重複させない
   const personSrc = normFields(regions.person, {}, 'regions.person', warnings, tone);
   normRegionTone(isObject(regions.person) ? regions.person : {}, personSrc, 'regions.person', warnings, ids);
   const bg = normFields(regions.background, BACKGROUND_FIELDS, 'regions.background', warnings, tone);
   normRegionTone(isObject(regions.background) ? regions.background : {}, bg, 'regions.background', warnings, ids);
   params.regions = { person: personSrc, background: bg };
+  for (const key of parts) {
+    const part = normFields(regions[key], PART_FIELDS, `regions.${key}`, warnings, tone);
+    normRegionTone(isObject(regions[key]) ? regions[key] : {}, part, `regions.${key}`, warnings, ids);
+    params.regions[key] = part;
+  }
 
   params.watermark = normFields(raw.watermark, SECTIONS.watermark, 'watermark', warnings);
   params.output = normFields(raw.output, SECTIONS.output, 'output', warnings);
@@ -206,7 +250,7 @@ export function inheritIds(raw, base) {
   if (!isObject(raw) || !isObject(raw.regions) || !base) return raw;
   const out = clone(raw);
   const used = layerIds(out);
-  for (const r of REGIONS) {
+  for (const r of regionNames(out)) {
     const layers = isObject(out.regions[r]) ? out.regions[r].layers : null;
     const before = (base.regions && base.regions[r] && base.regions[r].layers) || [];
     if (!Array.isArray(layers)) continue;
@@ -220,9 +264,17 @@ export function inheritIds(raw, base) {
 
 const styleKeyOf = (s) => String(s).normalize('NFKC').toLowerCase().replace(/[\s_]/g, '');
 
-/** スタイル名（キーまたは別名）からキーを引く。無ければ null */
-export function resolveStyle(name) {
+/**
+ * スタイル名（キーまたは別名）からキーを引く。無ければ null。
+ * region が人物・部分のときは、その向きの別名（「白」「白抜き」→ blank）を先に見る
+ */
+export function resolveStyle(name, region = null) {
   const want = styleKeyOf(name);
+  if (region && region !== 'background' && region !== 'both') {
+    for (const [key, style] of Object.entries(STYLES)) {
+      if ((style.aliasesNonBackground || []).some((a) => styleKeyOf(a) === want)) return key;
+    }
+  }
   for (const [key, style] of Object.entries(STYLES)) {
     if (styleKeyOf(key) === want || styleKeyOf(style.label) === want
       || (style.aliases || []).some((a) => styleKeyOf(a) === want)) return key;
@@ -230,28 +282,47 @@ export function resolveStyle(name) {
   return null;
 }
 
+/** 部分の項目を新しく作る。人物の levels / solid / layers を写す（切り離した瞬間に見た目が変わらないように） */
+export function newPart(params, linked = true) {
+  const person = params.regions.person;
+  const taken = layerIds(params);
+  const layers = person.layers.map((l) => { const id = newId(taken); taken.add(id); return { ...l, id }; });
+  return { linked, levels: { ...person.levels }, solid: { ...person.solid }, layers };
+}
+
 /**
  * 名前付きスタイルを領域に適用した新しい設定を返す。
  * 人物: ベタと層を差し替える。背景: 人物との連動を切り、描き方・ベタ・層を差し替える。
+ * 部分（region が部分名）: 人物との連動を切り、ベタ・層を差し替える。
+ * custom を渡すと、名前から引く代わりにその定義（solid / layers / backgroundMode / levels）を使う（自分用スタイル）
  */
-export function applyStyle(params, name, region = 'person') {
-  const key = resolveStyle(name);
-  if (!key) throw new Error(`スタイルが見つかりません: ${name}`);
-  const style = STYLES[key];
+export function applyStyle(params, name, region = 'person', custom = null) {
+  const key = custom ? null : resolveStyle(name, region);
+  if (!custom && !key) throw new Error(`スタイルが見つかりません: ${name}`);
+  const style = custom || STYLES[key];
   const next = clone(params);
   const taken = layerIds(next);
   const fill = (target) => {
     // 層は入れ替わるので、新しい id を振る（前の層の消しゴムのマスクは引き継がない）
-    target.solid = { ...target.solid, ...clone(style.solid) };
-    target.layers = style.layers.map((l) => { const made = newLayer(l, taken); taken.add(made.id); return made; });
+    target.solid = { ...target.solid, ...clone(style.solid || {}) };
+    target.layers = (style.layers || []).map((l) => { const made = newLayer(l, taken); taken.add(made.id); return made; });
+    if (isObject(style.levels)) target.levels = { ...target.levels, ...clone(style.levels) };
   };
   if (region === 'person' || region === 'both') fill(next.regions.person);
   if (region === 'background' || region === 'both') {
     const bg = next.regions.background;
     if (bg.linked) bg.levels = clone(next.regions.person.levels);
     bg.linked = false;
-    bg.mode = style.backgroundMode;
+    bg.mode = style.backgroundMode || 'keep';
     fill(bg);
+  }
+  if (!REGIONS.includes(region) && region !== 'both') {
+    if (!isPartName(region)) throw new Error(`領域として使えません: ${region}`);
+    let part = next.regions[region];
+    if (!isObject(part)) part = next.regions[region] = newPart(next);
+    else if (part.linked) part.levels = clone(next.regions.person.levels);
+    part.linked = false;
+    fill(part);
   }
   return next;
 }
@@ -266,7 +337,7 @@ export function effectiveUnit(params, imageWidth) {
  * 実際に描く領域別の設定。マスクが無ければ全体が人物扱い。
  * 背景が人物と連動（linked）している間は、背景も人物の levels / solid / layers を使う。
  */
-export function effectiveRegions(params, hasMask) {
+export function effectiveRegions(params, hasMask, parts = []) {
   const { person, background } = params.regions;
   const mode = hasMask ? background.mode : 'keep';
   const tone = background.linked || !hasMask ? person : background;
@@ -274,6 +345,13 @@ export function effectiveRegions(params, hasMask) {
     mode,
     person: { levels: person.levels, solid: person.solid, layers: person.layers },
     background: { levels: tone.levels, solid: tone.solid, layers: tone.layers, linked: tone === person },
+    // 部分マスクのある部分（parts はその画像の部分名の並び）。linked の間は人物と同じ設定で描く
+    parts: parts.map((name) => {
+      const own = params.regions[name];
+      const linked = !isObject(own) || own.linked !== false;
+      const t = linked ? person : own;
+      return { name, linked, levels: t.levels, solid: t.solid, layers: t.layers };
+    }),
   };
 }
 

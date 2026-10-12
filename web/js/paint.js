@@ -15,7 +15,8 @@ export const MASK_MAX_SIDE = 2048;
 const MASK_TEXTURES = 8;                 // RGBA × 8 = 32 対象ぶん
 export const PEN = 'pen';
 export const FIXED_TARGETS = ['solid-person', 'solid-background', 'lines', 'all'];
-const TARGET_RE = /^(layer-[a-z0-9]{4,16}|solid-person|solid-background|lines|all|pen)$/;
+// solid-<領域> の領域は person / background / 部分名（部分のベタ）
+const TARGET_RE = /^(layer-[a-z0-9]{4,16}|solid-[\p{L}\p{N}_-]{1,32}|lines|all|pen)$/u;
 
 export const isTarget = (name) => typeof name === 'string' && TARGET_RE.test(name);
 export const layerTarget = (id) => `layer-${id}`;
@@ -547,7 +548,8 @@ export class Paint {
 
   /**
    * 合成パスのユニフォームを設定する。
-   * layerSlots: 16 個（人物 8 + 背景 8）の、詰めた層番号 → スロット。misc: [ベタ人物, ベタ背景, 線画, すべて]
+   * layerSlots: 合成で使う層・ベタのスロットの並び（1 つでも 0 以上なら、消去マスクを読む）。misc: [-, -, 線画, すべて]
+   * （層とベタのスロットそのものは、合成パスの uC / uLevels に入れて渡す）
    */
   bind(p, layerSlots, misc, showPen) {
     const gl = this.gl;
@@ -558,7 +560,6 @@ export class Paint {
       else gl.uniform1i(p.loc(`uEr${i}`), 0);          // 使わない分は、同じ型のテクスチャが入っている 0 番へ
     }
     gl.uniform1i(p.loc('uErN'), used ? this.maskTex.length : 0);
-    gl.uniform1iv(p.loc('uErLayer'), layerSlots);
     gl.uniform4i(p.loc('uErMisc'), misc[0], misc[1], misc[2], misc[3]);
     const pen = showPen && this.penOn();
     if (pen) r.sampler(p, 'uPen', this.penTex);

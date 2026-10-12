@@ -2,7 +2,7 @@
 // 依存する設定が変わったパスだけを再計算する（各パスが「何から作ったか」のキーを覚えている）。
 
 import * as S from './shaders.js';
-import { effectiveUnit, effectiveRegions, effectiveWatermark, MAX_LAYERS } from './schema.js';
+import { effectiveUnit, effectiveRegions, effectiveWatermark, MAX_LAYERS, MAX_PARTS } from './schema.js';
 import { Paint, layerTarget } from './paint.js';
 
 const MAX_SMOOTH_RADIUS = 64;
@@ -24,6 +24,14 @@ export class Renderer {
     }
     this.gl = gl;
     this.maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    // 合成パスの制限。テクスチャは最大 14 枚（輝度・ぼかし・距離場・透かし・部分マップ・消去マスク 8・ペン）で、
+    // WebGL2 が保証する 16 に収まる。uniform の本数は、使う層の総数に合わせて配列の長さを選ぶ
+    this.maxUniformVectors = gl.getParameter(gl.MAX_FRAGMENT_UNIFORM_VECTORS);
+    this.maxTextureUnits = gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS);
+    this.maxLayers = Math.max(S.LAYER_CAPACITIES[0],
+      ...S.LAYER_CAPACITIES.filter((c) => S.uniformVectors(c) <= this.maxUniformVectors));
+    this.parts = [];          // 部分マップに入っている部分名（番号 1〜 の順）
+    this.dropped = [];        // 層の総数が上限を超えたために、人物と同じ設定で描いた部分
     this.lost = false;
     canvas.addEventListener('webglcontextlost', (e) => { e.preventDefault(); this.lost = true; });
     this.vao = gl.createVertexArray();
@@ -136,6 +144,7 @@ export class Renderer {
     this.H = height;
     this.imageId += 1;
     this.hasMask = false;
+    this.parts = [];
     this.wmRect = null;
     this.tex.src = this.createTexture(gl.RGBA8, width, height, { mips: true });
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, source);
@@ -223,6 +232,75 @@ export class Renderer {
     gl.deleteTexture(b);
     gl.deleteTexture(mask);
     this.hasMask = true;
+  }
+
+  /**
+   * 部分マスク（[{ name, source }]。白 = その部分）から、部分の番号（1〜）の地図を 1 枚の R8 に作る。
+   * 部分は互いに重ならない前提（重なったら、並びの後ろの部分が勝つ）。空の並び・null で解除
+   */
+  setParts(list) {
+    this.drop('partMap');
+    this.parts = [];
+    for (const { name, source } of list || []) this.addPart(name, source);
+  }
+
+  /** 部分マスクを 1 つ、部分マップへ足す（1 枚ずつ読んで足せるように。足せたら true） */
+  addPart(name, source) {
+    const gl = this.gl;
+    if (!this.W || !source || this.parts.length >= MAX_PARTS || this.parts.includes(name)) return false;
+    const { W, H } = this;
+    let map = this.tex.partMap;
+    if (!map) {
+      map = this.work('partMap', gl.R8);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, map, 0);
+      gl.viewport(0, 0, W, H);
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+    const mask = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, mask);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+      [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) {
+      gl.texParameteri(gl.TEXTURE_2D, k, v);
+    }
+    this.parts.push(name);
+    this.pass('partmap', S.FS_PARTMAP, map, W, H, (p) => {
+      this.sampler(p, 'uMask', mask);
+      gl.uniform2f(p.loc('uSize'), W, H);
+      gl.uniform1f(p.loc('uCode'), this.parts.length);
+    });
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
+    gl.deleteTexture(mask);
+    return true;
+  }
+
+  /**
+   * 画像の座標 (x, y) がどの領域か。{ part: 部分名 | null, inside: 人物マスク（広げ込み）の内側か }。画像の外は null
+   */
+  regionAt(x, y, growPx = 0) {
+    const gl = this.gl;
+    const ix = Math.floor(x);
+    const iy = Math.floor(y);
+    if (!this.W || ix < 0 || iy < 0 || ix >= this.W || iy >= this.H) return null;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
+    let part = null;
+    if (this.tex.partMap) {
+      const buf = new Uint8Array(4);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.tex.partMap, 0);
+      gl.readPixels(ix, iy, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      part = buf[0] > 0 ? this.parts[buf[0] - 1] || null : null;
+    }
+    let inside = true;
+    if (this.hasMask && this.tex.sdf) {
+      const buf = new Float32Array(4);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.tex.sdf, 0);
+      gl.readPixels(ix, iy, 1, 1, gl.RGBA, gl.FLOAT, buf);
+      inside = buf[0] + growPx >= 0;
+    }
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
+    return { part, inside };
   }
 
   // ---- 各パス（キーが変わったときだけ計算） ----
@@ -337,23 +415,25 @@ export class Renderer {
   prepare(params, { solo = null } = {}) {
     const { W, H } = this;
     const unit = effectiveUnit(params, W);
-    const regions = effectiveRegions(params, this.hasMask);
+    const regions = effectiveRegions(params, this.hasMask, this.parts);
     const bg = params.regions.background;
     const soloing = !!solo;
     const mode = soloing ? 0 : { keep: 0, white: 1, lines: 2 }[regions.mode] || 0;
     const lineStrength = params.lines.enabled && !soloing ? params.lines.strength : 0;
-    const needLines = lineStrength > 0 || mode === 2;
 
-    const sets = ['person', 'background'].map((name, r) => {
-      const reg = regions[name];
+    // 領域の並び: 0 = 人物、1 = 背景、2〜 = 別の設定にした部分（linked の部分は、人物の領域で描く）
+    const makeSet = (name, reg, r) => {
       // ソロ表示は、連動中の背景なら人物の層として扱う
       const soloHere = soloing && (solo.region === name || (name === 'background' && reg.linked && solo.region === 'person'));
       const layers = reg.layers
         .map((l, i) => ({ l, i }))
         .filter(({ l, i }) => l.type === 'hatch' && (soloing ? soloHere && i === solo.index : l.enabled))
         .slice(0, MAX_LAYERS);
-      const active = r === 0 || mode === 0;        // 背景の層とベタは「層で描く」ときだけ
+      const active = r !== 1 || mode === 0;        // 背景の層とベタは「層で描く」ときだけ
       return {
+        name,
+        // 人物と同じ層の並びを使う（配列には 1 回だけ詰める）
+        shared: name === 'background' && reg.linked && !(soloing && solo.region === 'background'),
         layers: active ? layers : [],
         solidOn: active && reg.solid.enabled && !soloing,
         solid: reg.solid,
@@ -361,7 +441,27 @@ export class Renderer {
         // 統計用: 設定上の層番号（無効な層は飛ばして詰めてあるため）
         index: (active ? layers : []).map(({ i }) => i),
       };
+    };
+    const sets = [makeSet('person', regions.person, 0), makeSet('background', regions.background, 1)];
+    const partSet = new Int32Array(8);              // 部分の番号（1〜）→ 領域の番号（0 = 人物と同じ設定で描く）
+    const own = (set) => (set.shared ? 0 : set.layers.length);
+    let total = own(sets[0]) + own(sets[1]);
+    this.dropped = [];
+    regions.parts.forEach((part, i) => {
+      if (part.linked) return;
+      const set = makeSet(part.name, part, sets.length);
+      // 層の総数が、この環境の uniform の上限から決まる数を超えるなら、その部分は人物と同じ設定で描く
+      if (sets.length >= S.MAX_SETS || total + set.layers.length > this.maxLayers) {
+        this.dropped.push(part.name);
+        return;
+      }
+      total += set.layers.length;
+      partSet[i + 1] = sets.length;
+      sets.push(set);
     });
+    const capacity = S.LAYER_CAPACITIES.find((c) => c >= total) || this.maxLayers;
+    const knockout = !soloing && sets.some((x) => x.solidOn && x.solid.lineKnockout > 0);
+    const needLines = lineStrength > 0 || mode === 2 || knockout;
 
     const lumKey = this.ensureLum(params.input.autoLevel);
     const needTone = sets.some((x) => x.layers.length || x.solidOn);
@@ -400,31 +500,41 @@ export class Renderer {
       }
     }
 
-    const A = new Float32Array(MAX_LAYERS * 8);
-    const B = new Float32Array(MAX_LAYERS * 8);
-    const C = new Float32Array(MAX_LAYERS * 8);
-    const levels = new Float32Array(8);
-    const solid = new Float32Array(8);
-    sets.forEach((set, r) => {
-      set.layers.forEach(({ l }, k) => {
-        const a = (l.angle * Math.PI) / 180;
-        const spacing = Math.max(0.25, l.spacing * unit);
-        const at = (r * MAX_LAYERS + k) * 4;
-        A.set([l.threshold, l.soft, Math.sin(a), Math.cos(a)], at);
-        B.set([spacing, l.width * unit, l.widthByDarkness, l.opacity], at);
-        C.set([l.phase, 0, 0, 0], at);
-      });
-      levels.set([set.levels.brightness, set.levels.contrast, 1 / Math.max(0.01, set.levels.gamma), 0], r * 4);
-      solid.set([set.solidOn ? 1 : 0, set.solid.threshold, set.solid.soft, 0], r * 4);
-    });
-
-    // 消しゴム: 各層（詰めた番号）・ベタ・線画・すべて の消去マスクのスロット（描いた物が無ければ -1）
+    // 層は、使う物だけを 1 本の配列に詰める（領域ごとに「先頭の番号と数」で引く）。
+    // 消しゴム: 各層・ベタ・線画・すべて の消去マスクのスロット（描いた物が無ければ -1）も一緒に渡す
     const paint = this.paint;
-    const layerSlots = new Int32Array(MAX_LAYERS * 2).fill(-1);
-    sets.forEach((set, r) => set.layers.forEach(({ l }, k) => {
-      if (l.id) layerSlots[r * MAX_LAYERS + k] = paint.slotOf(layerTarget(l.id));
-    }));
-    const miscSlots = ['solid-person', 'solid-background', 'lines', 'all'].map((t) => paint.slotOf(t));
+    const A = new Float32Array(capacity * 4);
+    const B = new Float32Array(capacity * 4);
+    const C = new Float32Array(capacity * 4);
+    const ranges = new Int32Array(S.MAX_SETS * 2);
+    const levels = new Float32Array(S.MAX_SETS * 4);
+    const solid = new Float32Array(S.MAX_SETS * 4);
+    const slots = [];
+    let next = 0;
+    sets.forEach((set, r) => {
+      if (set.shared) {
+        ranges.set(set.layers.length ? [ranges[0], ranges[1]] : [0, 0], r * 2);
+      } else {
+        ranges.set([next, set.layers.length], r * 2);
+        set.layers.forEach(({ l }) => {
+          const a = (l.angle * Math.PI) / 180;
+          const spacing = Math.max(0.25, l.spacing * unit);
+          const slot = l.id ? paint.slotOf(layerTarget(l.id)) : -1;
+          const at = next * 4;
+          A.set([l.threshold, l.soft, Math.sin(a), Math.cos(a)], at);
+          B.set([spacing, l.width * unit, l.widthByDarkness, l.opacity], at);
+          C.set([l.phase, slot, 0, 0], at);
+          slots.push(slot);
+          next += 1;
+        });
+      }
+      const solidSlot = paint.slotOf(`solid-${set.name}`);
+      slots.push(solidSlot);
+      levels.set([set.levels.brightness, set.levels.contrast, 1 / Math.max(0.01, set.levels.gamma), solidSlot], r * 4);
+      solid.set([set.solidOn ? 1 : 0, set.solid.threshold, set.solid.soft, set.solid.lineKnockout || 0], r * 4);
+    });
+    const miscSlots = [-1, -1, paint.slotOf('lines'), paint.slotOf('all')];
+    const partMap = this.tex.partMap || null;
 
     const gl = this.gl;
     const apply = (p, statMode, sw, sh) => {
@@ -432,7 +542,13 @@ export class Renderer {
       this.sampler(p, 'uBlur', blur || this.tex.lum);
       this.sampler(p, 'uSdf', this.tex.sdf || this.tex.lum);
       this.sampler(p, 'uWm', wmTex || this.tex.lum);
-      gl.uniform2i(p.loc('uCount'), sets[0].layers.length, sets[1].layers.length);
+      // 部分マップは、別の設定にした部分があるとき（と、統計で部分ごとに数えるとき）だけ読む
+      const partOn = !!partMap && (sets.length > 2 || statMode !== 0);
+      if (partOn) this.sampler(p, 'uPartMap', partMap);
+      else gl.uniform1i(p.loc('uPartMap'), 0);
+      gl.uniform1i(p.loc('uPartOn'), partOn ? 1 : 0);
+      gl.uniform4iv(p.loc('uPartSet'), partSet);
+      gl.uniform2iv(p.loc('uRange'), ranges);
       gl.uniform4fv(p.loc('uA'), A);
       gl.uniform4fv(p.loc('uB'), B);
       gl.uniform4fv(p.loc('uC'), C);
@@ -448,9 +564,9 @@ export class Renderer {
       gl.uniform1i(p.loc('uMode'), statMode);
       gl.uniform2f(p.loc('uSampleScale'), statMode ? W / sw : 1, statMode ? H / sh : 1);
       gl.uniform2i(p.loc('uSize'), W, H);
-      paint.bind(p, layerSlots, miscSlots, !soloing);     // ソロ表示の間は、ペンの絵は隠す
+      paint.bind(p, slots, miscSlots, !soloing);          // ソロ表示の間は、ペンの絵は隠す
     };
-    return { apply, unit, sets, mode };
+    return { apply, unit, sets, mode, partSet, capacity, program: `composite${capacity}`, fs: S.composite(capacity) };
   }
 
   /**
@@ -469,7 +585,7 @@ export class Renderer {
       gl.scissor(opts.rect.x, opts.rect.y, opts.rect.w, opts.rect.h);
     }
     try {
-      this.pass('composite', S.FS_COMPOSITE, this.tex.out, W, H, (p) => prep.apply(p, 0, W, H));
+      this.pass(prep.program, prep.fs, this.tex.out, W, H, (p) => prep.apply(p, 0, W, H));
     } finally {
       gl.disable(gl.SCISSOR_TEST);
     }
@@ -499,7 +615,7 @@ export class Renderer {
     this.lastPasses = before;
     const tmp = this.createTexture(gl.RGBA8, sw, sh);
     const read = (mode) => {
-      this.pass('composite', S.FS_COMPOSITE, tmp, sw, sh, (p) => prep.apply(p, mode, sw, sh));
+      this.pass(prep.program, prep.fs, tmp, sw, sh, (p) => prep.apply(p, mode, sw, sh));
       const buf = new Uint8Array(sw * sh * 4);
       gl.readPixels(0, 0, sw, sh, gl.RGBA, gl.UNSIGNED_BYTE, buf);
       return buf;
@@ -514,12 +630,17 @@ export class Renderer {
       lum: new Uint32Array(256), adjusted: new Uint32Array(256),
     });
     const acc = { all: make(), person: make(), background: make() };
+    // 部分ごとの集計（その部分のマスクの画素。人物と同じ設定で描いている部分は、人物の集計にも入る）
+    const partAcc = this.parts.map(() => make());
     const n = sw * sh;
     for (let i = 0; i < n; i++) {
       const v = a[i * 4];
-      const person = a[i * 4 + 1] >= 128;
+      const code = Math.min(b[i * 4 + 3], partAcc.length);
       const bits = b[i * 4 + 2];
-      for (const t of [acc.all, person ? acc.person : acc.background]) {
+      const targets = [acc.all];
+      if (!(code > 0 && prep.partSet[code] >= 2)) targets.push(a[i * 4 + 1] >= 128 ? acc.person : acc.background);
+      if (code > 0) targets.push(partAcc[code - 1]);
+      for (const t of targets) {
         t.n += 1;
         if (v < 128) t.black += 1;
         t.density += 255 - v;
@@ -544,25 +665,32 @@ export class Renderer {
     };
     const output = {};
     const input = {};
-    ['all', 'person', 'background'].forEach((name) => {
-      const t = acc[name];
+    const put = (name, t, set, extra = {}) => {
       const o = {
         areaRatio: round(t.n / n),
         blackRatio: t.n ? round(t.black / t.n) : null,
         meanDensity: t.n ? round(t.density / t.n / 255) : null,
         solidRatio: t.n ? round(t.solid / t.n) : null,
         lineRatio: t.n ? round(t.line / t.n) : null,
+        ...extra,
       };
-      if (name !== 'all') {
-        const set = prep.sets[name === 'person' ? 0 : 1];
+      if (set) {
         // 層ごとの「描かれている画素の割合」（その領域の中で）。layer は設定上の層番号
         o.layers = t.n ? set.index.map((layerIndex, k) => ({ layer: layerIndex, coverage: round(t.layers[k] / t.n) })) : [];
       }
       output[name] = o;
       input[name] = { luminance: summary(t.lum, t.n), adjusted: summary(t.adjusted, t.n) };
-    });
+    };
+    put('all', acc.all, null);
+    put('person', acc.person, prep.sets[0]);
+    put('background', acc.background, prep.sets[1]);
+    // 部分: linked = 人物と同じ設定で描いている（そのときの layers は人物の層）
+    this.parts.forEach((name, k) => put(name, partAcc[k], prep.sets[prep.partSet[k + 1]], { linked: prep.partSet[k + 1] < 2 }));
     return {
       width: W, height: H, unit: round(prep.unit), hasMask: this.hasMask, samples: n,
+      parts: this.parts.slice(),
+      // 層の総数が上限を超えたために、人物と同じ設定で描いた部分（普通は空）
+      ...(this.dropped.length ? { droppedParts: this.dropped.slice() } : {}),
       backgroundMode: ['keep', 'white', 'lines'][prep.mode], output, input,
       // 消しゴム・ペン（人が画面で描いた物）。上の数値は、それらを反映した最終出力に対する物
       paint: { targets: this.paint.targets(), penUsed: this.paint.penOn() },
@@ -592,7 +720,25 @@ export class Renderer {
     gl.uniform2f(p.loc('uImg'), this.W, this.H);
     gl.uniform1f(p.loc('uSplit'), view.split ?? -1);
     gl.uniform1i(p.loc('uOriginal'), view.original ? 1 : 0);
+    // 領域の強調表示（view.highlight = { kind: 1 人物 / 2 背景 / 3 部分, part: 部分の番号, grow: px, own: ビット集合 }）
+    const hi = view.highlight || null;
+    const sdf = hi && this.hasMask ? this.tex.sdf : null;
+    const map = hi ? this.tex.partMap : null;
+    if (sdf) this.sampler(p, 'uSdf', sdf); else gl.uniform1i(p.loc('uSdf'), 0);
+    if (map) this.sampler(p, 'uPartMap', map); else gl.uniform1i(p.loc('uPartMap'), 0);
+    gl.uniform4i(p.loc('uHi'), hi ? hi.kind : 0, hi ? hi.part || 0 : 0, sdf ? 1 : 0, map ? 1 : 0);
+    gl.uniform1f(p.loc('uHiGrow'), hi ? hi.grow || 0 : 0);
+    gl.uniform1i(p.loc('uHiOwn'), hi ? hi.own || 0 : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  /** 画面のキャンバスの 1 画素（デバイスpx。左上が原点）を読む。draw の直後に呼ぶこと（テスト・確認用） */
+  readCanvas(px, py) {
+    const gl = this.gl;
+    const buf = new Uint8Array(4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.readPixels(Math.floor(px), this.canvas.height - 1 - Math.floor(py), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    return Array.from(buf);
   }
 
   // ---- 読み出し ----

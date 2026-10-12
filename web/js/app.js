@@ -8,7 +8,7 @@ import { createTools } from './tools.js';
 import { layerTarget, isTarget, unionRect } from './paint.js';
 import {
   SCHEMA, normalize, defaultParams, applyStyle, effectiveUnit, effectiveWatermark, STYLES,
-  withoutIds, inheritIds, layerIds,
+  withoutIds, withoutParts, inheritIds, layerIds, regionLabel, isPartName,
 } from './schema.js';
 
 const $ = (id) => document.getElementById(id);
@@ -23,7 +23,6 @@ const HISTORY_MAX = 200;
 const PAINT_SAVE_DELAY_MS = 1000;                  // 筆を置き終えてから、この時間が経ったら消しゴム・ペンを保存する
 const PAINT_HISTORY_BYTES = 256 * 1024 * 1024;     // 筆の取り消し用に持つ画素の上限（超えたら古い履歴から捨てる）
 const STROKE_SLOW_MS = 40;                         // 筆の最中の合成がこれより遅い環境では、合成の頻度を落とす
-const REGION_LABELS = { person: '人物', background: '背景' };
 const ZOOM_MIN = 0.02;
 const ZOOM_MAX = 32;
 
@@ -38,6 +37,10 @@ const state = {
   versionsOK: false,    // サーバがバージョンに対応しているか（古いサーバにつないだときは既定だけで動く）
   idsOK: false,         // サーバが層の id を知っているか（知らない古いサーバへは、id を除いて保存する）
   paintOK: false,       // サーバが消しゴム・ペンを保存できるか（できなければメモリ上だけで働く）
+  partsOK: true,        // 部分（髪・肌・服など）まわりの設定を保存できるか（知らない古いサーバへは、除いて保存する）
+  parts: [],            // 表示中の画像にマスクのある部分名（部分マップに入っている順）
+  partNames: [],        // いまの画像フォルダの部分名（部分マスクの置き場にある部分）
+  highlight: null,      // 強調表示している領域（'person' | 'background' | 部分名）
   remote: false,        // 表示中の画像がサーバの一覧のものか（ドロップした画像は false）
   params: null,
   rev: null,            // 表示中の設定に対応する設定ファイルの版（未保存の変更があるときは古い）
@@ -186,11 +189,62 @@ function drawNow() {
     zoom: state.view.zoom, cx: state.view.cx, cy: state.view.cy,
     original: state.original,
     split: state.compare && !state.original ? state.split * canvas.width : -1,
+    highlight: highlightOf(state.highlight),
   });
   $('zoomLabel').textContent = renderer.W ? `${Math.round(state.view.zoom * 100)}%` : '-';
   const handle = $('splitHandle');
   handle.hidden = !state.compare;
   handle.style.left = `${state.split * 100}%`;
+}
+
+/** 別の設定にしてある部分（その画像にマスクがあり、linked でない）か */
+const partOwn = (name) => {
+  const own = state.params && state.params.regions[name];
+  return !!own && own.linked === false;
+};
+
+/** 強調表示する領域を、表示シェーダ向けの形にする */
+function highlightOf(region) {
+  if (!region || !renderer || !renderer.W || !state.params) return null;
+  const code = state.parts.indexOf(region) + 1;
+  if (region !== 'person' && region !== 'background' && !code) return null;
+  let own = 0;
+  state.parts.forEach((name, i) => { if (partOwn(name) && !renderer.dropped.includes(name)) own |= 1 << (i + 1); });
+  return { kind: region === 'person' ? 1 : region === 'background' ? 2 : 3, part: code, own,
+    grow: state.params.regions.background.grow * effectiveUnit(state.params, renderer.W) };
+}
+
+function setHighlight(region) {
+  if (state.highlight === (region || null)) return;
+  state.highlight = region || null;
+  requestDraw();
+}
+
+/** 画像の座標 (x, y) がどの領域か（'person' | 'background' | 部分名）。画像の外は null */
+function regionAt(x, y) {
+  if (!renderer || !renderer.W || !state.params) return null;
+  const found = renderer.regionAt(x, y, state.params.regions.background.grow * effectiveUnit(state.params, renderer.W));
+  if (!found) return null;
+  if (found.part) return found.part;
+  return found.inside ? 'person' : 'background';
+}
+
+/** トーンのタブを切り替える（その画像に無い部分は選べない） */
+function setTab(tab) {
+  state.tab = ['person', 'background', ...state.parts].includes(tab) ? tab : 'person';
+  rebuild();
+}
+
+let droppedKey = '';
+/** 層の総数がこの環境の上限を超えて、人物と同じ設定で描いた部分があれば知らせる（変わったときだけ） */
+function noteDropped() {
+  const key = renderer ? renderer.dropped.join() : '';
+  if (key === droppedKey) return;
+  droppedKey = key;
+  if (key) {
+    showMessage(`層の数がこの環境で一度に扱える数（${renderer.maxLayers} 層）を超えたため、次の部分は人物と同じ設定で描いています: `
+      + `${renderer.dropped.map(regionLabel).join('、')}。部分や層を減らしてください`, 'error');
+  }
 }
 
 function requestDraw() {
@@ -208,6 +262,7 @@ function renderNow() {
     result = renderer.render(state.params, { solo: state.solo });
     lastRenderMs = result.ms;
     if (renderer.W) $('timing').textContent = `再描画 ${result.ms.toFixed(1)} ms`;
+    noteDropped();
   } catch (e) {
     showMessage(`描画に失敗しました: ${e.message}`, 'error');
   }
@@ -310,6 +365,13 @@ function wireViewer() {
   let drag = null;
   canvas.addEventListener('pointerdown', (e) => {
     if (e.button !== 0 && e.button !== 1) return;
+    // Alt+クリック: その場所の領域（人物 / 背景 / 部分）のタブへ切り替える
+    if (e.altKey && e.button === 0) {
+      e.preventDefault();
+      const region = regionAt(...imagePoint(e));
+      if (region) setTab(region);
+      return;
+    }
     try { canvas.setPointerCapture(e.pointerId); } catch { /* 取れなくても動く */ }
     // 消しゴム・ペンの最中は、左ドラッグは筆。移動は中ボタンか、スペースを押しながらのドラッグ
     if (tools && tools.pointerDown(e)) return;
@@ -419,7 +481,8 @@ const ctx = {
     state.solo = solo;
     if (redraw) { requestRender(); rebuild(); }
   },
-  setTab: (tab) => { state.tab = tab; rebuild(); },
+  setTab: (tab) => setTab(tab),
+  highlight: (region) => setHighlight(region),
   selectLayer: (region, id) => selectLayer(region, id),
   painted: (target) => !!renderer && renderer.paint.has(target),
   style: (key, region) => {
@@ -517,7 +580,7 @@ const sig = (params) => JSON.stringify(withoutIds(params));
  * 戻り値の filledIds は「id の無い層に新しい id を振った」（保存し直す必要がある）
  */
 function loadParams(raw, { fresh = false, save = true } = {}) {
-  const { params, warnings, filledIds } = normalize(fresh ? raw : inheritIds(raw, state.params));
+  const { params, warnings, filledIds } = normalize(fresh ? raw : inheritIds(raw, state.params), state.partNames);
   state.params = params;
   state.solo = null;
   if (warnings.length) showMessage(`設定の読み込みで気になる点がありました:\n・${warnings.join('\n・')}`, 'info', 20000);
@@ -537,6 +600,14 @@ function scheduleSave() {
   saveTimer = setTimeout(() => { saveTimer = null; saveNow(); }, SAVE_DELAY_MS);
 }
 
+/** サーバへ保存する形の設定（サーバが知らない項目を除く） */
+function forServer(params) {
+  let out = params;
+  if (!state.partsOK) out = withoutParts(out);
+  if (!state.idsOK) out = withoutIds(out);
+  return out;
+}
+
 /** 設定を保存する。idsOnly は「層の id を補っただけ」の保存（見た目は変わらないので、白黒版を「古い」にしない） */
 async function saveNow({ idsOnly = false } = {}) {
   if (!canAutoSave()) return;
@@ -545,8 +616,8 @@ async function saveNow({ idsOnly = false } = {}) {
   saving = true;
   try {
     const r = await fetch(apiPath('params', name, version), {
-      // 層の id を知らない古いサーバは、id のある設定を外部操作（ctl）で受け付けなくなるので、除いて保存する
-      method: 'PUT', body: JSON.stringify(state.idsOK ? state.params : withoutIds(state.params)),
+      // 層の id・部分の項目を知らない古いサーバは、それらのある設定を外部操作（ctl）で受け付けなくなるので、除いて保存する
+      method: 'PUT', body: JSON.stringify(forServer(state.params)),
       headers: { 'Content-Type': 'application/json', 'X-Inkdeus-Client': CLIENT_ID,
         ...(idsOnly ? { 'X-Inkdeus-Ids-Only': '1' } : {}) },
     });
@@ -732,15 +803,18 @@ function eraseTargetOf(kind) {
   if (kind === 'lines') return { target: 'lines', label: '線画' };
   if (kind === 'all') return { target: 'all', label: 'トーン・ベタ・線画をまとめて' };
   if (kind === 'solid') {
-    // ベタは人物・背景それぞれにマスクがある。開いているタブの側を消す（マスクの無い画像は全体が人物）
-    const region = state.hasMask && state.tab === 'background' ? 'background' : 'person';
-    return { target: `solid-${region}`, label: state.hasMask ? `${REGION_LABELS[region]}のベタ（タブで切り替え）` : 'ベタ' };
+    // ベタは人物・背景・（別の設定にした）部分それぞれにマスクがある。開いているタブの側を消す（マスクの無い画像は全体が人物）
+    let region = state.hasMask && state.tab === 'background' ? 'background' : 'person';
+    if (state.parts.includes(state.tab) && partOwn(state.tab)) region = state.tab;
+    const tabbed = state.hasMask || state.parts.some(partOwn);
+    return { target: `solid-${region}`, label: tabbed ? `${regionLabel(region)}のベタ（タブで切り替え）` : 'ベタ' };
   }
   const sel = state.selLayer;
-  const layers = sel && state.params ? state.params.regions[sel.region].layers : [];
+  const owner = sel && state.params ? state.params.regions[sel.region] : null;
+  const layers = owner && Array.isArray(owner.layers) ? owner.layers : [];
   const index = sel ? layers.findIndex((l) => l.id === sel.id) : -1;
   if (index < 0) return { error: '消す層を、右のパネルの層の行をクリックして選んでください' };
-  return { target: layerTarget(sel.id), label: `${REGION_LABELS[sel.region]}の層${index + 1}`, region: sel.region, index };
+  return { target: layerTarget(sel.id), label: `${regionLabel(sel.region)}の層${index + 1}`, region: sel.region, index };
 }
 
 /** 消しゴムを当てる層を選ぶ（層の行のクリック。パネルは作り直さず、強調だけ付け替える） */
@@ -985,6 +1059,7 @@ async function refreshImages() {
   }));
   if (state.remote && state.name) sel.value = state.name;
   $('nav').hidden = state.images.length < 2;
+  state.partNames = state.partsOK && Array.isArray(list.parts) ? list.parts.filter(isPartName) : [];
   state.versionsOK = state.images.some((i) => Array.isArray(i.versions));
   if (gallery) gallery.refresh();
   updateVersionUI();
@@ -1226,6 +1301,8 @@ async function setImageBlob(blob, name, remote) {
   state.version = '';
   state.remote = remote;
   state.hasMask = false;
+  state.parts = [];                    // 部分マスクは画像ごと（setImage が部分マップも捨てている）
+  state.highlight = null;
   state.lastExport = '';
   state.solo = null;
   state.rev = null;
@@ -1252,6 +1329,28 @@ async function setMaskBlob(blob) {
     bitmap.close();
   }
   state.hasMask = renderer.hasMask;
+}
+
+/** その画像の部分マスク（髪・肌・服など）を読んで、部分マップを作る。1 枚ずつ読んで足す（大きな画像でもメモリを食わないように） */
+async function loadParts(item) {
+  renderer.setParts(null);
+  state.parts = [];
+  if (!state.partsOK || !state.server || !Array.isArray(item.parts)) return;
+  for (const part of item.parts.filter(isPartName)) {
+    try {
+      const r = await fetch(`api/part/${encodeURIComponent(item.name)}/${encodeURIComponent(part)}${queryOf()}`, { cache: 'no-store' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const bitmap = await createImageBitmap(await r.blob(), BITMAP_OPTS);
+      try {
+        renderer.addPart(part, bitmap);
+      } finally {
+        bitmap.close();
+      }
+    } catch (e) {
+      showMessage(`部分マスクを読み込めませんでした（${part}）: ${e.message}`, 'error');
+    }
+  }
+  state.parts = renderer.parts.slice();
 }
 
 /** サーバの一覧の i 番目を開く（マスクと保存済みの設定も読む）。version でバージョンを選ぶ（'' = 既定） */
@@ -1285,6 +1384,8 @@ async function openIndex(i, version = '') {
         const m = await fetch(apiPath('mask', item.name), { cache: 'no-store' });
         if (m.ok) await setMaskBlob(await m.blob());
       }
+      await loadParts(item);
+      if (!['person', 'background', ...state.parts].includes(state.tab)) state.tab = 'person';
     }
     state.version = version;
     state.index = i;
@@ -1767,6 +1868,9 @@ async function init() {
   const features = state.server && config && Array.isArray(config.features) ? config.features : [];
   state.idsOK = features.includes('layerIds');
   state.paintOK = features.includes('paint');
+  // 部分（regions.<部分名>）と solid.lineKnockout。サーバなしのときは、画面だけで使える（部分マスクはサーバから読む）
+  state.partsOK = !state.server || features.includes('parts');
+  state.partNames = state.partsOK && list && Array.isArray(list.parts) ? list.parts.filter(isPartName) : [];
   showProject();
   state.params = defaultParams();
   try { state.autoExport = localStorage.getItem(AUTO_EXPORT_KEY) !== '0'; } catch { state.autoExport = true; }
@@ -1868,6 +1972,24 @@ const hooks = {
   openVersion: async (version) => { await openIndex(state.index, version); return state.version; },
   createVersion, renameVersion, deleteVersion,
   historyInfo: () => ({ length: history.length, pos: hpos }),
+  // 部分（髪・肌・服など）と領域
+  parts: () => state.parts.slice(),
+  partsInfo: () => ({ ok: state.partsOK, parts: state.parts.slice(), names: state.partNames.slice(), tab: state.tab,
+    dropped: renderer.dropped.slice(), maxLayers: renderer.maxLayers,
+    maxUniformVectors: renderer.maxUniformVectors, maxTextureUnits: renderer.maxTextureUnits }),
+  /** 一度に扱える層の総数の上限を決め直す（上限を超えたときの扱いを確かめるための物。普通は環境から決まる） */
+  limitLayers: (n) => { renderer.maxLayers = n; renderNow(); return renderer.dropped.slice(); },
+  tab: () => state.tab,
+  setTab: (tab) => { setTab(tab); return state.tab; },
+  regionAt: (x, y) => regionAt(x, y),
+  highlight: (region) => { setHighlight(region); return state.highlight; },
+  /** 画面のキャンバスに出ている色（画像の座標で指す。[r, g, b, a]）。強調表示の確認用 */
+  displayPixel: (x, y) => {
+    drawNow();
+    const canvas = $('gl');
+    const v = state.view;
+    return renderer.readCanvas((x - v.cx) * v.zoom + canvas.width / 2, (y - v.cy) * v.zoom + canvas.height / 2);
+  },
   // 消しゴム・ペン
   paint: {
     state: () => ({ ...tools.state(), selected: state.selLayer, targets: paintTargets(),
