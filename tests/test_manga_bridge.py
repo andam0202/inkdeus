@@ -323,3 +323,246 @@ def test_unknown_names_are_reported_not_thrown_into_the_editor(mpage):
         mpage.evaluate("() => window.inkdeusBridge.open('a.b')")
     assert mpage.evaluate("() => window.inkdeusBridge.status().busy") is False
     assert mpage.evaluate("() => typeof canvas.getObjects().length") == "number"             # 漫画エディタは動き続ける
+
+
+# ---- 白黒化の画面（別のタブ）で調整 → 漫画の画面へホットリロード ----
+
+from conftest import BLANK, deep_merge  # noqa: E402
+
+BLACK = deep_merge(BLANK, {"solid": {"enabled": True, "threshold": 1.0}})
+
+PROBE = """(g) => { const o = canvas.getObjects().find(o => o.guid === g);
+    if (!o) return null;
+    const c = document.createElement('canvas'); c.width = 32; c.height = 32;
+    const x = c.getContext('2d'); x.drawImage(o._element, 0, 0, 32, 32);
+    const d = x.getImageData(0, 0, 32, 32).data; let s = 0;
+    for (let i = 0; i < d.length; i += 4) s += d[i];
+    return {mean: s / (d.length / 4), src: o.getSrc(), loaded: o._element.currentSrc || o._element.src,
+        left: o.left, top: o.top, angle: o.angle, shownW: o.width * o.scaleX, shownH: o.height * o.scaleY,
+        natural: o._element.naturalWidth, clipped: !!o.clipPath, panel: o.relatedPoly ? o.relatedPoly.guid : null,
+        index: canvas.getObjects().indexOf(o), version: o.__ikbVersion || null}; }"""
+
+
+def geometry(probe: dict) -> tuple:
+    return (round(probe["left"], 3), round(probe["top"], 3), probe["angle"], round(probe["shownW"], 3),
+            round(probe["shownH"], 3), probe["clipped"], probe["panel"], probe["index"])
+
+
+def open_editor(ctx, manga_env, image: str):
+    page = ctx.new_page()
+    page.set_default_timeout(WAIT_MS)
+    page.goto(manga_env.url + "?image=" + image)
+    page.wait_for_function("() => window.inkdeus && window.inkdeus.ready")
+    page.evaluate("() => window.inkdeus.ready")
+    return page
+
+
+def set_and_wait_hot(editor, page, params: dict) -> None:
+    """白黒化の画面で設定を変え、自動書き出し → 漫画の画面での差し替えが済むまで待つ"""
+    before = page.evaluate("() => window.inkdeusBridge.status().hot.updated")
+    editor.evaluate("(p) => { window.inkdeus.setParams(p); }", params)
+    page.wait_for_function("(n) => window.inkdeusBridge.status().hot.updated > n", arg=before)
+
+
+@pytest.fixture(scope="module")
+def hot(ctx, manga_env):
+    """ホットリロードの検証用: 白黒版を1枚コマへ入れた漫画の画面と、白黒化の画面（別のタブ）"""
+    page, status = open_manga(ctx, manga_env)
+    assert status["ok"]
+    page.evaluate("() => window.inkdeusBridge.setAutosave({enabled: false})")
+    apply_template(page)
+    panels = page.evaluate("() => window.inkdeusBridge.panels()")
+    placed = page.evaluate("(g) => window.inkdeusBridge.placeAsset('inked', 'scene.png', {panel: g})", panels[0]["guid"])
+    guid = placed["object"]["guid"]
+    assert page.evaluate("() => window.inkdeusBridge.status().events.connected") is True
+    editor = open_editor(ctx, manga_env, "scene.png")
+    yield {"page": page, "editor": editor, "guid": guid, "panels": panels}
+    editor.close()
+    page.close()
+
+
+def test_adjusting_in_the_editor_tab_updates_the_manga_canvas(hot, manga_env):
+    page, editor, guid = hot["page"], hot["editor"], hot["guid"]
+    assert editor.evaluate("() => window.inkdeus.info().name") == "scene.png"
+    start = page.evaluate(PROBE, guid)
+    set_and_wait_hot(editor, page, BLANK)                             # 何も描かない設定 → 真っ白
+    white = page.evaluate(PROBE, guid)
+    assert white["mean"] > 250
+    history = page.evaluate("() => [stateStack.length, currentStateIndex]")
+    set_and_wait_hot(editor, page, BLACK)                             # 全面ベタ → 真っ黒
+    black = page.evaluate(PROBE, guid)
+    assert black["mean"] < 5                                          # 画素が新しい内容に替わっている
+    assert geometry(black) == geometry(white) == geometry(start)      # 位置・大きさ・切り抜き・コマ・重なり順はそのまま
+    assert black["src"] == "/api/assets/inked/image/scene.png?max=2048"          # 保存される src に v は付けない
+    assert "v=" in black["loaded"] and black["version"]                           # 読み込みは v つき（古い物を使い回さない）
+    assert "scene.png を更新しました" in page.evaluate("() => document.querySelector('.ikb-msg').textContent")
+    # 取り消しの履歴は汚さない
+    page.wait_for_timeout(800)
+    assert page.evaluate("() => { flushHistory(); return [stateStack.length, currentStateIndex]; }") == history
+    assert "v=" not in page.evaluate("() => stateStack[currentStateIndex]")
+    # 素材パネルの「白黒」のサムネイルも新しい版になる
+    page.click(".ikb-tab:has-text('白黒')")
+    page.wait_for_function("""(v) => { const i = document.querySelector(".ikb-item[data-path='scene.png'] img");
+        return i && i.getAttribute('src').includes('v=' + v); }""", arg=black["version"])
+    assert page.evaluate("() => window.inkdeusBridge.status().events.received") >= 2
+
+
+def test_undo_does_not_bring_back_the_old_image(hot):
+    page, guid = hot["page"], hot["guid"]
+    latest = page.evaluate(PROBE, guid)["version"]
+    page.evaluate("() => window.inkdeusBridge.placeAsset('sfx', 'impact/don.png')")
+    page.wait_for_function("() => canvas.getObjects().filter(o => o.type === 'image').length === 2")
+    page.evaluate("() => { flushHistory(); undo(); }")
+    page.wait_for_function("() => !isProjectBusy() && canvas.getObjects().filter(o => o.type === 'image').length === 1")
+    # 取り消しでオブジェクトは作り直されるが、白黒版は最新の物が出る
+    page.wait_for_function("([g, v]) => { const o = canvas.getObjects().find(o => o.guid === g);"
+                           " return o && o.__ikbVersion === v; }", arg=[guid, latest])
+    probe = page.evaluate(PROBE, guid)
+    assert probe["mean"] < 5 and probe["clipped"] and probe["panel"] == hot["panels"][0]["guid"]
+    assert probe["src"] == "/api/assets/inked/image/scene.png?max=2048"
+    page.evaluate("() => redo()")
+    page.wait_for_function("() => !isProjectBusy() && canvas.getObjects().filter(o => o.type === 'image').length === 2")
+    page.wait_for_function("([g, v]) => canvas.getObjects().find(o => o.guid === g).__ikbVersion === v", arg=[guid, latest])
+    assert page.evaluate(PROBE, guid)["mean"] < 5
+
+
+def test_saved_manga_shows_the_latest_inked_image_when_reopened(ctx, hot, manga_env):
+    page, guid = hot["page"], hot["guid"]
+    page_guid = page.evaluate("() => getCanvasGUID()")
+    page.evaluate("() => window.inkdeusBridge.save('hot')")
+    fresh, status = open_manga(ctx, manga_env)
+    try:
+        assert status["ok"]
+        fresh.evaluate("() => window.inkdeusBridge.setAutosave({enabled: false})")
+        fresh.evaluate("() => window.inkdeusBridge.open('hot', {force: true})")
+        fresh.evaluate("async (g) => { await chengeCanvasByGuid(g); await btmWaitForPageReady(); }", page_guid)
+        fresh.wait_for_function("(g) => !isProjectBusy() && canvas.getObjects().some(o => o.guid === g && o._element"
+                                " && o._element.naturalWidth > 0)", arg=guid)
+        probe = fresh.evaluate(PROBE, guid)
+        assert probe["mean"] < 5 and probe["src"] == "/api/assets/inked/image/scene.png?max=2048"
+        # 別のページを開いている間に書き出し直されても、戻ったときに最新が出る
+        other = fresh.evaluate("(g) => btmGetGuids().find(x => x !== g)", page_guid)
+        fresh.evaluate("async (g) => { await btmSaveCurrentPage(false); await chengeCanvasByGuid(g);"
+                       " await btmWaitForPageReady(); }", other)
+        before = fresh.evaluate("() => window.inkdeusBridge.status().events.received")
+        hot["editor"].evaluate("(p) => { window.inkdeus.setParams(p); }", BLANK)
+        fresh.wait_for_function("(n) => window.inkdeusBridge.status().events.received > n", arg=before)
+        fresh.evaluate("async (g) => { await btmSaveCurrentPage(false); await chengeCanvasByGuid(g);"
+                       " await btmWaitForPageReady(); }", page_guid)
+        fresh.wait_for_function("(g) => { const o = canvas.getObjects().find(o => o.guid === g);"
+                                " return o && !!o.__ikbVersion; }", arg=guid)
+        assert fresh.evaluate(PROBE, guid)["mean"] > 250
+    finally:
+        fresh.close()
+    hot["page"].wait_for_function("(g) => canvas.getObjects().find(o => o.guid === g) !== undefined", arg=guid)
+
+
+def test_reconnect_picks_up_missed_exports_and_keeps_the_shown_size(hot, manga_env):
+    """接続が切れている間に白黒版が替わっても、つながり直したときに読み直す。
+    画素数の違う画像に替わっても、見た目の大きさは変えない"""
+    page, guid = hot["page"], hot["guid"]
+    page.wait_for_function("(g) => { const o = canvas.getObjects().find(o => o.guid === g); return o && o._element; }",
+                           arg=guid)
+    before = page.evaluate(PROBE, guid)
+    assert before["natural"] == 900
+    png = manga_env.project / "out" / "scene.png"
+    synth.save(png, synth.flat(450, 300, 128)[..., 0])                # 通知なしで、半分の大きさの灰色に差し替える
+    page.evaluate("() => window.inkdeusBridge.reconnectEvents()")
+    page.wait_for_function("(g) => canvas.getObjects().find(o => o.guid === g)._element.naturalWidth === 450", arg=guid)
+    after = page.evaluate(PROBE, guid)
+    assert 120 < after["mean"] < 136
+    assert geometry(after) == geometry(before)                        # 拡大率を直して、見た目の大きさと位置を保つ
+    assert page.evaluate("() => window.inkdeusBridge.status().events.connected") is True
+
+
+def test_swap_between_inked_and_source(hot):
+    page, guid = hot["page"], hot["guid"]
+    page.evaluate("(g) => { canvas.setActiveObject(canvas.getObjects().find(o => o.guid === g)); canvas.renderAll(); }", guid)
+    page.wait_for_function("() => !document.querySelector('.ikb-sel').hidden")
+    assert "選択中の画像: scene（白黒版）" in page.evaluate("() => document.querySelector('.ikb-sel-name').textContent")
+    buttons = page.evaluate("""() => Array.from(document.querySelectorAll('.ikb-sel button'))
+        .filter(b => !b.hidden).map(b => b.textContent)""")
+    assert buttons == ["白黒を調整", "元画像に戻す"]
+    before = page.evaluate(PROBE, guid)
+    depth = page.evaluate("() => { flushHistory(); return stateStack.length; }")
+    page.click(".ikb-sel button:has-text('元画像に戻す')")
+    page.wait_for_function("(g) => canvas.getObjects().find(o => o.guid === g).getSrc().includes('/source/')", arg=guid)
+    source = page.evaluate(PROBE, guid)
+    assert source["src"] == "/api/assets/source/image/scene.png?max=2048" and source["natural"] == 900
+    assert geometry(source) == geometry(before)                       # 画素数が違っても（450 → 900）見た目は同じ
+    page.wait_for_function("(n) => { flushHistory(); return stateStack.length === n + 1; }", arg=depth)   # 取り消せる
+    page.wait_for_function("() => Array.from(document.querySelectorAll('.ikb-sel button')).filter(b => !b.hidden)"
+                           ".map(b => b.textContent).join() === '白黒を調整,白黒版に差し替え'")
+    result = page.evaluate("() => window.inkdeusBridge.swapSelected('inked')")
+    assert result["changed"] and result["src"] == "/api/assets/inked/image/scene.png?max=2048"
+    assert geometry(page.evaluate(PROBE, guid)) == geometry(before)
+    # 白黒版がまだ無い画像は、その旨を伝える
+    placed = page.evaluate("(g) => window.inkdeusBridge.placeAsset('source', 'gradient.png', {panel: g})",
+                           hot["panels"][1]["guid"])
+    hot["gradient"] = placed["object"]["guid"]
+    with pytest.raises(Exception, match="白黒版がまだありません"):
+        page.evaluate("() => window.inkdeusBridge.swapSelected('inked')")
+    assert page.evaluate(PROBE, hot["gradient"])["src"].startswith("/api/assets/source/")
+
+
+def test_source_is_replaced_when_its_inked_version_appears(ctx, hot, manga_env):
+    page = hot["page"]
+    if "gradient" not in hot:
+        pytest.skip("前のテストで元画像を置けていません")
+    assert page.evaluate("() => document.getElementById('ikb-autoswap').checked") is False       # 既定はオフ
+    page.click(".ikb-tab:has-text('元画像')")
+    page.wait_for_selector(".ikb-item[data-path='gradient.png']")
+    page.evaluate("() => document.getElementById('ikb-autoswap').click()")
+    assert page.evaluate("() => window.inkdeusBridge.status().autoSwap") is True
+    before = page.evaluate(PROBE, hot["gradient"])
+    # 「調整」で白黒化の画面を開くと、自動書き出しで白黒版ができて、置いてある元画像が切り替わる
+    with ctx.expect_page() as opened:
+        page.click(".ikb-item[data-path='gradient.png'] .ikb-adjust")
+    editor = opened.value
+    try:
+        editor.wait_for_function("() => window.inkdeus && window.inkdeus.ready")
+        assert editor.url.endswith("/?image=gradient.png")
+        assert editor.evaluate("async () => { await window.inkdeus.ready; return window.inkdeus.info().name; }") == "gradient.png"
+        page.wait_for_function("(g) => canvas.getObjects().find(o => o.guid === g).getSrc().includes('/inked/')",
+                               arg=hot["gradient"])
+        after = page.evaluate(PROBE, hot["gradient"])
+        assert after["src"] == "/api/assets/inked/image/gradient.png?max=2048"
+        assert geometry(after) == geometry(before)
+        assert (manga_env.project / "out" / "gradient.png").is_file()
+        # 「調整」をもう一度押しても、同じタブを使い回す（画像だけ切り替わる）
+        count = len(ctx.pages)
+        page.wait_for_selector(".ikb-item[data-path='scene.png'] .ikb-adjust")
+        page.click(".ikb-item[data-path='scene.png'] .ikb-adjust")
+        editor.wait_for_url("**/?image=scene.png")
+        assert len(ctx.pages) == count
+    finally:
+        editor.close()
+        page.evaluate("() => window.inkdeusBridge.setAutoSwap(false)")
+
+
+def test_prefer_inked_when_placing_from_the_source_tab(hot):
+    page = hot["page"]
+    page.click(".ikb-tab:has-text('元画像')")
+    page.wait_for_selector(".ikb-item[data-path='scene.png'].ikb-has-inked")
+    assert page.evaluate("() => document.querySelector('.ikb-prefer').value") == "1"             # 既定は「白黒版があれば白黒」
+    assert page.evaluate("() => document.querySelector('.ikb-prefer-row').hidden") is False
+    target = hot["panels"][1]
+    page.evaluate("(g) => { canvas.setActiveObject(canvas.getObjects().find(o => o.guid === g)); }", target["guid"])
+
+    def placed_srcs():
+        return [i["src"] for i in images_on_canvas(page) if i["panel"] == target["guid"]]
+
+    count = len(placed_srcs())
+    page.click(".ikb-item[data-path='scene.png']")
+    page.wait_for_function("(n) => canvas.getObjects().filter(o => o.type === 'image').length > n",
+                           arg=len(images_on_canvas(page)))
+    assert placed_srcs()[-1] == "/api/assets/inked/image/scene.png?max=2048" and len(placed_srcs()) == count + 1
+    page.select_option(".ikb-prefer", "0")                            # 常に元画像
+    page.evaluate("(g) => { canvas.setActiveObject(canvas.getObjects().find(o => o.guid === g)); }", target["guid"])
+    total = len(images_on_canvas(page))
+    page.click(".ikb-item[data-path='scene.png']")
+    page.wait_for_function("(n) => canvas.getObjects().filter(o => o.type === 'image').length > n", arg=total)
+    assert placed_srcs()[-1] == "/api/assets/source/image/scene.png?max=2048"
+    page.select_option(".ikb-prefer", "1")
+    page.click(".ikb-tab:has-text('白黒')")
+    page.wait_for_function("() => document.querySelector('.ikb-prefer-row').hidden === true")

@@ -384,3 +384,72 @@ def test_bridge_reports_unsupported_version(tmp_path, images, upstream, browser)
     finally:
         page.close()
         server.shutdown()
+
+
+def test_panel_width_can_be_dragged_and_is_remembered(tmp_path, upstream, browser):
+    """素材パネルの幅: 左端のつまみのドラッグ・列数・保存と復元・既定に戻す・重ねて表示"""
+    from conftest import serve
+
+    repo, commit = upstream
+    cache = tmp_path / "cache"
+    manga.install(ref=commit, source=repo, root=cache, say=lambda _m: None)
+    folder = tmp_path / "many"
+    for i in range(12):
+        synth.save(folder / f"img{i:02d}.png", synth.flat(40, 30, 20 * i))
+    server, url = serve(create_app(folder, local_config=tmp_path / "none.toml", cache_root=cache, watch=False))
+    context = browser.new_context(viewport={"width": 1400, "height": 800})
+    page = context.new_page()
+
+    def measure():
+        return page.evaluate("""() => { const cs = (e) => getComputedStyle(e);
+            const grid = document.querySelector('.ikb-grid');
+            return {panel: document.querySelector('#inkdeus-bridge').getBoundingClientRect().width - 26,
+                    columns: cs(grid).gridTemplateColumns.split(' ').length,
+                    padding: parseFloat(cs(document.body).paddingRight),
+                    stored: JSON.parse(localStorage.getItem('inkdeus.manga.panelWidth')),
+                    width: window.inkdeusBridge.status().width, float: window.inkdeusBridge.status().float}; }""")
+
+    def drag_to(x: float):
+        box = page.locator(".ikb-resize").bounding_box()
+        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + 200)
+        page.mouse.down()
+        page.mouse.move(x + 40, box["y"] + 210, steps=4)
+        page.mouse.move(x, box["y"] + 220, steps=4)
+        page.mouse.up()
+
+    try:
+        page.goto(url + "manga/")
+        page.evaluate("() => window.inkdeusBridge.ready")
+        page.wait_for_selector(".ikb-item[data-path='img11.png']")
+        first = measure()
+        assert first["panel"] == 300 and first["columns"] == 3 and first["padding"] == 326 and first["stored"] is None
+        drag_to(1400 - 26 - 560)                                      # 幅 560px まで広げる
+        wide = measure()
+        assert wide["panel"] == pytest.approx(560, abs=3) and wide["width"] == pytest.approx(560, abs=3)
+        assert wide["columns"] > first["columns"]                     # 広げると列が増える
+        assert wide["padding"] == pytest.approx(wide["panel"] + 26, abs=1)        # 漫画エディタ側の余白も追従する
+        assert wide["stored"] == wide["width"]
+        drag_to(1400 - 26 - 50)                                       # 狭めすぎても最小 220px
+        assert measure()["panel"] == 220 and measure()["columns"] == 2
+        drag_to(20)                                                   # 広げすぎても画面幅の 70% まで
+        assert measure()["panel"] == 980
+        drag_to(1400 - 26 - 480)
+        kept = measure()["width"]
+        page.reload()                                                 # 幅は次回も復元される
+        page.evaluate("() => window.inkdeusBridge.ready")
+        assert measure()["panel"] == kept == pytest.approx(480, abs=3)
+        # 重ねて表示: 漫画エディタの画面を押しのけない
+        page.click(".ikb-head .ikb-icon")
+        floating = measure()
+        assert floating["float"] is True and floating["padding"] == 26 and floating["panel"] == kept
+        page.reload()
+        page.evaluate("() => window.inkdeusBridge.ready")
+        assert measure()["float"] is True and measure()["padding"] == 26
+        page.click(".ikb-head .ikb-icon")
+        assert measure()["padding"] == pytest.approx(kept + 26, abs=1)
+        page.dblclick(".ikb-resize")                                  # ダブルクリックで既定の幅
+        back = measure()
+        assert back["panel"] == 300 and back["stored"] is None and back["columns"] == 3
+    finally:
+        context.close()
+        server.shutdown()

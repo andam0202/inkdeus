@@ -296,3 +296,52 @@ def test_sse_stream_format(dirs):
     assert line.startswith("data: ") and line.endswith("\n\n")
     assert json.loads(line[6:])["type"] == "params"
     resp.close()
+
+
+# ---- 書き出しの通知・一括書き出しの進み具合 ----
+
+def test_export_status_and_exported_event(dirs):
+    import os
+    import time
+
+    _, images, masks = dirs
+    app = create_app(images, mask_dir=masks, watch=False)
+    client = app.test_client()
+    hub = app.config["INKDEUS_SESSION"].hub
+    editor, listener = hub.subscribe(), hub.subscribe(listener=True)
+    assert hub.count() == 1                                           # 聞くだけの相手は数えない
+    row = lambda: {i["name"]: i for i in client.get("/api/images").get_json()["images"]}["scene.png"]  # noqa: E731
+    assert (row()["hasExport"], row()["exportFresh"]) == (False, False)
+    r = client.post("/api/export/scene.png", data=png_bytes(), headers={"X-Inkdeus-Rev": "abc"})
+    out = images / "inkdeus_out"
+    assert r.get_json()["mtime"] == (out / "scene.png").stat().st_mtime
+    for q in (editor, listener):                                      # 通知は両方に届く
+        ev = q.get_nowait()
+        assert ev == {"type": "exported", "name": "scene.png", "file": "scene.png", "rev": "abc",
+                      "mtime": (out / "scene.png").stat().st_mtime,
+                      "version": (out / "scene.png").stat().st_mtime_ns // 1_000_000}
+    assert (row()["hasExport"], row()["exportFresh"]) == (True, False)    # 設定がまだ保存されていない
+    client.put("/api/params/scene.png", data=json.dumps({"version": 2}), content_type="application/json")
+    past = time.time_ns() - 60_000_000_000
+    os.utime(out / "scene.inkdeus.json", ns=(past, past))
+    os.utime(images / "scene.png", ns=(past, past))
+    os.utime(masks / "scene.png", ns=(past, past))
+    assert (row()["hasExport"], row()["exportFresh"]) == (True, True)
+    os.utime(out / "scene.inkdeus.json", ns=(time.time_ns() + 60_000_000_000,) * 2)   # 設定がその後変わった
+    assert row()["exportFresh"] is False
+    r = client.post("/api/command", data=json.dumps({"type": "export-all", "force": True})).get_json()
+    assert r["clients"] == 1 and r["force"] is True
+    assert editor.get_nowait()["type"] == "params" and editor.get_nowait() == {"type": "export-all", "force": True}
+
+
+def test_batch_progress_roundtrip(client):
+    assert client.get("/api/batch").get_json() == {"seq": 0, "running": False}
+    post = lambda body: client.post("/api/batch", data=json.dumps(body)).get_json()  # noqa: E731
+    first = post({"started": True, "running": True, "total": 3, "done": 0, "junk": "x"})
+    assert first["seq"] == 1 and first["running"] is True and "junk" not in first
+    assert post({"running": True, "total": 3, "done": 2, "exported": 2})["seq"] == 1
+    done = post({"running": False, "total": 3, "done": 3, "exported": 3, "skipped": 0, "failed": 0})
+    assert done["running"] is False and client.get("/api/state").get_json()["batch"] == client.get("/api/batch").get_json()
+    assert post({"started": True, "running": True})["seq"] == 2
+    assert client.post("/api/batch", data=json.dumps({"running": True}),
+                       headers={"Origin": "http://evil.example"}).status_code == 403

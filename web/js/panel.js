@@ -299,13 +299,26 @@ function watermarkSection(ctx) {
 }
 
 function outputSection(ctx) {
-  const { params, lastExport, server } = ctx.state;
+  const { params, lastExport, server, remote, images, autoExport, batchForce, lastBatch } = ctx.state;
+  const auto = el('input', { type: 'checkbox', id: 'chkAutoExport' });
+  auto.checked = !!autoExport;
+  auto.addEventListener('change', () => ctx.setAutoExport(auto.checked));
+  const force = el('input', { type: 'checkbox', id: 'chkExportAllForce' });
+  force.checked = !!batchForce;
+  force.addEventListener('change', () => ctx.setBatchForce(force.checked));
   return section('output', [
     ...Object.entries(SECTIONS.output).map(([k, f]) => fieldRow(ctx, f, params.output, k)),
     el('div', { class: 'buttons' },
       el('button', { class: 'primary', id: 'btnExport', onclick: () => ctx.exportNow() }, 'PNG を書き出す'),
       el('span', { class: 'note' }, server ? 'フル解像度・グレースケール' : 'フル解像度・グレースケール（ダウンロード）')),
     el('div', { class: 'note', id: 'exportInfo' }, lastExport || ''),
+    server && remote && el('label', { class: 'check', title: '設定を変えると、少し待ってから PNG を保存します。漫画の構成の画面（/manga/）で使っている白黒版もその場で替わります' },
+      auto, '変更を自動で書き出す（漫画の画面へ反映）'),
+    server && images.length > 0 && el('div', { class: 'buttons' },
+      el('button', { id: 'btnExportAll', onclick: () => ctx.exportAll(),
+        title: '各画像を、その画像に保存済みの設定で書き出します。設定の無い画像には、いま画面に出ている設定を使います' }, '全画像を書き出す'),
+      el('label', { class: 'check', title: '書き出し済みで設定が変わっていない画像も作り直す' }, force, 'すべて作り直す')),
+    server && lastBatch && el('div', { class: 'note', id: 'batchInfo', style: 'white-space: pre-wrap' }, lastBatch),
     el('div', { class: 'buttons' },
       el('button', { id: 'btnSaveJSON', onclick: () => ctx.saveJSON() }, '設定を保存 (JSON)'),
       el('button', { id: 'btnOpenJSON', onclick: () => ctx.openJSON() }, '設定を開く')),

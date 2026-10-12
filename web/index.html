@@ -27,6 +27,7 @@
   <button id="btnUndo" title="取り消し (Ctrl+Z)">取り消し</button>
   <button id="btnRedo" title="やり直し (Ctrl+Y)">やり直し</button>
   <span id="saveState" class="dim"></span>
+  <span id="exportState" class="dim" title="白黒版（書き出した PNG）の状態"></span>
   <a id="linkManga" class="navlink" href="/manga/" title="書き出した画像をコマ割りして漫画のページにする（別の画面へ移ります）" hidden>漫画を構成</a>
   <span id="modeBadge" class="badge"></span>
 </header>
@@ -39,6 +40,10 @@
       <p class="dim">マスク（ファイル名に mask を含む画像）・設定JSON もドロップで読み込めます</p>
     </div>
     <div id="messages"></div>
+    <div id="batchBar" hidden>
+      <span id="batchText"></span>
+      <button id="btnBatchAbort" title="いまの画像が終わったところで止めます">中止</button>
+    </div>
     <div id="viewbar">
       <button id="btnFit">全体表示</button>
       <button id="btnActual">100%</button>

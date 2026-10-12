@@ -96,9 +96,14 @@ def browser():
         b.close()
 
 
-def open_page(browser, url: str):
+def open_page(browser, url: str, auto_export: bool = False):
+    """白黒化の画面を開く。自動書き出しは、それを確かめるテスト以外では切っておく
+    （描画の検証の途中で、頼んでいない書き出しが走らないように）"""
     page = browser.new_page(viewport={"width": 1200, "height": 800})
     page.set_default_timeout(600_000)
+    if not auto_export:
+        page.add_init_script("try { if (localStorage.getItem('inkdeus.autoExport') === null) "
+                             "localStorage.setItem('inkdeus.autoExport', '0'); } catch (e) {}")
     errors: list[str] = []
     page.on("pageerror", lambda e: errors.append(str(e)))
     page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)

@@ -138,6 +138,22 @@ class Library:
     def export_path(self, entry: Entry) -> Path:
         return self.out_dir / f"{entry.stem}.png"
 
+    def export_status(self, entry: Entry) -> tuple[bool, bool]:
+        """(書き出し済みか, その書き出しがいまの設定・元画像・マスクより新しいか)。
+        設定がまだ保存されていない画像は「新しい」とは見なさない"""
+        try:
+            done = self.export_path(entry).stat().st_mtime_ns
+        except OSError:
+            return False, False
+        try:
+            inputs = [self.params_path(entry).stat().st_mtime_ns, entry.path.stat().st_mtime_ns]
+        except OSError:
+            return True, False
+        mask = self.mask_path(entry)
+        if mask is not None:
+            inputs.append(mask.stat().st_mtime_ns)
+        return True, done >= max(inputs)
+
 
 def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,31 +173,37 @@ class Hub:
     def __init__(self):
         self._lock = threading.Lock()
         self._clients: list[queue.Queue] = []
+        self._listeners: set[int] = set()         # 聞くだけの相手（漫画の構成の画面）。「開いているブラウザ」には数えない
 
-    def subscribe(self) -> queue.Queue:
+    def subscribe(self, listener: bool = False) -> queue.Queue:
         q: queue.Queue = queue.Queue(maxsize=256)
         with self._lock:
             self._clients.append(q)
+            if listener:
+                self._listeners.add(id(q))
         return q
 
     def unsubscribe(self, q: queue.Queue) -> None:
         with self._lock:
             if q in self._clients:
                 self._clients.remove(q)
+            self._listeners.discard(id(q))
 
     def publish(self, event: dict) -> int:
+        """全員へ配る。戻り値は、白黒化の画面（指示を実行できる相手）の数"""
         with self._lock:
             clients = list(self._clients)
+            editors = sum(1 for q in clients if id(q) not in self._listeners)
         for q in clients:
             try:
                 q.put_nowait(event)
             except queue.Full:
                 pass
-        return len(clients)
+        return editors
 
     def count(self) -> int:
         with self._lock:
-            return len(self._clients)
+            return sum(1 for q in self._clients if id(q) not in self._listeners)
 
 
 class Session:
@@ -196,6 +218,7 @@ class Session:
         self._stamps: dict[str, tuple[int, int]] = {}         # 設定ファイル名 → (mtime_ns, size)
         self.stats: dict[str, dict] = {}
         self.exports: dict[str, dict] = {}
+        self.batch: dict = {"seq": 0, "running": False}       # 一括書き出しの進み具合（ブラウザが知らせてくる）
         self._stop = threading.Event()
         self._primed = False                                  # 最初の走査（起動時の状態の記録）が済んだか
 
@@ -360,6 +383,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
             "masks": str(lib.mask_dir) if lib.mask_dir else None,
             "out": str(lib.out_dir),
             "manga": str(manga_dir),
+            "batch": session.batch,
         }
 
     @app.errorhandler(400)
@@ -469,6 +493,21 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
             abort(400, description=str(e))
         return send_file(path, mimetype=mime, conditional=True)
 
+    @app.get("/api/assets/<source>/versions")
+    def api_assets_versions(source: str):
+        """画像ごとの更新時刻（ミリ秒）。表示中の画像が古くなっていないかを軽く確かめるための物"""
+        return jsonify({"source": source, "versions": catalog.versions(asset_source(source))})
+
+    @app.get("/api/assets/<source>/pair/<path:rel>")
+    def api_assets_pair(source: str, rel: str):
+        """元画像（source）と白黒版（inked）の対応。どちらの名前からでも引ける"""
+        if source not in ("source", "inked"):
+            abort(404)
+        pair = catalog.pair(source, rel)
+        if pair is None:
+            abort(404)
+        return jsonify(pair)
+
     @app.get("/api/assets/<source>/image/<path:rel>")
     def api_assets_image(source: str, rel: str):
         item = asset_item(source, rel)
@@ -542,10 +581,12 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         items = []
         for e in lib.entries().values():
             w, h = lib.size(e)
+            exported, fresh = lib.export_status(e)
             items.append({
                 "name": e.name, "width": w, "height": h,
                 "hasMask": lib.mask_path(e) is not None,
                 "hasParams": lib.params_path(e).is_file(),
+                "hasExport": exported, "exportFresh": fresh,
             })
         return jsonify({"images": items, "outDir": str(lib.out_dir),
                         "maskDir": str(lib.mask_dir) if lib.mask_dir else None})
@@ -637,7 +678,11 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
             seq = session.exports.get(entry.name, {}).get("seq", 0) + 1
             session.exports[entry.name] = {"seq": seq, "path": str(path), "bytes": len(data),
                                            "time": time.time(), "rev": request.headers.get("X-Inkdeus-Rev")}
-        return jsonify({"path": str(path), "bytes": len(data)})
+        st = path.stat()
+        # 書き出しを知らせる（漫画の構成の画面が、使っている白黒版を新しい物に替える）
+        session.hub.publish({"type": "exported", "name": entry.name, "file": path.name, "mtime": st.st_mtime,
+                             "version": st.st_mtime_ns // 1_000_000, "rev": request.headers.get("X-Inkdeus-Rev")})
+        return jsonify({"path": str(path), "bytes": len(data), "mtime": st.st_mtime})
 
     @app.get("/api/exported/<path:name>")
     def api_exported(name: str):
@@ -658,7 +703,8 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
 
     @app.get("/api/events")
     def api_events():
-        q = session.hub.subscribe()
+        # ?role=manga は聞くだけの相手（書き出しの通知を受ける）。指示を実行できるブラウザには数えない
+        q = session.hub.subscribe(listener=request.args.get("role") == "manga")
 
         def stream():
             try:
@@ -693,12 +739,31 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
             "clients": session.hub.count(), "current": session.current,
         })
 
+    @app.route("/api/batch", methods=["GET", "POST"])
+    def api_batch():
+        """一括書き出しの進み具合。ブラウザが POST で知らせ、外部（ctl）が GET で読む"""
+        if request.method == "POST":
+            body = json_body()
+            with session.lock:
+                seq = session.batch.get("seq", 0)
+                if body.get("started") is True:
+                    seq += 1
+                keys = ("running", "total", "done", "exported", "skipped", "failed", "current", "aborted",
+                        "force", "elapsed", "remaining", "errors")
+                session.batch = {"seq": seq, **{k: body[k] for k in keys if k in body}, "time": time.time()}
+                session.batch["running"] = body.get("running") is True
+        return jsonify(session.batch)
+
     @app.post("/api/command")
     def api_command():
         body = json_body()
         kind = body.get("type")
+        if kind in ("export-all", "export-all-abort"):
+            # 一括書き出しの開始・中止（画像名は要らない）
+            event = {"type": kind, "force": body.get("force") is True}
+            return jsonify({**event, "clients": session.hub.publish(event), "batch": session.batch})
         if kind not in ("open", "export"):
-            abort(400, description="type は open か export です")
+            abort(400, description="type は open / export / export-all / export-all-abort のどれかです")
         entry = lib.get(str(body.get("name", "")))
         clients = session.hub.publish({"type": kind, "name": entry.name})
         return jsonify({"type": kind, "name": entry.name, "clients": clients})

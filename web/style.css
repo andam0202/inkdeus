@@ -103,4 +103,12 @@ details.sub > summary { cursor: pointer; padding: 3px 8px; user-select: none; }
 details.sub > .body { padding: 6px 8px 8px; border-top: 1px solid var(--line); }
 #projectName { color: var(--dim); margin-right: 6px; }
 .navlink { color: inherit; text-decoration: none; border: 1px solid var(--line); border-radius: 5px; padding: 2px 10px; }
+#exportState:not(:empty)::before { content: "· "; }
+#batchBar {
+  position: absolute; left: 50%; top: 44%; transform: translate(-50%, -50%); z-index: 5;
+  display: flex; gap: 12px; align-items: center; max-width: 90%;
+  background: var(--bg2); border: 1px solid var(--accent); border-radius: 6px; padding: 10px 14px;
+}
+/* 一括書き出しの間は、設定や画像の切り替えを触れないようにする（中止ボタンだけ押せる） */
+body.batching #panel, body.batching #topbar { pointer-events: none; opacity: 0.55; }
 .navlink:hover { border-color: var(--dim); }

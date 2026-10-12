@@ -20,7 +20,7 @@
      updateLayerPanel, saveStateByManual, btmSaveProjectFile, btmSaveCurrentPage, btmGetGuids, btmGetGuidsSize,
      btmWaitForPageReady, btmUpdateHandleText, chengeCanvasByGuid, multiLoadLz4, clearAllProjectPages,
      getContentObjectCount, getCropAndDownloadLinkByMultiplier, removeGrid, drawGrid, showConfirmDialog,
-     flushHistory, OP_showLoading, OP_hideLoading, waitNextFrame */
+     flushHistory, OP_showLoading, OP_hideLoading, waitNextFrame, withoutHistory, saveInitialState */
   const G = {
     fabric: () => fabric,
     canvas: () => canvas,
@@ -79,6 +79,8 @@
   const NO_EDITOR_GRACE_MS = 4000;          // 読み込みが終わってもキャンバスすら無いとき、別物と見なすまでの猶予
   const POLL_MS = 2000;
   const FREE_WIDTH_RATIO = 0.25;            // 自由配置する素材の既定の幅（ページ幅に対する割合）
+  const PANEL_WIDTH = { def: 300, min: 220, maxRatio: 0.7 };
+  const EDITOR_TAB = 'inkdeus-ink';         // 白黒化の画面を開くタブの名前（同じタブを使い回す）
 
   const state = {
     ready: false,
@@ -96,6 +98,11 @@
     saved: [],                   // 保存済みの漫画データ
     busy: false,                 // 連携スクリプトが保存・読み込み・書き出しの最中
     autosave: { enabled: true, seconds: 60, lastSig: null, dirtySince: 0, pageChanged: false, lastAt: 0 },
+    preferInked: true,           // 元画像のタブから入れるとき、白黒版があれば白黒版を入れる
+    autoSwap: false,             // 白黒版ができたら、置いてある元画像を白黒版に置き換える
+    inked: { versions: null, changed: new Set(), pairs: new Map() },   // 白黒版の更新時刻と、開いてから変わった物
+    events: { connected: false, opened: 0, received: 0 },
+    hot: { updated: 0, last: null },                                    // 書き出しの通知で差し替えた回数
   };
 
   // ---- 小物 ----
@@ -159,6 +166,35 @@
   function thumbUrl(source, rel) {
     return '/api/assets/' + assetPath(source, rel).replace('__KIND__', 'thumb') + '?h=160';
   }
+  // 画像の URL から、どのソースのどの画像かを読む（inkdeus の素材でなければ null）
+  function parseAssetUrl(src) {
+    if (typeof src !== 'string' || !src) return null;
+    try {
+      const u = new URL(src, location.origin);
+      if (u.origin !== location.origin) return null;
+      const m = u.pathname.match(/^\/api\/assets\/([^/]+)\/image\/(.+)$/);
+      if (!m) return null;
+      return { source: decodeURIComponent(m[1]), rel: m[2].split('/').map(decodeURIComponent).join('/'),
+        max: parseInt(u.searchParams.get('max'), 10) || 0 };
+    } catch (e) { return null; }
+  }
+  function withVersion(url, version) {
+    return version ? url + (url.includes('?') ? '&' : '?') + 'v=' + version : url;
+  }
+  // 実際に読み込む URL。開いてから書き出し直された白黒版は、古い物をブラウザが使い回さないよう v を付ける
+  function loadUrlFor(source, rel, canonical) {
+    if (source === 'inked' && state.inked.changed.has(rel) && state.inked.versions) {
+      return withVersion(canonical, state.inked.versions[rel]);
+    }
+    return canonical;
+  }
+  // 保存される src を「v なしの URL」に固定する（v はキャッシュ回避のためだけの物なので、漫画データや履歴には残さない）
+  function pinSrc(obj, canonical, version) {
+    obj.__ikbSrc = canonical;
+    obj.__ikbVersion = version || null;
+    obj.getSrc = function () { return this.__ikbSrc; };
+  }
+
   function stem(rel) {
     const base = String(rel).split('/').pop();
     return base.replace(/\.[^.]+$/, '');
@@ -187,6 +223,24 @@
     ui.reload = el('button', { type: 'button', class: 'ikb-icon', text: '↻', title: '素材の一覧を読み直す',
       'aria-label': '素材の一覧を読み直す', onclick: () => run(() => refresh()) });
     ui.target = el('div', { class: 'ikb-target' });
+    ui.prefer = el('select', { class: 'ikb-prefer', 'aria-label': '入れる画像' }, [
+      el('option', { value: '1', text: '白黒版があれば白黒' }), el('option', { value: '0', text: '常に元画像' })]);
+    ui.preferRow = el('label', { class: 'ikb-row ikb-prefer-row', hidden: true }, [el('span', { text: '入れる画像:' }), ui.prefer]);
+    ui.autoSwap = el('input', { type: 'checkbox', id: 'ikb-autoswap' });
+    ui.autoSwapRow = el('div', { class: 'ikb-row ikb-autosave-row', hidden: true }, [
+      ui.autoSwap, el('label', { for: 'ikb-autoswap', text: '白黒版ができたら元画像を置き換える',
+        title: '元画像のまま置いてある絵を、白黒版が書き出されたときに白黒版へ切り替えます' })]);
+    ui.selName = el('div', { class: 'ikb-sel-name' });
+    ui.btnAdjust = el('button', { type: 'button', text: '白黒を調整', title: '白黒化の画面を別のタブで開きます',
+      onclick: () => run(() => adjustSelected()) });
+    ui.btnToInked = el('button', { type: 'button', text: '白黒版に差し替え', onclick: () => run(() => swapSelected('inked')) });
+    ui.btnToSource = el('button', { type: 'button', text: '元画像に戻す', onclick: () => run(() => swapSelected('source')) });
+    ui.sel = el('div', { class: 'ikb-sel', hidden: true }, [ui.selName,
+      el('div', { class: 'ikb-row' }, [ui.btnAdjust, ui.btnToInked, ui.btnToSource])]);
+    ui.float = el('button', { type: 'button', class: 'ikb-icon', text: '⧉', title: '重ねて表示／並べて表示（漫画エディタの画面を押しのけるかどうか）',
+      'aria-label': '重ねて表示／並べて表示', 'aria-pressed': 'false', onclick: () => setFloat(!state.float) });
+    ui.resize = el('div', { class: 'ikb-resize', title: 'ドラッグで幅を変える（ダブルクリックで既定の幅）', role: 'separator',
+      'aria-orientation': 'vertical' });
     ui.grid = el('div', { class: 'ikb-grid' });
     ui.more = el('button', { type: 'button', class: 'ikb-more', text: 'さらに表示', hidden: true, onclick: () => loadItems(true) });
     ui.count = el('div', { class: 'ikb-count' });
@@ -204,12 +258,16 @@
       el('div', { class: 'ikb-head' }, [
         el('a', { class: 'ikb-link', href: '/', text: '← 白黒化の画面へ' }),
         ui.projectName,
+        ui.float,
       ]),
       ui.msg,
       ui.resume,
+      ui.sel,
       el('div', { class: 'ikb-section ikb-assets' }, [
         ui.tabs,
         el('div', { class: 'ikb-row' }, [ui.search, ui.size, ui.reload]),
+        ui.preferRow,
+        ui.autoSwapRow,
         ui.target,
         ui.grid,
         ui.more,
@@ -228,7 +286,8 @@
     ]);
     ui.toggle = el('button', { type: 'button', class: 'ikb-toggle', title: '素材パネルを開く／閉じる', 'aria-expanded': 'true',
       onclick: () => setOpen(!ui.root.classList.contains('ikb-open')) }, [el('span', { text: '素材' })]);
-    ui.root = el('aside', { id: 'inkdeus-bridge', class: 'ikb', 'aria-label': 'inkdeus の素材パネル' }, [ui.toggle, ui.body]);
+    ui.root = el('aside', { id: 'inkdeus-bridge', class: 'ikb', 'aria-label': 'inkdeus の素材パネル' },
+      [ui.resize, ui.toggle, ui.body]);
 
     // 入力欄でのキー操作が、漫画エディタ側のショートカット（Delete・Ctrl+Z など）として働かないようにする
     ['keydown', 'keyup', 'keypress', 'paste', 'copy', 'cut'].forEach((type) => {
@@ -251,6 +310,20 @@
       renderStatus();
     });
 
+    ui.prefer.addEventListener('change', () => {
+      state.preferInked = ui.prefer.value === '1';
+      store.set('preferInked', state.preferInked);
+    });
+    ui.autoSwap.addEventListener('change', () => {
+      state.autoSwap = ui.autoSwap.checked;
+      store.set('autoSwap', state.autoSwap);
+      if (state.autoSwap) queueSync();
+    });
+    state.preferInked = store.get('preferInked', true) !== false;
+    ui.prefer.value = state.preferInked ? '1' : '0';
+    state.autoSwap = store.get('autoSwap', false) === true;
+    ui.autoSwap.checked = state.autoSwap;
+    wireResize();
     state.imageMax = store.get('imageMax', 2048);
     if (!SIZES.some(([v]) => v === state.imageMax)) state.imageMax = 2048;
     ui.size.value = String(state.imageMax);
@@ -259,7 +332,71 @@
 
     document.documentElement.classList.add('ikb-docked');
     document.body.appendChild(ui.root);
+    setWidth(store.get('panelWidth', null), true);
+    setFloat(store.get('panelFloat', false) === true, true);
     setOpen(store.get('panelOpen', true) !== false, true);
+  }
+
+  // ---- パネルの幅と置き方 ----
+
+  function relayout() {
+    // 画面の幅が変わるので、漫画エディタ側のキャンバスを合わせ直させる
+    setTimeout(() => window.dispatchEvent(new Event('resize')), 0);
+  }
+
+  function clampWidth(px) {
+    return Math.round(Math.min(Math.max(px, PANEL_WIDTH.min), Math.max(PANEL_WIDTH.min, window.innerWidth * PANEL_WIDTH.maxRatio)));
+  }
+
+  // 幅を変える（null で既定の幅）。漫画エディタ側の余白も同じ変数を見ているので一緒に動く
+  function setWidth(px, quiet) {
+    const width = px == null || !isFinite(px) ? null : clampWidth(Number(px));
+    state.width = width === null ? PANEL_WIDTH.def : width;
+    if (width === null) document.documentElement.style.removeProperty('--ikb-width');
+    else document.documentElement.style.setProperty('--ikb-width', width + 'px');
+    if (!quiet) store.set('panelWidth', width);
+    return state.width;
+  }
+
+  function setFloat(on, quiet) {
+    state.float = !!on;
+    document.documentElement.classList.toggle('ikb-float', state.float);
+    ui.float.setAttribute('aria-pressed', String(state.float));
+    ui.float.classList.toggle('ikb-on', state.float);
+    if (!quiet) { store.set('panelFloat', state.float); relayout(); }
+  }
+
+  function wireResize() {
+    let dragging = false;
+    let frame = 0;
+    const handle = ui.resize;
+    handle.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      dragging = true;
+      handle.setPointerCapture(e.pointerId);
+      document.documentElement.classList.add('ikb-resizing');
+      e.preventDefault();
+    });
+    handle.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const tab = ui.toggle.getBoundingClientRect().width;
+      setWidth(window.innerWidth - e.clientX - tab, true);
+      if (!frame) frame = requestAnimationFrame(() => { frame = 0; window.dispatchEvent(new Event('resize')); });
+    });
+    const end = () => {
+      if (!dragging) return;
+      dragging = false;
+      document.documentElement.classList.remove('ikb-resizing');
+      store.set('panelWidth', state.width);
+      relayout();
+    };
+    handle.addEventListener('pointerup', end);
+    handle.addEventListener('pointercancel', end);
+    handle.addEventListener('dblclick', () => { setWidth(null); relayout(); });
+    window.addEventListener('resize', () => {
+      // 画面が狭くなったら、上限（画面幅の 70%）に収め直す
+      if (state.width > clampWidth(state.width)) setWidth(state.width, true);
+    });
   }
 
   function setOpen(open, quiet) {
@@ -267,8 +404,7 @@
     document.documentElement.classList.toggle('ikb-docked-open', open);
     ui.toggle.setAttribute('aria-expanded', String(open));
     if (!quiet) store.set('panelOpen', open);
-    // 画面の幅が変わるので、漫画エディタ側のキャンバスを合わせ直させる
-    setTimeout(() => window.dispatchEvent(new Event('resize')), 0);
+    relayout();
   }
 
   let msgTimer = 0;
@@ -316,18 +452,27 @@
         group = item.group;
         nodes.push(el('div', { class: 'ikb-group', text: group || '（直下）' }));
       }
-      const img = el('img', { loading: 'lazy', decoding: 'async', alt: item.name, src: thumbUrl(src.name, item.path), draggable: 'false' });
+      const img = el('img', { loading: 'lazy', decoding: 'async', alt: item.name, draggable: 'false',
+        src: withVersion(thumbUrl(src.name, item.path), item.version) });
+      // 白黒化の画面で開ける画像（元画像と、その白黒版）には「調整」を付ける
+      const editable = item.editable !== undefined ? item.editable : (src.name === 'source' ? item.path : null);
+      const adjust = src.builtin && editable ? el('button', {
+        type: 'button', class: 'ikb-adjust', text: '調整', title: `白黒化の画面で ${editable} を開く（別のタブ）`,
+        onclick: (e) => { e.stopPropagation(); openEditor(editable); },
+        onkeydown: (e) => e.stopPropagation(),
+      }) : null;
       const cell = el('div', {
         role: 'button', tabindex: '0', class: 'ikb-item' + (src.mode === 'free' ? ' ikb-free' : ''), draggable: 'true',
         title: `${item.path}（${item.width}×${item.height}）`,
         'data-path': item.path,
-        onclick: () => run(() => placeAsset(src.name, item.path)),
+        onclick: () => run(() => placeAsset(src.name, item.path, uiPlaceOptions(src))),
         onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.currentTarget.click(); } },
         ondragstart: (e) => {
           e.dataTransfer.setData('application/x-inkdeus-asset', JSON.stringify({ source: src.name, path: item.path }));
           e.dataTransfer.effectAllowed = 'copy';
         },
-      }, [img, el('span', { class: 'ikb-caption', text: item.name })]);
+      }, [img, el('span', { class: 'ikb-caption', text: item.name })].concat(adjust ? [adjust] : []));
+      if (src.name === 'source' && item.inked) cell.classList.add('ikb-has-inked');
       nodes.push(cell);
     });
     if (!state.items.length) {
@@ -337,6 +482,8 @@
       nodes.push(el('div', { class: 'ikb-empty', text: empty }));
     }
     ui.grid.replaceChildren(...nodes);
+    ui.preferRow.hidden = !(src && src.builtin && src.name === 'source');
+    ui.autoSwapRow.hidden = ui.preferRow.hidden;
     ui.more.hidden = state.items.length >= state.total;
     ui.count.textContent = state.total ? `${state.items.length} / ${state.total} 枚` : '';
   }
@@ -475,6 +622,19 @@
     });
   }
 
+  // 素材を fabric の画像として読み込む（保存される src は v なしの URL）
+  async function loadAsset(source, rel, max) {
+    const canonical = assetUrl(source, rel, max);
+    const url = loadUrlFor(source, rel, canonical);
+    const img = await loadFabricImage(url);
+    if (url !== canonical) pinSrc(img, canonical, state.inked.versions[rel]);
+    return img;
+  }
+
+  function uiPlaceOptions(src) {
+    return src && src.builtin && src.name === 'source' && state.preferInked ? { inked: 'prefer' } : {};
+  }
+
   function requireFeature(feature) {
     if (!state.ready) throw new Error('漫画エディタの準備がまだ終わっていません');
     if (!state.features[feature]) {
@@ -505,7 +665,7 @@
       throw err;
     }
     const max = o.max === undefined ? state.imageMax : o.max;
-    const img = await loadFabricImage(assetUrl(source, rel, max));
+    const img = await loadAsset(source, rel, max);
     if (canvas.getObjects().indexOf(panel) === -1) throw new Error('入れ先のコマが無くなりました');
     img.name = stem(rel);
     const x = panel.left + (panel.width * panel.scaleX) / 2;
@@ -520,7 +680,7 @@
     requireFeature('place');
     const o = opts || {};
     const max = o.max === undefined ? state.imageMax : o.max;
-    const img = await loadFabricImage(assetUrl(source, rel, max));
+    const img = await loadAsset(source, rel, max);
     const ratio = o.widthRatio || FREE_WIDTH_RATIO;
     const scale = (canvas.getWidth() * ratio) / img.width;
     let center = o.at || optional(() => getVisibleCanvasCenter());
@@ -547,8 +707,15 @@
     }
     await waitIdle();
     say('画像を読み込んでいます…', 'work');
+    let label = '';
+    if (o.inked === 'prefer' && source === 'source') {
+      // 白黒版（書き出した PNG）があればそちらを入れる
+      const pair = await pairOf('source', rel).catch(() => null);
+      if (pair && pair.inked) { source = 'inked'; rel = pair.inked.path; label = '（白黒版）'; }
+    }
     const result = mode === 'free' ? await placeFree(source, rel, o) : await placeInPanel(source, rel, o);
-    say(mode === 'free' ? `ページに置きました: ${stem(rel)}` : `コマに入れました: ${result.panel.name || 'コマ'} ← ${stem(rel)}`);
+    say(mode === 'free' ? `ページに置きました: ${stem(rel)}${label}`
+      : `コマに入れました: ${result.panel.name || 'コマ'} ← ${stem(rel)}${label}`);
     renderTarget();
     return result;
   }
@@ -573,9 +740,247 @@
         if (src && src.mode === 'free') return placeAsset(source, path, { mode: 'free', at });
         const panel = optional(() => findPanelUnderPoint(at.x, at.y, null));
         if (!panel) throw new Error('落とした位置にコマがありません');
-        return placeAsset(source, path, { mode: 'panel', panel });
+        return placeAsset(source, path, Object.assign({ mode: 'panel', panel }, uiPlaceOptions(src)));
       });
     });
+  }
+
+  // ---- 白黒化の画面との行き来（別のタブで調整 → 書き出しの通知を受けて、使っている白黒版を差し替える） ----
+
+  function openEditor(name) {
+    // 同じ名前のタブを使い回す（既に開いていれば、そのタブの画像が切り替わる）
+    const win = window.open('/?image=' + encodeURIComponent(name), EDITOR_TAB);
+    say(win ? `白黒化の画面で開きました: ${name}（調整すると、ここで使っている白黒版も替わります）`
+      : 'タブを開けませんでした（ポップアップがブロックされていないか確かめてください）', win ? 'info' : 'error');
+    return !!win;
+  }
+
+  // 元画像と白黒版の対応（どちらの名前からでも引ける）
+  async function pairOf(source, rel) {
+    const key = source + '|' + rel;
+    if (!state.inked.pairs.has(key)) {
+      state.inked.pairs.set(key, await api('GET', '/api/assets/' + assetPath(source, rel).replace('__KIND__', 'pair')));
+    }
+    return state.inked.pairs.get(key);
+  }
+
+  function loadHtmlImage(url) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('画像を読み込めません: ' + url));
+      img.src = url;
+    });
+  }
+
+  function assetImages() {
+    if (!has('canvas')) return [];
+    return canvas.getObjects().filter((o) => o && o.type === 'image')
+      .map((o) => ({ obj: o, ref: parseAssetUrl(optional(() => o.getSrc())) }))
+      .filter((x) => x.ref && (x.ref.source === 'source' || x.ref.source === 'inked'));
+  }
+
+  // オブジェクトの絵だけを入れ替える。位置・角度・切り抜き・コマとの紐づけ・重なり順はそのままにし、
+  // 画素数が違う画像に替わったときは、見た目の大きさが変わらないよう拡大率を直す
+  async function replaceElement(obj, source, rel, version) {
+    const ref = parseAssetUrl(obj.getSrc());
+    const canonical = assetUrl(source, rel, ref ? ref.max : state.imageMax);
+    const element = await loadHtmlImage(withVersion(canonical, version));
+    if (canvas.getObjects().indexOf(obj) === -1) return false;          // 読み込みの間に消された・ページが替わった
+    const before = { w: obj.width, h: obj.height, sx: obj.scaleX, sy: obj.scaleY };
+    const apply = () => {
+      obj.setElement(element);
+      pinSrc(obj, canonical, version);
+      if (obj.width !== before.w || obj.height !== before.h) {
+        obj.scaleX = before.sx * (before.w / obj.width);
+        obj.scaleY = before.sy * (before.h / obj.height);
+        if (obj.initial) optional(() => saveInitialState(obj));         // 画面に合わせ直すときの基準も更新する
+      }
+      obj.dirty = true;
+      obj.setCoords();
+    };
+    const quiet = optional(() => withoutHistory);
+    if (quiet) quiet(apply); else apply();
+    return true;
+  }
+
+  // いま開いているページを見直す:
+  //   - 開いてから書き出し直された白黒版を使っている絵を、新しい画像に替える（履歴には積まない）
+  //   - 「白黒版ができたら元画像を置き換える」がオンなら、白黒版のある元画像を白黒版に切り替える（履歴に1件）
+  // 取り消し・やり直し・ページの切り替えのあと（オブジェクトが作り直されたあと）にも呼ばれる
+  async function syncPage() {
+    if (!state.ready || !has('canvas') || !state.inked.versions) return { refreshed: 0, swapped: 0 };
+    let refreshed = 0;
+    let swapped = 0;
+    for (const { obj, ref } of assetImages()) {
+      try {
+        if (ref.source === 'inked') {
+          const version = state.inked.versions[ref.rel];
+          if (version && state.inked.changed.has(ref.rel) && obj.__ikbVersion !== version) {
+            if (await replaceElement(obj, 'inked', ref.rel, version)) refreshed += 1;
+          }
+        } else if (state.autoSwap) {
+          const pair = await pairOf('source', ref.rel);
+          if (pair && pair.inked && await replaceElement(obj, 'inked', pair.inked.path,
+            state.inked.changed.has(pair.inked.path) ? pair.inked.version : null)) swapped += 1;
+        }
+      } catch (e) {
+        console.error('[inkdeus]', e);
+      }
+    }
+    if (refreshed || swapped) {
+      canvas.requestRenderAll();
+      optional(() => updateLayerPanel());
+      if (swapped) optional(() => saveStateByManual());
+    }
+    return { refreshed, swapped };
+  }
+
+  let syncChain = Promise.resolve();
+  let syncTimer = 0;
+  function queueSync(delay) {
+    clearTimeout(syncTimer);
+    return new Promise((resolve) => {
+      syncTimer = setTimeout(() => {
+        syncChain = syncChain.then(async () => {
+          for (let i = 0; i < 100 && has('isProjectBusy') && isProjectBusy(); i++) await sleep(100);
+          return syncPage();
+        }).catch((e) => { console.error('[inkdeus]', e); return { refreshed: 0, swapped: 0 }; });
+        syncChain.then(resolve);
+      }, delay === undefined ? 150 : delay);
+    });
+  }
+
+  // 白黒版の更新時刻を読み直す。前に読んだ時から変わっていた物は「開いてから変わった物」に加える
+  async function refreshVersions() {
+    let data;
+    try {
+      data = await api('GET', '/api/assets/inked/versions');
+    } catch (e) {
+      return false;                                           // 古いサーバ（この API が無い）。差し替えは行わない
+    }
+    const old = state.inked.versions;
+    const now = data.versions || {};
+    if (old) {
+      Object.keys(now).forEach((rel) => { if (old[rel] !== now[rel]) state.inked.changed.add(rel); });
+    }
+    state.inked.versions = now;
+    return true;
+  }
+
+  // 白黒化の画面（別のタブ）や一括書き出しが PNG を保存したとき
+  async function onExported(ev) {
+    if (!ev || !ev.file) return;
+    state.events.received += 1;
+    if (!state.inked.versions) state.inked.versions = {};
+    state.inked.versions[ev.file] = ev.version;
+    state.inked.changed.add(ev.file);
+    state.inked.pairs.clear();
+    const viewing = state.source === 'inked' || state.source === 'source';
+    listSources().then(() => (viewing ? loadItems(false) : null)).catch(() => {});
+    const result = await queueSync(0);
+    if (result.refreshed || result.swapped) {
+      state.hot.updated += 1;
+      state.hot.last = ev.name;
+      say(`${ev.name} を更新しました`);
+    }
+    renderSelection(true);
+  }
+
+  let eventSource = null;
+  function connectEvents() {
+    if (typeof EventSource === 'undefined') return;
+    if (eventSource) eventSource.close();
+    state.events.connected = false;
+    // ?role=manga: 聞くだけの相手として接続する（白黒化の画面への指示は実行しない）
+    eventSource = new EventSource('/api/events?role=manga');
+    eventSource.onopen = () => {
+      const again = state.events.opened > 0;
+      state.events.connected = true;
+      state.events.opened += 1;
+      if (again) {
+        // つながり直した。切れている間の書き出しを取りこぼしているかもしれないので読み直す
+        refreshVersions().then(() => { state.inked.pairs.clear(); return refresh(); }).then(() => queueSync(0))
+          .catch((e) => console.error('[inkdeus]', e));
+      }
+    };
+    eventSource.onerror = () => { state.events.connected = false; };      // 再接続はブラウザが自動で行う
+    eventSource.onmessage = (msg) => {
+      let ev;
+      try { ev = JSON.parse(msg.data); } catch (e) { return; }
+      if (ev.type === 'exported') onExported(ev).catch((e) => console.error('[inkdeus]', e));
+    };
+  }
+
+  // ---- 選択中の画像（inkdeus の素材なら、調整・差し替えのボタンを出す） ----
+
+  function selectedAsset() {
+    if (!has('canvas')) return null;
+    const obj = canvas.getActiveObject();
+    if (!obj || obj.type !== 'image') return null;
+    const ref = parseAssetUrl(optional(() => obj.getSrc()));
+    return ref && (ref.source === 'source' || ref.source === 'inked') ? { obj, ref } : null;
+  }
+
+  let selKey = '';
+  function renderSelection(force) {
+    const sel = state.ready ? selectedAsset() : null;
+    const key = sel ? sel.ref.source + '|' + sel.ref.rel : '';
+    if (key === selKey && !force) return;
+    selKey = key;
+    ui.sel.hidden = !sel;
+    if (!sel) return;
+    ui.selName.textContent = `選択中の画像: ${stem(sel.ref.rel)}（${sel.ref.source === 'inked' ? '白黒版' : '元画像'}）`;
+    ui.btnToInked.hidden = sel.ref.source !== 'source';
+    ui.btnToSource.hidden = sel.ref.source !== 'inked';
+    ui.btnAdjust.disabled = false;
+    ui.btnToSource.disabled = false;
+    pairOf(sel.ref.source, sel.ref.rel).then((pair) => {
+      if (selKey !== key) return;
+      ui.btnAdjust.disabled = !pair.name;
+      ui.btnToSource.disabled = !pair.source;
+      if (pair.name) ui.selName.title = pair.name;
+    }).catch(() => {});
+  }
+
+  async function adjustSelected() {
+    const sel = selectedAsset();
+    if (!sel) throw new Error('inkdeus の画像が選ばれていません');
+    const pair = await pairOf(sel.ref.source, sel.ref.rel);
+    if (!pair.name) throw new Error('この白黒版の元画像が見つかりません');
+    return openEditor(pair.name);
+  }
+
+  // 選択中の絵を、白黒版 ⇔ 元画像で差し替える（位置・見た目の大きさ・切り抜き・コマとの紐づけは保つ）
+  async function swapSelected(to) {
+    requireFeature('place');
+    const sel = selectedAsset();
+    if (!sel) throw new Error('inkdeus の画像が選ばれていません');
+    await waitIdle();
+    const pair = await pairOf(sel.ref.source, sel.ref.rel);
+    let done;
+    if (to === 'inked') {
+      if (sel.ref.source === 'inked') return { ok: true, changed: false };
+      if (!pair.inked) {
+        const err = new Error('白黒版がまだありません。「白黒を調整」で白黒化の画面を開くと、自動で書き出されます');
+        err.code = 'no-inked';
+        throw err;
+      }
+      done = await replaceElement(sel.obj, 'inked', pair.inked.path,
+        state.inked.changed.has(pair.inked.path) ? pair.inked.version : null);
+    } else {
+      if (sel.ref.source === 'source') return { ok: true, changed: false };
+      if (!pair.source) throw new Error('元画像が見つかりません');
+      done = await replaceElement(sel.obj, 'source', pair.source.path, null);
+    }
+    if (done) {
+      canvas.requestRenderAll();
+      updateLayerPanel();
+      saveStateByManual();                                   // これは絵の内容の変更なので、取り消せるよう履歴に積む
+      say(to === 'inked' ? `白黒版に差し替えました: ${stem(sel.ref.rel)}` : `元画像に戻しました: ${stem(sel.ref.rel)}`);
+    }
+    renderSelection(true);
+    return { ok: !!done, changed: !!done, object: describe(sel.obj), src: sel.obj.getSrc() };
   }
 
   // ---- 保存と読み込み ----
@@ -908,7 +1313,16 @@
     markClean();
     renderStatus();
     renderTarget();
-    setInterval(renderTarget, 700);
+    setInterval(() => { renderTarget(); renderSelection(false); }, 700);
+    await refreshVersions();
+    connectEvents();
+    if (has('canvas')) {
+      // 取り消し・やり直し・ページの切り替えではオブジェクトが作り直される。そのあとでページを見直す
+      canvas.on('object:added', (e) => { if (e.target && e.target.type === 'image') queueSync(); });
+      canvas.on('selection:created', () => renderSelection(false));
+      canvas.on('selection:updated', () => renderSelection(false));
+      canvas.on('selection:cleared', () => renderSelection(false));
+    }
     setInterval(autosaveTick, POLL_MS);
     if (problems.length) {
       say('対応していない版です。次の機能は使えません: ' + problems.join(' / '), 'error');
@@ -932,6 +1346,8 @@
     status: () => ({ ready: state.ready, busy: state.busy, features: Object.assign({}, state.features),
       missing: Object.assign({}, state.missing), project: state.project, mangaDir: state.mangaDir,
       name: state.name, source: state.source, imageMax: state.imageMax,
+      width: state.width, float: !!state.float, preferInked: state.preferInked, autoSwap: state.autoSwap,
+      events: Object.assign({}, state.events), hot: Object.assign({}, state.hot),
       autosave: { enabled: state.autosave.enabled, seconds: state.autosave.seconds,
         dirty: !!state.autosave.dirtySince, lastAt: state.autosave.lastAt } }),
     // 素材
@@ -951,8 +1367,14 @@
     },
     // 書き出し
     exportPage, exportAllPages,
+    // 白黒化の画面との行き来
+    openEditor, adjustSelected, swapSelected, syncPage: () => queueSync(0), reconnectEvents: connectEvents,
+    setPreferInked(on) { state.preferInked = !!on; ui.prefer.value = on ? '1' : '0'; },
+    setAutoSwap(on) { state.autoSwap = !!on; ui.autoSwap.checked = !!on; if (on) return queueSync(0); return null; },
     // 画面
     setOpen: (open) => setOpen(!!open),
+    setWidth: (px) => { const w = setWidth(px); relayout(); return w; },
+    setFloat: (on) => setFloat(!!on),
     setImageMax(max) {
       if (!SIZES.some(([v]) => v === max)) throw new Error('大きさは 1024 / 2048 / 4096 / 0（原寸）のどれかです');
       state.imageMax = max;

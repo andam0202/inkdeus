@@ -11,6 +11,8 @@ const $ = (id) => document.getElementById(id);
 const BITMAP_OPTS = { premultiplyAlpha: 'none', colorSpaceConversion: 'none' };
 const SAVE_DELAY_MS = 700;
 const STATS_DELAY_MS = 400;
+const AUTO_EXPORT_DELAY_MS = 1500;      // 最後の変更からこの時間が経ったら自動で書き出す
+const AUTO_EXPORT_KEY = 'inkdeus.autoExport';
 // このブラウザ画面の ID。自分の保存で出たイベントを「外部からの変更」と取り違えないために使う
 const CLIENT_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 const HISTORY_MAX = 200;
@@ -30,6 +32,9 @@ const state = {
   tab: 'person',        // トーンのパネルで開いているタブ
   project: null,
   lastExport: '',
+  autoExport: true,     // 変更を自動で書き出す（漫画の構成の画面へ反映するため）
+  batchForce: false,    // 一括書き出しで、書き出し済みの画像も作り直す
+  lastBatch: '',        // 直近の一括書き出しの結果
   view: { zoom: 1, cx: 0, cy: 0 },
   compare: false,
   split: 0.5,           // 比較の仕切り位置（キャンバス幅に対する割合）
@@ -46,6 +51,7 @@ let lastStats = null;
 let renderPending = false;
 let drawPending = false;
 let lastRenderMs = 0;
+let renderSeq = 0;                      // 描画のたびに増える（書き出しの途中で絵が変わったことを知るため）
 
 // ---- 表示まわりの小物 ----
 
@@ -122,6 +128,7 @@ function renderNow() {
   if (!renderer) return null;
   let result = null;
   try {
+    renderSeq += 1;
     result = renderer.render(state.params, { solo: state.solo });
     lastRenderMs = result.ms;
     if (renderer.W) $('timing').textContent = `再描画 ${result.ms.toFixed(1)} ms`;
@@ -276,7 +283,7 @@ function wireViewer() {
 const ctx = {
   state,
   imageSize: () => ({ w: renderer ? renderer.W : 0, h: renderer ? renderer.H : 0 }),
-  live: () => requestRender(),
+  live: () => { requestRender(); deferAutoExport(); },
   commit: () => commit(),
   rebuild: () => rebuild(),
   setSolo: (solo, redraw) => {
@@ -290,6 +297,9 @@ const ctx = {
     commit(); rebuild(); requestRender();
   },
   exportNow: () => exportNow(),
+  setAutoExport: (on) => setAutoExport(on),
+  exportAll: () => exportAll({ force: state.batchForce }),
+  setBatchForce: (on) => { state.batchForce = !!on; },
   saveJSON: () => download(new Blob([JSON.stringify(state.params, null, 2) + '\n'], { type: 'application/json' }),
     `${state.name ? stemOf(state.name) : 'inkdeus'}.inkdeus.json`),
   openJSON: () => $('fileParams').click(),
@@ -318,6 +328,7 @@ function commit(save = true) {
   $('btnUndo').disabled = hpos <= 0;
   $('btnRedo').disabled = true;
   if (save) scheduleSave();
+  touchAutoExport();
 }
 
 function stepHistory(delta) {
@@ -329,6 +340,7 @@ function stepHistory(delta) {
   rebuild();
   requestRender();
   scheduleSave();
+  touchAutoExport();
 }
 const undo = () => stepHistory(-1);
 const redo = () => stepHistory(1);
@@ -458,8 +470,11 @@ function connectEvents() {
     let ev;
     try { ev = JSON.parse(msg.data); } catch { return; }
     if (ev.type === 'params') onExternalParams(ev).catch((e) => console.warn(e));
+    else if (batch.running && (ev.type === 'open' || ev.type === 'export')) return;   // 一括書き出しの最中は受けない
     else if (ev.type === 'open') openByName(ev.name);
     else if (ev.type === 'export') openByName(ev.name).then(() => exportNow()).catch((e) => console.warn(e));
+    else if (ev.type === 'export-all') exportAll({ force: !!ev.force }).catch((e) => console.warn(e));
+    else if (ev.type === 'export-all-abort') abortExportAll();
   };
 }
 
@@ -532,6 +547,7 @@ async function setMaskBlob(blob) {
 async function openIndex(i) {
   if (i < 0 || i >= state.images.length) return;
   await flushSave();
+  await flushAutoExport();             // 前の画像の「未反映の変更」を書き出してから離れる
   const item = state.images[i];
   setBusy(true);
   try {
@@ -559,6 +575,9 @@ async function openIndex(i) {
     }
     postState();
     renderNow();
+    // 白黒版がまだ無い（または設定より古い）画像は、開いた時点で書き出しの対象にする
+    if (item.exportFresh) setExportState(state.autoExport ? '書き出し済み' : '');
+    else touchAutoExport();
   } catch (e) {
     showMessage(`${item.name} を開けませんでした: ${e.message}`, 'error');
   } finally {
@@ -643,6 +662,27 @@ function wireFiles() {
 
 // ---- 書き出し ----
 
+/** いま描かれている絵を PNG にする。途中で描き直しが入ったら null（上下で違う絵が混ざるため使えない） */
+async function encodeCurrent() {
+  const { W, H } = renderer;
+  const seq = renderSeq;
+  const blob = await encodeGrayPNG(W, H, (y0, rows) => renderer.readPixels(0, y0, W, rows));
+  return seq === renderSeq ? blob : null;
+}
+
+/** PNG をサーバへ保存する（表示中の画像の書き出しとして） */
+async function uploadExport(name, blob) {
+  const r = await fetch(apiPath('export', name), {
+    method: 'POST', body: blob,
+    headers: { 'Content-Type': 'image/png', ...(state.rev ? { 'X-Inkdeus-Rev': state.rev } : {}) },
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const j = await r.json();
+  const item = state.images.find((i) => i.name === name);
+  if (item) { item.hasExport = true; item.exportFresh = true; }
+  return { path: j.path, bytes: blob.size };
+}
+
 async function exportNow() {
   if (!renderer || !renderer.W) {
     showMessage('画像が読み込まれていません', 'error');
@@ -652,20 +692,23 @@ async function exportNow() {
   await new Promise((resolve) => setTimeout(resolve, 0));
   try {
     state.solo = null;                          // ソロ表示のまま書き出さない
-    renderNow();
-    setBusy(true);
-    const { W, H } = renderer;
-    const blob = await encodeGrayPNG(W, H, (y0, rows) => renderer.readPixels(0, y0, W, rows));
+    let blob = null;
+    for (let attempt = 0; attempt < 3 && !blob; attempt++) {
+      renderNow();
+      setBusy(true);
+      blob = await encodeCurrent();
+    }
+    if (!blob) throw new Error('書き出しの途中で設定が変わり続けています。操作を止めてからもう一度試してください');
     let result;
     if (state.server && state.remote) {
-      const r = await fetch(apiPath('export', state.name), {
-        method: 'POST', body: blob,
-        headers: { 'Content-Type': 'image/png', ...(state.rev ? { 'X-Inkdeus-Rev': state.rev } : {}) },
-      });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const j = await r.json();
-      result = { path: j.path, bytes: blob.size };
-      state.lastExport = `保存しました: ${j.path}`;
+      const snap = JSON.stringify(state.params);
+      await flushSave();                        // 保存先の設定ファイルと書き出した絵をそろえる
+      result = await uploadExport(state.name, blob);
+      state.lastExport = `保存しました: ${result.path}`;
+      if (snap === JSON.stringify(state.params) && !autoExport.timer) {
+        autoExport.dirty = false;
+        setExportState('書き出し済み');
+      }
     } else {
       const filename = `${stemOf(state.name || 'image')}_inkdeus.png`;
       download(blob, filename);
@@ -680,6 +723,224 @@ async function exportNow() {
   } finally {
     setBusy(false);
   }
+}
+
+// ---- 自動書き出し（設定が変わって落ち着いたら PNG を保存する。漫画の構成の画面がそれを拾う） ----
+
+const autoExport = { timer: null, running: null, again: false, dirty: false, count: 0 };
+
+function setExportState(text) {
+  $('exportState').textContent = text;
+}
+
+function autoExportReady() {
+  return canAutoSave() && !batch.running && renderer && renderer.W > 0;
+}
+
+/** 設定が変わったときに呼ぶ。最後の変更から一定時間後に書き出す */
+function touchAutoExport() {
+  if (!autoExportReady()) return;
+  autoExport.dirty = true;
+  const item = state.images.find((i) => i.name === state.name);
+  if (item) item.exportFresh = false;
+  if (!state.autoExport) {
+    setExportState('未反映の変更あり');
+    return;
+  }
+  setExportState(autoExport.running ? '書き出し中…' : '未反映の変更あり');
+  clearTimeout(autoExport.timer);
+  autoExport.timer = setTimeout(runAutoExport, AUTO_EXPORT_DELAY_MS);
+}
+
+/** スライダーを動かしている間は、待ち時間を数え直す（動かしている最中に書き出さない） */
+function deferAutoExport() {
+  if (!autoExport.timer) return;
+  clearTimeout(autoExport.timer);
+  autoExport.timer = setTimeout(runAutoExport, AUTO_EXPORT_DELAY_MS);
+}
+
+function runAutoExport() {
+  autoExport.timer = null;
+  if (!state.autoExport || !autoExportReady()) return Promise.resolve();
+  if (autoExport.running) {
+    autoExport.again = true;                    // 書き出し中に来た変更は、終わってから1回だけやり直す（溜めない）
+    return autoExport.running;
+  }
+  if (state.solo || renderPending) {
+    // ソロ表示の間は書き出さない（その層だけの絵になってしまう）。戻るのを待つ
+    autoExport.timer = setTimeout(runAutoExport, 500);
+    return Promise.resolve();
+  }
+  const name = state.name;
+  setExportState('書き出し中…');
+  autoExport.running = (async () => {
+    try {
+      await flushSave();
+      const snap = JSON.stringify(state.params);
+      const blob = await encodeCurrent();
+      if (!blob || state.name !== name) {
+        autoExport.again = state.name === name;  // 途中で絵が変わった。保存せずにやり直す
+        return;
+      }
+      await uploadExport(name, blob);
+      autoExport.count += 1;
+      if (snap === JSON.stringify(state.params) && !autoExport.timer && !autoExport.again) {
+        autoExport.dirty = false;
+        setExportState('書き出し済み');
+      }
+    } catch (e) {
+      console.warn('自動の書き出しに失敗しました', e);
+      setExportState('書き出しに失敗');
+    } finally {
+      autoExport.running = null;
+      if (autoExport.again) {
+        autoExport.again = false;
+        if (!autoExport.timer) autoExport.timer = setTimeout(runAutoExport, 0);
+      }
+    }
+  })();
+  return autoExport.running;
+}
+
+/** 待っている自動書き出しがあれば、いますぐ済ませる（別の画像へ移る前に呼ぶ） */
+async function flushAutoExport() {
+  if (batch.running) return;
+  if (autoExport.timer && state.autoExport && !state.solo) {
+    clearTimeout(autoExport.timer);
+    autoExport.timer = null;
+    await runAutoExport();
+  }
+  if (autoExport.running) await autoExport.running;
+  clearTimeout(autoExport.timer);
+  autoExport.timer = null;
+  autoExport.again = false;
+}
+
+function setAutoExport(on) {
+  state.autoExport = !!on;
+  try { localStorage.setItem(AUTO_EXPORT_KEY, on ? '1' : '0'); } catch { /* 覚えられなくても動く */ }
+  if (!on) {
+    clearTimeout(autoExport.timer);
+    autoExport.timer = null;
+    setExportState(autoExport.dirty ? '未反映の変更あり' : '');
+  } else if (autoExport.dirty) {
+    touchAutoExport();
+  }
+}
+
+// ---- 全画像の書き出し ----
+
+const batch = { running: false, abort: false, total: 0, done: 0, exported: 0, skipped: 0, failed: 0,
+  current: null, startedAt: 0, force: false, errors: [] };
+let batchTicker = null;
+
+function formatSpan(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function batchReport(extra = {}) {
+  const elapsed = batch.startedAt ? (performance.now() - batch.startedAt) / 1000 : 0;
+  const left = batch.total - batch.done;
+  // 残りは「実際に書き出した画像の平均」から見積もる（飛ばした画像はほぼ時間がかからない）
+  const remaining = batch.exported > 0 && batch.running ? (elapsed / batch.exported) * left : null;
+  return { running: batch.running, total: batch.total, done: batch.done, exported: batch.exported,
+    skipped: batch.skipped, failed: batch.failed, current: batch.current, aborted: batch.abort, force: batch.force,
+    elapsed: Math.round(elapsed * 10) / 10, remaining: remaining === null ? null : Math.round(remaining),
+    errors: batch.errors.slice(0, 20), ...extra };
+}
+
+function showBatch(extra) {
+  const r = batchReport(extra);
+  $('batchBar').hidden = !batch.running;
+  document.body.classList.toggle('batching', batch.running);
+  if (batch.running) {
+    $('batchText').textContent = `全画像を書き出し中 ${r.done} / ${r.total}`
+      + `（書き出し ${r.exported}・飛ばし ${r.skipped}・失敗 ${r.failed}）`
+      + ` 経過 ${formatSpan(r.elapsed)}${r.remaining === null ? '' : ` / 残り 約 ${formatSpan(r.remaining)}`}`
+      + (r.current ? ` — ${r.current}` : '');
+  }
+  return r;
+}
+
+function postBatch(extra) {
+  const r = showBatch(extra);
+  return fetch('api/batch', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(r),
+  }).catch(() => {});
+}
+
+function abortExportAll() {
+  if (batch.running) batch.abort = true;
+}
+
+/**
+ * プロジェクトの全画像を順に開いて書き出す。各画像は保存済みの設定で、設定の無い画像は
+ * 「始めたときに画面に出ていた設定」で書き出す（その設定をその画像の設定として保存する）。
+ * 書き出し済みで、設定・元画像がその後変わっていない画像は飛ばす（force で作り直す）
+ */
+async function exportAll({ force = false } = {}) {
+  if (batch.running) return batchReport();
+  if (!state.server) {
+    showMessage('全画像の書き出しはサーバありのときだけ使えます', 'error');
+    return null;
+  }
+  await flushSave();
+  await flushAutoExport();
+  await refreshImages();
+  const base = JSON.stringify(state.params);
+  const startName = state.remote ? state.name : null;
+  Object.assign(batch, { running: true, abort: false, total: state.images.length, done: 0, exported: 0, skipped: 0,
+    failed: 0, current: null, startedAt: performance.now(), force: !!force, errors: [] });
+  state.lastBatch = '';
+  rebuild();
+  await postBatch({ started: true });
+  batchTicker = setInterval(() => showBatch(), 1000);
+  try {
+    for (let i = 0; i < state.images.length && !batch.abort; i++) {
+      const item = state.images[i];
+      batch.current = item.name;
+      if (!force && item.exportFresh) {
+        batch.skipped += 1;
+      } else {
+        try {
+          const hadParams = item.hasParams;
+          if (!hadParams) state.params = JSON.parse(base);     // 設定の無い画像には、始めたときの設定を使う
+          await openIndex(i);
+          if (state.name !== item.name || !state.remote) throw new Error('画像を開けませんでした');
+          if (!hadParams) await saveNow();
+          state.solo = null;
+          renderNow();
+          const blob = await encodeCurrent();
+          if (!blob) throw new Error('書き出しの途中で描き直しが入りました');
+          await uploadExport(item.name, blob);
+          batch.exported += 1;
+        } catch (e) {
+          batch.failed += 1;
+          batch.errors.push(`${item.name}: ${e.message}`);
+        }
+      }
+      batch.done += 1;
+      await postBatch();
+      await new Promise((resolve) => setTimeout(resolve, 0));  // 画面の更新と中止ボタンに順番を回す
+    }
+  } finally {
+    clearInterval(batchTicker);
+    batch.running = false;
+    batch.current = null;
+    const r = batchReport();
+    state.lastBatch = `${batch.abort ? '中止しました' : '終わりました'}: 書き出し ${r.exported} / 飛ばし ${r.skipped}`
+      + ` / 失敗 ${r.failed}（全 ${r.total} 枚・${formatSpan(r.elapsed)}）`
+      + (r.errors.length ? `\n${r.errors.join('\n')}` : '');
+    await postBatch();
+    // 始める前に開いていた画像へ戻る
+    const back = startName ? state.images.findIndex((x) => x.name === startName) : -1;
+    if (back >= 0 && state.name !== startName) await openIndex(back);
+    autoExport.dirty = false;
+    rebuild();
+    showMessage(`全画像の書き出し: ${state.lastBatch}`, batch.failed ? 'error' : 'info');
+  }
+  return batchReport();
 }
 
 // ---- 起動 ----
@@ -702,6 +963,8 @@ async function init() {
     $('projectName').hidden = false;
   }
   state.params = defaultParams();
+  try { state.autoExport = localStorage.getItem(AUTO_EXPORT_KEY) !== '0'; } catch { state.autoExport = true; }
+  $('btnBatchAbort').addEventListener('click', abortExportAll);
   resetHistory();
   $('modeBadge').textContent = state.server ? 'サーバ' : 'サーバなし';
   $('linkManga').hidden = !state.server;          // 漫画の構成（/manga/）は inkdeus のサーバが配信する
@@ -714,7 +977,11 @@ async function init() {
   connectEvents();
   if (state.images.length) {
     await refreshImages();
-    await openIndex(0);
+    // /?image=<画像名> で、その画像を開いた状態で始める（漫画の構成の画面の「調整」から来る）
+    const wanted = new URLSearchParams(location.search).get('image');
+    const index = wanted ? state.images.findIndex((i) => i.name === wanted) : 0;
+    if (wanted && index < 0) showMessage(`指定の画像が見つかりません: ${wanted}`, 'error');
+    await openIndex(Math.max(0, index));
   } else if (state.server) {
     showMessage('入力フォルダに画像がありません', 'error');
   }
@@ -761,6 +1028,13 @@ const hooks = {
   },
   watermark: () => ({ ...effectiveWatermark(state.params), rect: renderer.wmRect }),
   exportPNG: () => exportNow(),
+  /** 自動書き出しの状態（テスト・確認用） */
+  autoExport: () => ({ enabled: state.autoExport, dirty: autoExport.dirty, running: !!autoExport.running,
+    pending: !!autoExport.timer, count: autoExport.count, label: $('exportState').textContent }),
+  setAutoExport: (on) => { setAutoExport(on); rebuild(); },
+  exportAll: (opts) => exportAll(opts || {}),
+  abortExportAll,
+  batch: () => batchReport(),
   undo, redo,
 };
 window.inkdeus = hooks;

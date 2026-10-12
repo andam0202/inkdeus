@@ -168,6 +168,42 @@ def cmd_export(c: Client, args) -> dict:
     return {"name": name, **result}
 
 
+def cmd_export_all(c: Client, args) -> dict:
+    if args.status:
+        return c.call("GET", "/api/batch")
+    if args.abort:
+        r = c.call("POST", "/api/command", {"type": "export-all-abort"})
+        return {"aborting": r["clients"] > 0, "batch": r["batch"]}
+    before = c.call("GET", "/api/batch")
+    if before.get("running"):
+        raise CtlError("一括書き出しは既に進行中です（進み具合は export-all --status、中止は --abort）", before, code=2)
+    r = c.call("POST", "/api/command", {"type": "export-all", "force": args.force})
+    if r["clients"] == 0:
+        raise CtlError("ブラウザが開いていないため書き出せません（書き出しはブラウザが行います）", r, code=2)
+
+    def started():
+        b = c.call("GET", "/api/batch")
+        return b if b.get("seq", 0) > before.get("seq", 0) else None
+
+    batch = _wait(started, min(args.timeout, 30.0))
+    if batch is None:
+        raise CtlError("ブラウザが一括書き出しを始めません（白黒化の画面を開いていますか？）", code=3)
+    if not args.wait:
+        return batch
+
+    def finished():
+        b = c.call("GET", "/api/batch")
+        return b if not b.get("running") else None
+
+    batch = _wait(finished, args.timeout, interval=1.0)
+    if batch is None:
+        raise CtlError(f"{args.timeout:g} 秒待ちましたが、一括書き出しが終わりません",
+                       c.call("GET", "/api/batch"), code=3)
+    if batch.get("failed"):
+        raise CtlError(f"{batch['failed']} 枚の書き出しに失敗しました", batch, code=1)
+    return batch
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="inkdeus ctl",
@@ -212,6 +248,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=60.0)
     p = with_name(add("export", cmd_export, "ブラウザに PNG の書き出しを指示し、保存先を返す"))
     p.add_argument("--timeout", type=float, default=300.0)
+    p = add("export-all", cmd_export_all,
+            "ブラウザに全画像の書き出しを指示する。各画像は保存済みの設定で、設定の無い画像は"
+            "いま画面に出ている設定で書き出す。書き出し済みで設定が変わっていない画像は飛ばす")
+    p.add_argument("--force", action="store_true", help="書き出し済みの画像も作り直す")
+    p.add_argument("--wait", action="store_true", help="終わるまで待って結果（件数）を返す")
+    p.add_argument("--status", action="store_true", help="進み具合だけを表示する（何も始めない）")
+    p.add_argument("--abort", action="store_true", help="進行中の一括書き出しを中止する")
+    p.add_argument("--timeout", type=float, default=7200.0)
     return ap
 
 

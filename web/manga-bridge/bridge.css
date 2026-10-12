@@ -17,11 +17,14 @@
 
 /* パネルの分だけ画面の右側を空ける（漫画エディタの画面と重ねない） */
 html.ikb-docked body { padding-right: var(--ikb-tab); }
-html.ikb-docked.ikb-docked-open body { padding-right: calc(var(--ikb-width) + var(--ikb-tab)); }
+html.ikb-docked.ikb-docked-open:not(.ikb-float) body { padding-right: calc(var(--ikb-width) + var(--ikb-tab)); }
 
 /* 開いたページ一覧（画面の下端いっぱいに広がる）がパネルに被らないよう、同じ分だけ縮める */
 html.ikb-docked .btm-drawer:not(.btm-closed) { width: calc(100% - var(--ikb-tab)); }
-html.ikb-docked.ikb-docked-open .btm-drawer:not(.btm-closed) { width: calc(100% - var(--ikb-width) - var(--ikb-tab)); }
+html.ikb-docked.ikb-docked-open:not(.ikb-float) .btm-drawer:not(.btm-closed) { width: calc(100% - var(--ikb-width) - var(--ikb-tab)); }
+/* 「重ねて表示」: 漫画エディタの画面は押しのけず、パネルを上にかぶせる */
+html.ikb-float .ikb.ikb-open { box-shadow: -6px 0 18px rgba(0, 0, 0, 0.45); }
+html.ikb-resizing, html.ikb-resizing * { cursor: ew-resize !important; user-select: none !important; }
 
 /* service worker を外しているので、PWA として導入するボタンは働かない */
 #pwa-install-button { display: none !important; }
@@ -109,7 +112,7 @@ html.ikb-docked.ikb-docked-open .btm-drawer:not(.btm-closed) { width: calc(100% 
 
 .ikb-grid {
   flex: 1; min-height: 80px; overflow-y: auto; overflow-x: hidden;
-  display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; align-content: start;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 6px; align-content: start;
   padding-right: 2px;
 }
 .ikb-group {
@@ -122,6 +125,17 @@ html.ikb-docked.ikb-docked-open .btm-drawer:not(.btm-closed) { width: calc(100% 
   background: #15161a; border: 1px solid var(--ikb-line); border-radius: 4px; cursor: pointer;
 }
 .ikb-item:hover { border-color: var(--ikb-accent); }
+.ikb-item { position: relative; }
+.ikb .ikb-adjust {
+  position: absolute; top: 2px; right: 2px; padding: 0 5px; font-size: 10px; line-height: 16px;
+  background: rgba(20, 21, 25, 0.85); opacity: 0.75;
+}
+.ikb-item:hover .ikb-adjust, .ikb .ikb-adjust:focus-visible { opacity: 1; border-color: var(--ikb-accent); }
+.ikb-item.ikb-has-inked::after {
+  /* 白黒版（書き出した PNG）がある元画像の目印 */
+  content: "白黒"; position: absolute; left: 2px; top: 2px; padding: 0 4px; font-size: 9px; line-height: 14px;
+  background: rgba(20, 21, 25, 0.85); color: #a8d8a0; border-radius: 3px; pointer-events: none;
+}
 .ikb-item img { width: 100%; height: 72px; object-fit: contain; display: block; pointer-events: none; }
 .ikb-item.ikb-free img {
   /* 透過の素材が見分けられるように市松模様を敷く */
@@ -132,3 +146,19 @@ html.ikb-docked.ikb-docked-open .btm-drawer:not(.btm-closed) { width: calc(100% 
 .ikb-count, .ikb-dim { color: var(--ikb-dim); font-size: 11px; }
 .ikb-count { flex: none; text-align: right; }
 .ikb-dir { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+
+/* 幅を変えるつまみ（パネルの左端） */
+.ikb-resize { display: none; position: absolute; left: -4px; top: 0; bottom: 0; width: 8px; cursor: ew-resize; z-index: 1; touch-action: none; }
+.ikb.ikb-open .ikb-resize { display: block; }
+.ikb-resize:hover, html.ikb-resizing .ikb-resize { background: var(--ikb-accent); opacity: 0.6; }
+.ikb .ikb-head > .ikb-icon { flex: none; padding: 1px 7px; }
+.ikb .ikb-icon.ikb-on { border-color: var(--ikb-accent); color: #fff; }
+.ikb-project-name { flex: 1; text-align: right; }
+
+/* 選択中の画像（調整・差し替え） */
+.ikb-sel { flex: none; display: flex; flex-direction: column; gap: 5px; padding: 6px 8px; border-radius: 4px;
+  border: 1px solid var(--ikb-line); background: var(--ikb-bg2); }
+.ikb-sel-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ikb-prefer-row { margin: 0; color: var(--ikb-dim); }
+.ikb-prefer-row > span { flex: none; }
+.ikb-prefer-row > select { flex: 1; }

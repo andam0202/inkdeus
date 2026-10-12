@@ -294,3 +294,50 @@ def test_run_without_project_has_builtin_sources_only(env):
     assert list(rows) == ["source", "inked"] and rows["source"]["count"] == 1 and rows["inked"]["count"] == 0
     assert single.get("/api/assets/source/image/tall.png").status_code == 404           # 1枚だけ開いたときは、その1枚だけ
     assert single.get("/api/assets/source/image/wide.png").status_code == 200
+
+
+# ---- 元画像と白黒版の対応・更新の検知 ----
+
+def test_source_and_inked_are_paired(env):
+    client = client_for(env)
+    rows = {i["path"]: i for i in client.get("/api/assets/source").get_json()["items"]}
+    inked = rows["wide.png"]["inked"]
+    assert rows["wide.png"]["editable"] == "wide.png" and inked["path"] == "wide.png"
+    assert inked["version"] == (env["project"].out / "wide.png").stat().st_mtime_ns // 1_000_000
+    assert rows["tall.png"]["inked"] is None and rows["wide.png"]["version"] > 0
+    assert client.get("/api/assets/inked").get_json()["items"][0]["editable"] == "wide.png"
+    pair = client.get("/api/assets/source/pair/wide.png").get_json()
+    assert pair == client.get("/api/assets/inked/pair/wide.png").get_json()
+    assert pair["name"] == "wide.png" and pair["source"] == {"path": "wide.png"} and pair["inked"] == inked
+    assert client.get("/api/assets/source/pair/tall.png").get_json()["inked"] is None
+    # 元画像の無い書き出し済み PNG
+    synth.save(env["project"].out / "orphan.png", synth.flat(8, 8, 0)[..., 0])
+    orphan = client.get("/api/assets/inked/pair/orphan.png").get_json()
+    assert orphan["name"] is None and orphan["source"] is None and orphan["inked"]["path"] == "orphan.png"
+    assert {i["path"]: i["editable"] for i in client.get("/api/assets/inked").get_json()["items"]} == \
+        {"orphan.png": None, "wide.png": "wide.png"}
+    for bad in ("/api/assets/source/pair/nope.png", "/api/assets/inked/pair/nope.png",
+                "/api/assets/source/pair/../secret.png", "/api/assets/nope/pair/wide.png"):
+        assert client.get(bad).status_code in (301, 308, 404), bad
+    assert client.get("/api/assets/inked/versions").get_json()["versions"].keys() == {"orphan.png", "wide.png"}
+    assert client.get("/api/assets/nope/versions").status_code == 404
+
+
+def test_browser_never_keeps_a_stale_inked_image(env):
+    """白黒版が書き出し直されたら、同じ URL でも新しい中身が返る（ETag が変わり、縮小キャッシュも作り直す）"""
+    client = client_for(env)
+    target = env["project"].out / "wide.png"
+    for url in ("/api/assets/inked/image/wide.png", "/api/assets/inked/image/wide.png?max=100&v=1",
+                "/api/assets/inked/thumb/wide.png?h=40"):
+        first = client.get(url)
+        assert first.headers["Cache-Control"] == "no-cache" and first.headers.get("ETag")
+        assert client.get(url, headers={"If-None-Match": first.headers["ETag"]}).status_code == 304
+        value = 10 + len(url)
+        synth.save(target, synth.flat(400, 100, value)[..., 0])
+        st = target.stat()
+        os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns + 3_000_000_000))
+        again = client.get(url, headers={"If-None-Match": first.headers["ETag"]})
+        assert again.status_code == 200 and again.headers["ETag"] != first.headers["ETag"], url
+        assert image_of(again).convert("L").getpixel((5, 5)) == pytest.approx(value, abs=3)
+    versions = client.get("/api/assets/inked/versions").get_json()["versions"]
+    assert versions["wide.png"] == target.stat().st_mtime_ns // 1_000_000

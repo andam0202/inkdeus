@@ -185,6 +185,44 @@ class Catalog:
                 self._dims[key] = (0, 0)
         return self._dims[key]
 
+    # ---- 元画像と白黒版（書き出した PNG）の対応 ----
+
+    def _inked_of(self, entry) -> dict | None:
+        p = self.lib.export_path(entry)
+        try:
+            st = p.stat()
+        except OSError:
+            return None
+        return {"path": p.name, "mtime": st.st_mtime, "version": st.st_mtime_ns // 1_000_000}
+
+    def pair(self, source: str, rel: str) -> dict | None:
+        """source か inked の名前から、{name, source, inked} を返す（一覧に無い名前は None）"""
+        entries = self.lib.entries()
+        if source == "source":
+            entry = entries.get(rel)
+            if entry is None:
+                return None
+        else:
+            entry = next((e for e in entries.values() if self.lib.export_path(e).name == rel), None)
+            if entry is None:
+                # 元画像が見当たらない書き出し済み PNG（元画像を消した等）
+                found = self.find(Source("inked", "", "panel", False, None, builtin=True), rel)
+                if found is None:
+                    return None
+                st = found.path.stat()
+                return {"name": None, "source": None,
+                        "inked": {"path": rel, "mtime": st.st_mtime, "version": st.st_mtime_ns // 1_000_000}}
+        return {"name": entry.name, "source": {"path": entry.name}, "inked": self._inked_of(entry)}
+
+    def versions(self, src: Source) -> dict[str, int]:
+        out = {}
+        for item in self.items(src):
+            try:
+                out[item.rel] = item.path.stat().st_mtime_ns // 1_000_000
+            except OSError:
+                pass
+        return out
+
     def summary(self) -> dict:
         sources, problems = self.sources()
         rows = []
@@ -205,15 +243,23 @@ class Catalog:
         offset = max(0, offset)
         limit = max(1, min(MAX_LIMIT, limit))
         rows = []
+        entries = self.lib.entries() if src.builtin else {}
+        by_export = {self.lib.export_path(e).name: e.name for e in entries.values()} if src.name == "inked" else {}
         for item in items[offset:offset + limit]:
             w, h = self.size(item)
             try:
                 st = item.path.stat()
-                mtime, nbytes = st.st_mtime, st.st_size
+                mtime, nbytes, version = st.st_mtime, st.st_size, st.st_mtime_ns // 1_000_000
             except OSError:
-                mtime, nbytes = 0.0, 0
-            rows.append({"path": item.rel, "name": item.path.name, "group": item.group,
-                         "width": w, "height": h, "mtime": mtime, "bytes": nbytes})
+                mtime, nbytes, version = 0.0, 0, 0
+            row = {"path": item.rel, "name": item.path.name, "group": item.group,
+                   "width": w, "height": h, "mtime": mtime, "bytes": nbytes, "version": version}
+            if src.builtin and src.name == "source":
+                row["editable"] = item.rel                     # 白黒化の画面で開く画像名
+                row["inked"] = self._inked_of(entries[item.rel]) if item.rel in entries else None
+            elif src.builtin and src.name == "inked":
+                row["editable"] = by_export.get(item.rel)      # 元画像が無ければ None
+            rows.append(row)
         return {"source": src.name, "label": src.label, "mode": src.mode, "recursive": src.recursive,
                 "total": len(items), "offset": offset, "limit": limit, "items": rows}
 
