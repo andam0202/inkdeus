@@ -327,6 +327,42 @@ def cmd_export_all(c: Client, args) -> dict:
     return batch
 
 
+def _manga_command(c: Client, command: str, args: dict, wait: bool, timeout: float) -> dict:
+    """/manga/ を開いているブラウザへ指示を出し、結果を待つ"""
+    sent = c.call("POST", "/api/manga/command", {"command": command, "args": args})
+    if sent["clients"] == 0:
+        raise CtlError("漫画の構成の画面（/manga/）を開いているブラウザがありません", sent, code=2)
+    if not wait:
+        return sent
+
+    def finished():
+        r = c.call("GET", f"/api/manga/result/{sent['id']}")
+        return r if r["state"] in ("done", "error") else None
+
+    record = _wait(finished, timeout, interval=0.3)
+    if record is None:
+        raise CtlError(f"{timeout:g} 秒待ちましたが、ブラウザから結果が届きません",
+                       c.call("GET", f"/api/manga/result/{sent['id']}"), code=3)
+    if record["state"] == "error":
+        raise CtlError(str(record.get("error") or "ブラウザ側で失敗しました"), record)
+    return record.get("result") or {}
+
+
+def cmd_manga_pdf(c: Client, args) -> dict:
+    if args.abort:
+        return _manga_command(c, "pdf-abort", {}, True, 30.0)
+    body = {"size": args.size, "dpi": args.dpi, "bleedMm": args.bleed, "fit": args.fit, "color": args.color,
+            "binding": args.binding, "layout": args.layout, "matchAspect": args.match_aspect,
+            "threshold": args.threshold}
+    if args.size.lower() == "custom" or (args.width is not None or args.height is not None):
+        if args.width is None or args.height is None:
+            raise CtlError("カスタムの仕上がりサイズは --width と --height（mm）の両方が必要です")
+        body.update(size="custom", widthMm=args.width, heightMm=args.height)
+    payload = {"settings": body, **({"name": args.name} if args.name else {}),
+               **({"pages": args.pages} if args.pages else {})}
+    return _manga_command(c, "pdf", payload, args.wait, args.timeout)
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="inkdeus ctl",
@@ -433,6 +469,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--status", action="store_true", help="進み具合だけを表示する（何も始めない）")
     p.add_argument("--abort", action="store_true", help="進行中の一括書き出しを中止する")
     p.add_argument("--timeout", type=float, default=7200.0)
+    p = add("manga", None, "漫画の構成の画面（/manga/ を開いているブラウザ）への指示")
+    msub = p.add_subparsers(dest="action", required=True, metavar="<pdf>")
+    q = msub.add_parser("pdf", parents=[target],
+                        help="全ページ（または範囲）を、印刷向けの PDF 1つにまとめる。保存先を返す")
+    q.set_defaults(func=cmd_manga_pdf)
+    q.add_argument("--name", default=None, metavar="N", help="出力名（省略時は画面の保存名）")
+    q.add_argument("--size", default="B5", metavar="<B5|A5|A4|B6|custom>", help="仕上がりサイズ（既定 B5）")
+    q.add_argument("--width", type=float, default=None, metavar="MM", help="カスタムの仕上がりの幅（mm）")
+    q.add_argument("--height", type=float, default=None, metavar="MM", help="カスタムの仕上がりの高さ（mm）")
+    q.add_argument("--match-aspect", action="store_true",
+                   help="仕上がりをページの縦横比に合わせる（指定のサイズに余白なしで収まる最大）")
+    q.add_argument("--dpi", type=float, default=600.0, help="解像度（既定 600。白黒の線画は 600 以上）")
+    q.add_argument("--bleed", type=float, default=0.0, metavar="MM", help="塗り足し（mm。既定 0）")
+    q.add_argument("--pages", default=None, metavar="1-8,10", help="書き出すページの範囲（省略時は全ページ）")
+    q.add_argument("--fit", choices=["contain", "cover"], default="contain",
+                   help="contain = 収める（余白は白） / cover = 埋める（はみ出しは切る）")
+    q.add_argument("--color", choices=["gray", "bw", "rgb"], default="gray",
+                   help="gray = グレースケール / bw = 白黒2値 / rgb = そのまま")
+    q.add_argument("--threshold", type=int, default=128, help="白黒2値のしきい値（1〜254。既定 128）")
+    q.add_argument("--binding", choices=["right", "left"], default="right", help="綴じ方向（既定 right = 右綴じ）")
+    q.add_argument("--layout", choices=["single", "spread", "spread-cover"], default="single",
+                   help="開いたときの表示（single = 1ページずつ / spread = 見開き / spread-cover = 表紙だけ単独の見開き）")
+    q.add_argument("--wait", action="store_true", help="終わるまで待って保存先を返す")
+    q.add_argument("--abort", action="store_true", help="進行中の PDF の書き出しを中止する")
+    q.add_argument("--timeout", type=float, default=3600.0)
     return ap
 
 

@@ -68,6 +68,18 @@ uv run inkdeus assets remove <名前> --name <ソース名>
 `--mode panel`（既定）はコマにはめ込む画像、`--mode free` はコマにはめずページ上へ自由に置く素材。`--recursive` はサブフォルダも含める。
 `/manga/` の画面の操作（コマ割り・画像の配置・吹き出し）は、いまは利用者が画面で行う（`ctl` からの操作には未対応）。
 
+全ページを印刷向けの PDF 1つにまとめるのは `ctl` からもできる（`/manga/` を開いているブラウザが実行する。開いていなければ exit 2）:
+
+```bash
+uv run inkdeus ctl manga pdf --name 第1話 --size B5 --dpi 600 --bleed 3 --color gray --binding right --wait
+# → {"path": "<プロジェクト>/manga/pdf/第1話.pdf", "pages": 24, "pageInfo": [...], ...}
+uv run inkdeus ctl manga pdf --pages 1-8,10 --fit cover --color bw --threshold 128 --wait    # 範囲・埋める・白黒2値
+uv run inkdeus ctl manga pdf --abort                                                         # 進行中の書き出しを中止
+```
+
+`--size` は B5 / A5 / A4 / B6（カスタムは `--width` `--height` を mm で）。`--match-aspect` で仕上がりをページの縦横比に合わせる。
+`--bleed` を付けると PDF のページは「仕上がり＋塗り足し」になり、TrimBox / BleedBox が入る（トンボは描かない）。画像は可逆で埋め込まれる。
+
 白黒の調整は `/manga/` にその場で反映される。白黒化の画面（`/`）と `/manga/` を別々のタブで開いておいてもらい、
 `ctl set` / `ctl patch` / `ctl preset` で設定を変えると、白黒化の画面が PNG を自動で書き出し（「変更を自動で書き出す」がオンのとき）、
 `/manga/` で使っている白黒版が新しい画像に替わる。対象の画像を白黒化の画面で開くには `ctl open <画像名>`（または `/?image=<画像名>`）。

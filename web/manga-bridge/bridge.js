@@ -324,6 +324,7 @@
     ]);
     ui.toggle = el('button', { type: 'button', class: 'ikb-toggle', title: '素材パネルを開く／閉じる', 'aria-expanded': 'true',
       onclick: () => setOpen(!ui.root.classList.contains('ikb-open')) }, [el('span', { text: '素材' })]);
+    ui.fileSection = ui.body.querySelector('.ikb-file');
     ui.root = el('aside', { id: 'inkdeus-bridge', class: 'ikb', 'aria-label': 'inkdeus の素材パネル' },
       [ui.resize, ui.toggle, ui.body]);
 
@@ -1057,7 +1058,26 @@
       try { ev = JSON.parse(msg.data); } catch (e) { return; }
       if (ev.type === 'exported') onExported(ev).catch((e) => console.error('[inkdeus]', e));
       else if (ev.type === 'versions') onVersionsEvent(ev).catch((e) => console.error('[inkdeus]', e));
+      else if (ev.type === 'manga-command') runCommand(ev);
     };
+  }
+
+  // ---- 外部（inkdeus ctl manga …）からの指示。追加の部品（pdf.js など）が commands に受け口を登録する ----
+
+  const commands = {};
+  async function runCommand(ev) {
+    const post = (body) => api('POST', '/api/manga/result/' + encodeURIComponent(ev.id), JSON.stringify(body))
+      .catch((e) => console.error('[inkdeus]', e));
+    const fn = commands[ev.command];
+    if (!fn) { await post({ state: 'error', error: `この画面は指示「${ev.command}」に対応していません` }); return; }
+    await post({ state: 'running' });
+    try {
+      const result = await fn(ev.args || {}, (progress) => post({ state: 'running', progress }));
+      await post({ state: 'done', result: result === undefined ? null : result });
+    } catch (e) {
+      console.error('[inkdeus]', e);
+      await post({ state: 'error', error: e && e.message ? e.message : String(e) });
+    }
   }
 
   // ---- 選択中の画像（inkdeus の素材なら、調整・差し替えのボタンを出す） ----
@@ -1518,13 +1538,15 @@
 
   // いま開いているページを PNG にする。漫画エディタの「画像を保存」と同じ（グリッドを消し、
   // 原稿サイズと DPI から決まる倍率で書き出し、グリッドを戻す）
-  async function renderPagePng() {
+  // multiplier を渡すと、原稿サイズと DPI の設定によらずその倍率で書き出す（PDF の書き出しが使う）
+  async function renderPagePng(multiplier) {
     await ensurePageFonts();                                   // フォントが読み込み終わってから描く
     removeGrid();
     let size;
     let link;
     try {
-      size = ImageUtil.getOutputPixelSize();
+      size = multiplier ? { multiplier, width: Math.round(canvas.width * multiplier), height: Math.round(canvas.height * multiplier) }
+        : ImageUtil.getOutputPixelSize();
       link = getCropAndDownloadLinkByMultiplier(size.multiplier, 'png');
     } finally {
       if (optional(() => isGridVisible)) optional(() => { drawGrid(); isGridVisible = true; });
@@ -1647,6 +1669,11 @@
     refresh().catch((e) => fail(e, '素材の一覧を読めません'));
     renderStatus();
 
+    try {
+      state.server = (await api('GET', '/api/config')).features || [];
+    } catch (e) {
+      state.server = [];
+    }
     const complete = await waitUpstream();
     const problems = checkFeatures();
     if (has('fabric')) {
@@ -1680,16 +1707,45 @@
     } catch (e) {
       fail(e, '保存済みの漫画データの一覧を読めません');
     }
+    await loadModules();
     return { ok: problems.length === 0 && complete, complete, features: Object.assign({}, state.features),
       missing: Object.assign({}, state.missing) };
+  }
+
+  // ---- 追加の部品（同じフォルダの別ファイル。この連携スクリプトが読み込む） ----
+  // 部品は window.inkdeusBridge.x（下の内部の入口）を使い、公開する関数を window.inkdeusBridge に足す
+
+  const MODULES = ['pdf.js'];
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const node = el('script', { src });
+      node.onload = () => resolve(true);
+      node.onerror = () => { node.remove(); reject(new Error('読み込めません: ' + src)); };
+      document.head.appendChild(node);
+    });
+  }
+  async function loadModules() {
+    state.modules = [];
+    for (const name of MODULES) {
+      try {
+        await loadScript('/manga-bridge/' + name);
+        state.modules.push(name);
+      } catch (e) {
+        console.error('[inkdeus]', e);                          // 部品が無くても、ほかの機能は動かす
+      }
+    }
   }
 
   buildPanel();
 
   window.inkdeusBridge = {
     version: 1,
+    // 追加の部品のための内部の入口（外からは使わない）
+    x: { state, ui, store, el, api, say, fail, run, has, optional, sleep, nextFrames, commands, requireFeature, waitIdle,
+      busyWhile, exportName, renderPagePng, markClean, panels, describe, getTargetPanel, renderStatus },
     ready: init(),
     status: () => ({ ready: state.ready, busy: state.busy, features: Object.assign({}, state.features),
+      server: (state.server || []).slice(), modules: (state.modules || []).slice(),
       missing: Object.assign({}, state.missing), project: state.project, mangaDir: state.mangaDir,
       name: state.name, source: state.source, folder: state.folder, folders: state.folders.slice(),
       imageMax: state.imageMax,

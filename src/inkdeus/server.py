@@ -13,6 +13,7 @@ import queue
 import re
 import shutil
 import struct
+import tempfile
 import threading
 import time
 import tomllib
@@ -28,6 +29,7 @@ from . import folders as folders_mod
 from . import fonts as fonts_mod
 from . import manga as manga_mod
 from . import parts as parts_mod
+from . import pdf as pdf_mod
 from . import schema
 from . import styles as styles_mod
 
@@ -52,7 +54,10 @@ PAINT_FORMAT = 1
 PAINT_TARGET_RE = re.compile(r"layer-[a-z0-9]{4,16}|solid-[\w\-]{1,32}|lines|all|pen")
 PAINT_ALL = "all-targets"                              # 削除でだけ使える「全部の対象」
 MAX_PAINT_BYTES = 1 << 28
-FEATURES = ["layerIds", "paint", "parts", "userStyles"]     # 画面が、サーバにある機能を確かめるための名前
+# 画面が、サーバにある機能を確かめるための名前
+FEATURES = ["layerIds", "paint", "parts", "userStyles", "mangaPdf", "mangaCommand"]
+MANGA_COMMANDS = ("pdf", "pdf-abort")       # 漫画の構成の画面へ出せる指示
+MANGA_RESULT_KEEP = 32                                 # 覚えておく指示の結果の数
 
 
 class VersionError(ValueError):
@@ -430,6 +435,18 @@ class Hub:
     def count(self) -> int:
         with self._lock:
             return sum(1 for q in self._clients if id(q) not in self._listeners)
+
+    def send_listener(self, event: dict) -> int:
+        """聞くだけの相手（漫画の構成の画面）のうち、最後につないだ1つへだけ送る。
+        戻り値は、つながっている漫画の構成の画面の数（0 なら送れていない）"""
+        with self._lock:
+            listeners = [q for q in self._clients if id(q) in self._listeners]
+        if listeners:
+            try:
+                listeners[-1].put_nowait(event)
+            except queue.Full:
+                return 0
+        return len(listeners)
 
 
 class Session:
@@ -981,6 +998,143 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         path = manga_dir / "pages" / manga_name(name) / f"{number:03d}.png"
         _atomic_write(path, data)
         return jsonify({"name": name, "number": number, "path": str(path), "bytes": len(data)})
+
+    # ---- 漫画の構成: PDF（全ページを1つにまとめる。ページの PNG は画面が1枚ずつ送ってくる）----
+
+    pdf_jobs: dict[str, dict] = {}                         # 名前 → 進行中の書き出し
+    pdf_lock = threading.Lock()
+    app.config["INKDEUS_PDF_JOBS"] = pdf_jobs
+
+    def pdf_path(name: str) -> Path:
+        return manga_dir / "pdf" / (manga_name(name) + ".pdf")
+
+    def pdf_drop(name: str) -> bool:
+        with pdf_lock:
+            job = pdf_jobs.pop(name, None)
+        if job is None:
+            return False
+        shutil.rmtree(job["tmp"], ignore_errors=True)
+        return True
+
+    def pdf_job(name: str) -> dict:
+        job = pdf_jobs.get(manga_name(name))
+        if job is None:
+            abort(409, description="この名前の PDF の書き出しは始まっていません（begin を先に呼んでください）")
+        return job
+
+    @app.errorhandler(409)
+    def _conflict(e):
+        return jsonify({"error": e.description}), 409
+
+    @app.get("/api/manga/pdf")
+    def api_manga_pdf_list():
+        folder = manga_dir / "pdf"
+        rows = []
+        if folder.is_dir():
+            for p in sorted(folder.glob("*.pdf")):
+                if p.is_file() and MANGA_NAME_RE.fullmatch(p.stem):
+                    st = p.stat()
+                    rows.append({"name": p.stem, "file": p.name, "bytes": st.st_size, "mtime": st.st_mtime,
+                                 "url": f"/api/manga/pdf/{p.name}"})
+        return jsonify({"dir": str(folder), "pdfs": rows, "sizes": pdf_mod.SIZES,
+                        "running": sorted(pdf_jobs)})
+
+    @app.get("/api/manga/pdf/<name>.pdf")
+    def api_manga_pdf_file(name: str):
+        path = pdf_path(name)
+        if not path.is_file():
+            abort(404)
+        return send_file(path, mimetype="application/pdf", conditional=True)
+
+    @app.post("/api/manga/pdf/<name>/begin")
+    def api_manga_pdf_begin(name: str):
+        manga_name(name)
+        try:
+            settings = pdf_mod.normalize(json_body())
+        except pdf_mod.PdfError as e:
+            abort(400, description=str(e))
+        pdf_drop(name)                                      # 同じ名前の前の書き出しが残っていたら片付ける
+        job = {"settings": settings, "tmp": Path(tempfile.mkdtemp(prefix="inkdeus-pdf-")), "pages": {},
+               "startedAt": time.time()}
+        with pdf_lock:
+            pdf_jobs[name] = job
+        return jsonify({"name": name, "settings": settings.info(), "path": str(pdf_path(name))})
+
+    @app.post("/api/manga/pdf/<name>/page/<int:number>")
+    def api_manga_pdf_page(name: str, number: int):
+        job = pdf_job(name)
+        if not 1 <= number <= pdf_mod.MAX_PAGES:
+            abort(400, description=f"ページ番号は 1〜{pdf_mod.MAX_PAGES} です")
+        data = request.get_data(cache=False)
+        if not data.startswith(PNG_SIGNATURE):
+            abort(400, description="PNG ではありません")
+        try:
+            meta = pdf_mod.prepare_page(data, job["settings"], job["tmp"] / f"{number:04d}.z")
+        except pdf_mod.PdfError as e:
+            abort(400, description=str(e))
+        except OSError:
+            abort(409, description="この PDF の書き出しは中止されました")
+        job["pages"][number] = meta
+        return jsonify({"name": name, "number": number, **meta})
+
+    @app.post("/api/manga/pdf/<name>/finish")
+    def api_manga_pdf_finish(name: str):
+        job = pdf_job(name)
+        path = pdf_path(name)
+        try:
+            pages = [(job["pages"][n], job["tmp"] / job["pages"][n]["file"]) for n in sorted(job["pages"])]
+            info = pdf_mod.write_pdf(path, pages, job["settings"])
+        except pdf_mod.PdfError as e:
+            abort(400, description=str(e))
+        numbers = sorted(job["pages"])
+        boxes = [{"number": n, **{k: job["pages"][n][k] for k in ("trimMm", "fullMm", "pixels", "resampled")}}
+                 for n in numbers]
+        pdf_drop(name)
+        return jsonify({"name": name, **info, "numbers": numbers, "pageInfo": boxes,
+                        "settings": job["settings"].info(), "url": f"/api/manga/pdf/{path.name}",
+                        "mtime": path.stat().st_mtime})
+
+    @app.post("/api/manga/pdf/<name>/abort")
+    def api_manga_pdf_abort(name: str):
+        return jsonify({"name": name, "aborted": pdf_drop(manga_name(name))})
+
+    # ---- 漫画の構成: 外部からの指示（/manga/ を開いているブラウザが実行して、結果を返してくる）----
+
+    manga_results: dict[str, dict] = {}
+    app.config["INKDEUS_MANGA_RESULTS"] = manga_results
+
+    @app.post("/api/manga/command")
+    def api_manga_command():
+        body = json_body()
+        command = body.get("command")
+        if command not in MANGA_COMMANDS:
+            abort(400, description=f"command は {' / '.join(MANGA_COMMANDS)} のどれかです")
+        args = body.get("args", {})
+        if not isinstance(args, dict):
+            abort(400, description="args は JSON オブジェクトで指定してください")
+        command_id = hashlib.sha1(os.urandom(16)).hexdigest()[:16]
+        while len(manga_results) >= MANGA_RESULT_KEEP:
+            manga_results.pop(next(iter(manga_results)))
+        manga_results[command_id] = {"id": command_id, "command": command, "state": "sent", "time": time.time()}
+        clients = session.hub.send_listener({"type": "manga-command", "id": command_id, "command": command,
+                                             "args": args})
+        if clients == 0:
+            manga_results[command_id]["state"] = "no-client"
+        return jsonify({**manga_results[command_id], "clients": clients})
+
+    @app.route("/api/manga/result/<command_id>", methods=["GET", "POST"])
+    def api_manga_result(command_id: str):
+        record = manga_results.get(command_id)
+        if record is None:
+            abort(404)
+        if request.method == "POST":
+            body = json_body()
+            state = body.get("state")
+            if state not in ("running", "done", "error"):
+                abort(400, description="state は running / done / error のどれかです")
+            record.update(state=state, time=time.time(),
+                          **{k: body[k] for k in ("result", "error", "progress") if k in body})
+        return jsonify(record)
 
     # ---- 画像・マスク ----
 
