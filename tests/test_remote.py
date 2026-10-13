@@ -142,7 +142,9 @@ def test_patch_without_browser_is_applied_on_next_open(live, capsys):
     assert (live["out"] / "halves.inkdeus.json").is_file()
     assert page.evaluate("() => window.inkdeus.info().name") == "scene.png"
     open_image(page, "halves.png")
-    assert page.evaluate("() => window.inkdeus.rev()") == r["rev"]
+    # 画面は「halves.png に設定ができた」ことを、サーバからの知らせ（SSE）で知る。知らせより先に開いたときは、
+    # 知らせが届いた時点で設定が読み込まれる（どちらの順でも、最後は同じ状態になる）
+    wait_rev(page, r["rev"])
     assert page.evaluate("() => window.inkdeus.getParams().regions.background.mode") == "white"
 
 
@@ -154,7 +156,9 @@ def test_own_save_does_not_cause_reload_loop(live):
     requests: list[tuple[str, str]] = []
     page.on("request", lambda r: requests.append((r.method, r.url.split("/api/")[-1])) if "/api/" in r.url else None)
     render(page, deep_merge(BASE, {"lines": {"sigma": 1.3}}))
-    rev = settle(page)
+    # 変更から少し置いての自動の保存を待つ（ここで save() を呼ぶと、負荷で自動の保存が先に走っていたときに保存が 2 回になる）
+    page.wait_for_function("() => window.inkdeus.saveStatus().state === 'saved'")
+    rev = page.evaluate("() => window.inkdeus.rev()")
     page.wait_for_timeout(2500)                                  # 監視（0.5秒ごと）が何周かする間待つ
     puts = [r for r in requests if r[0] == "PUT"]
     gets = [r for r in requests if r[0] == "GET" and r[1].startswith("params/")]
