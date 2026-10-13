@@ -24,14 +24,23 @@ from inkdeus.projects import add_asset_source, create_project
 from inkdeus.server import create_app
 
 WAIT_MS = 180_000
-# 初回起動の案内（言語選択・チュートリアル）を出さないための、上流側の保存値
+# 初回起動の案内（言語選択・チュートリアル）を出さないための、上流側の保存値。
+# 上流の自動保存（60 秒ごとに IndexedDB へ保存し、次に開いたページで「Recover Auto-save」の確認を出す）も切っておく。
+# 切らないと、同じブラウザコンテキストで先に開いていた漫画の画面が 60 秒を超えて生きていたときだけ、
+# あとから開いた画面に全面の確認ダイアログが出て、パネルへのクリックが届かなくなる
+# （全件実行や負荷のかかった実行でだけ、ホットリロードのテストなどが時間切れで落ちていた原因）。
+# 確認ダイアログが出ている状態そのものは、test_upstream_recovery_dialog_… が狙って作って確かめる
 SKIP_FIRST_RUN = """
 try {
   localStorage.setItem('tutorial_lang_selected', 'true');
   localStorage.setItem('manga_tutorial_state',
     JSON.stringify({quickStartCompleted: true, hintsShown: {}, comfyUIGuideShown: true}));
+  if (localStorage.getItem('localSettingsData') === null) {
+    localStorage.setItem('localSettingsData', JSON.stringify({autoSaveEnabled: false}));
+  }
 } catch (e) {}
 """
+UPSTREAM_DIALOG = ".confirm-dialog-overlay"       # 上流の確認ダイアログ（画面全体を覆い、ポインタ操作を受け止める）
 
 
 def find_upstream() -> Path | None:
@@ -105,9 +114,12 @@ def ctx(browser, manga_env):
     context.close()
 
 
-def open_manga(ctx, manga_env):
+def open_manga(ctx, manga_env, prepare=None):
+    """漫画の画面を開く。prepare(page) は、読み込む前にページへ手を入れるための物（通信の差し替えなど）"""
     page = ctx.new_page()
     page.set_default_timeout(WAIT_MS)
+    if prepare is not None:
+        prepare(page)
     page.goto(manga_env.url + "manga/", wait_until="domcontentloaded")
     page.wait_for_function("() => !!window.inkdeusBridge")
     status = page.evaluate("() => window.inkdeusBridge.ready")       # 上流の初期化完了まで待つ
@@ -371,8 +383,29 @@ def open_editor(ctx, manga_env, image: str):
     return page
 
 
+def settle_editor(editor) -> None:
+    """白黒化の画面が、開いた時点の自動書き出しを済ませるまで待つ。
+    設定のまだ無い画像（白黒版はあっても「最新」とは見なされない）を開くと、1.5 秒後に既定の設定で書き出される。
+    それが飛んでいる最中に次の設定変更を数え始めると、「開いた時点の書き出し」を「変更の反映」と取り違える"""
+    editor.wait_for_function("""() => { const a = window.inkdeus.autoExport();
+        return !a.enabled || (!a.dirty && !a.running && !a.pending); }""")
+
+
+def wait_hot_idle(page) -> None:
+    """漫画の画面が、届いた書き出しの通知をすべて差し替え終えるまで待つ
+    （使っている白黒版が、どれも最新の更新時刻の物になっている）"""
+    page.wait_for_function("""() => { const d = window.inkdeusBridge.debug(); const changed = new Set(d.changed);
+        return !isProjectBusy() && canvas.getObjects().filter(o => o.type === 'image').every(o => {
+            const m = /\\/api\\/assets\\/inked\\/image\\/([^?]+)/.exec(o.getSrc() || '');
+            if (!m) return true;
+            const key = decodeURIComponent(m[1]);
+            return !changed.has(key) || o.__ikbVersion === d.versions[key]; }); }""")
+
+
 def set_and_wait_hot(editor, page, params: dict) -> None:
     """白黒化の画面で設定を変え、自動書き出し → 漫画の画面での差し替えが済むまで待つ"""
+    settle_editor(editor)
+    wait_hot_idle(page)
     before = page.evaluate("() => window.inkdeusBridge.status().hot.updated")
     editor.evaluate("(p) => { window.inkdeus.setParams(p); }", params)
     page.wait_for_function("(n) => window.inkdeusBridge.status().hot.updated > n", arg=before)
@@ -390,6 +423,7 @@ def hot(ctx, manga_env):
     guid = placed["object"]["guid"]
     assert page.evaluate("() => window.inkdeusBridge.status().events.connected") is True
     editor = open_editor(ctx, manga_env, "scene.png")
+    settle_editor(editor)
     yield {"page": page, "editor": editor, "guid": guid, "panels": panels}
     editor.close()
     page.close()
@@ -658,3 +692,71 @@ def test_local_font_is_listed_applied_saved_and_exported(ctx, manga_env):
         assert dark == pytest.approx(both * scale * scale, rel=0.2)
     finally:
         fresh.close()
+
+
+# ---- 上流の自動保存の復元確認（全画面のダイアログ）が出ているとき ----
+
+def test_upstream_recovery_dialog_covers_the_panel_until_it_is_answered(ctx, manga_env):
+    """上流の漫画エディタは、自分でも 60 秒ごとに IndexedDB へ自動保存し、次に開いたページで復元するかを全画面で尋ねる。
+    その間、素材パネルへのポインタ操作は届かない（連携スクリプト自体は動いている）。答えれば、元どおり操作できる。
+    ほかのテストは SKIP_FIRST_RUN で上流の自動保存を切っているので、ここでだけ狙って保存させる"""
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
+    first, status = open_manga(ctx, manga_env)
+    second = None
+    try:
+        assert status["ok"]
+        first.evaluate("() => window.inkdeusBridge.setAutosave({enabled: false})")
+        apply_template(first)
+        assert first.evaluate("(s) => document.querySelector(s) === null", UPSTREAM_DIALOG)
+        first.evaluate("() => AutoSaveManager.save()")                    # 60 秒たって上流の自動保存が走ったのと同じ
+        first.wait_for_function("""async () => !!(await localforage.createInstance(
+            {name: 'autoSaveStorage', storeName: 'projectAutoSave'}).getItem('metadata'))""")
+        second, status = open_manga(ctx, manga_env)
+        second.wait_for_selector(UPSTREAM_DIALOG)
+        assert status["ok"]                                               # 連携スクリプトの準備は、確認を待たずに済む
+        second.wait_for_function("() => window.inkdeusBridge.status().events.connected === true")
+        second.wait_for_selector(".ikb-tab:has-text('白黒')")
+        with pytest.raises(PlaywrightTimeout, match="intercepts pointer events"):
+            second.click(".ikb-tab:has-text('白黒')", timeout=3000)       # 確認が出ている間は、パネルを押せない
+        second.click(f"{UPSTREAM_DIALOG} button:has-text('Decide later')")
+        second.wait_for_selector(UPSTREAM_DIALOG, state="detached")
+        second.click(".ikb-tab:has-text('白黒')")                         # 答えれば押せる
+        second.wait_for_function("() => window.inkdeusBridge.status().source === 'inked'")
+    finally:
+        first.evaluate("() => AutoSaveManager.clearAutoSave()")           # 後続のテストに確認を出させない
+        if second is not None:
+            second.close()
+        first.close()
+
+
+def test_exports_made_before_the_event_stream_opens_are_picked_up_on_the_first_connect(ctx, manga_env):
+    """起動時に白黒版の更新時刻を読んでから、通知（SSE）の購読が始まるまでの間に書き出された分は、通知が届かない。
+    最初の接続でも更新時刻を突き合わせて、取りこぼしを回収する"""
+    held = []
+    page, status = open_manga(ctx, manga_env,
+                              prepare=lambda p: p.route("**/api/events?role=manga", lambda route: held.append(route)))
+    try:
+        assert status["ok"]
+        page.evaluate("() => window.inkdeusBridge.setAutosave({enabled: false})")
+        page.wait_for_function("() => window.inkdeusBridge.debug().versions['scene.png'] > 0")
+        assert len(held) == 1 and page.evaluate("() => window.inkdeusBridge.status().events") == {
+            "connected": False, "opened": 0, "received": 0, "last": None}        # 購読はまだ始まっていない
+        apply_template(page)
+        panel = page.evaluate("() => window.inkdeusBridge.panels()[0].guid")
+        guid = page.evaluate("(g) => window.inkdeusBridge.placeAsset('inked', 'scene.png', {panel: g})",
+                             panel)["object"]["guid"]
+        before = page.evaluate(PROBE, guid)
+        synth.save(manga_env.project / "out" / "scene.png", synth.flat(300, 200, 200)[..., 0])   # 通知の届かない書き出し
+        held[0].continue_()                                               # ここで購読が始まる
+        page.wait_for_function("(g) => canvas.getObjects().find(o => o.guid === g)._element.naturalWidth === 300",
+                               arg=guid)
+        after = page.evaluate(PROBE, guid)
+        assert 192 < after["mean"] < 208 and geometry(after) == geometry(before)
+        status = page.evaluate("() => window.inkdeusBridge.status()")
+        assert status["events"]["connected"] is True and status["events"]["opened"] == 1
+        assert status["hot"]["updated"] >= 1                              # 通知なしの差し替えも数える
+        assert any(t["kind"] == "reconcile" and t["detail"]["again"] is False
+                   for t in page.evaluate("() => window.inkdeusBridge.debug().trail"))
+    finally:
+        page.close()

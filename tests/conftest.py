@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 # 利用者の設定フォルダ（自分用スタイルの置き場）は、テストの間は一時フォルダへ向ける（実物を読まない・書かない）
 os.environ["INKDEUS_CONFIG"] = tempfile.mkdtemp(prefix="inkdeus-test-config-")
 
+import evidence  # noqa: E402
 import synth  # noqa: E402
 from inkdeus.server import create_app  # noqa: E402
 
@@ -59,7 +60,10 @@ def serve(app):
 
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
+    holder = {}
+    evidence.watch_server(app, lambda: holder.get("url"))      # 失敗したときに、リクエストとイベントの列を残す
     server = make_server("127.0.0.1", 0, app, threaded=True)
+    holder["url"] = f"http://127.0.0.1:{server.server_port}/"
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, f"http://127.0.0.1:{server.server_port}/"
@@ -97,8 +101,25 @@ def browser():
             b = pw.chromium.launch(args=CHROMIUM_ARGS)
         except Exception as e:  # noqa: BLE001
             pytest.skip(f"Chromium を起動できません（uv run playwright install chromium）: {e}")
+        evidence.watch_browser(b)                 # 作られる全ページのコンソール・エラー・通信の失敗を覚えておく
         yield b
         b.close()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """落ちた結合テストの証拠（両タブのログ・状態・スクリーンショット、サーバのリクエストとイベントの列）を残す。
+    フィクスチャの片付けの前に呼ばれるので、ページはまだ開いている"""
+    outcome = yield
+    report = outcome.get_result()
+    if report.when == "teardown" or report.skipped:
+        return
+    always = os.environ.get("INKDEUS_TEST_EVIDENCE_ALWAYS") == "1" and report.when == "call"
+    if not (report.failed or always) or "browser" not in getattr(item, "fixturenames", ()):
+        return
+    folder = evidence.dump(item.nodeid, report.when, report.longreprtext if report.failed else "")
+    if folder is not None and report.failed:
+        report.sections.append(("inkdeus evidence", f"失敗時の記録: {folder}"))
 
 
 def open_page(browser, url: str, auto_export: bool = False, prepare=None):

@@ -103,9 +103,9 @@
     autosave: { enabled: true, seconds: 60, lastSig: null, dirtySince: 0, pageChanged: false, lastAt: 0 },
     preferInked: true,           // 元画像のタブから入れるとき、白黒版があれば白黒版を入れる
     autoSwap: false,             // 白黒版ができたら、置いてある元画像を白黒版に置き換える
-    inked: { versions: null, changed: new Set(), pairs: new Map() },   // 白黒版の更新時刻と、開いてから変わった物
-    events: { connected: false, opened: 0, received: 0 },
-    hot: { updated: 0, last: null, fallback: 0 },                       // 書き出しの通知で差し替えた回数、既定へ切り替えた枚数
+    inked: { versions: null, changed: new Set(), pairs: new Map(), names: new Map(), lastChanged: 0 },   // 白黒版の更新時刻と、開いてから変わった物
+    events: { connected: false, opened: 0, received: 0, last: null },
+    hot: { updated: 0, last: null, fallback: 0 },                       // 白黒版を差し替えた回数、既定へ切り替えた枚数
     // ローカルフォント（利用者のPCにあるフォント。inkdeus のサーバが配信する）
     fonts: { list: [], loaded: new Set(), loading: new Map(), failed: new Map(), registered: false, supported: true },
   };
@@ -887,6 +887,7 @@
     const canonical = assetUrl(source, rel, ref ? ref.max : state.imageMax);
     const element = await loadHtmlImage(withVersion(canonical, version));
     if (canvas.getObjects().indexOf(obj) === -1) return false;          // 読み込みの間に消された・ページが替わった
+    note('replace', { source, rel, version: version || null });
     const before = { w: obj.width, h: obj.height, sx: obj.scaleX, sy: obj.scaleY };
     const apply = () => {
       obj.setElement(element);
@@ -913,6 +914,8 @@
     let refreshed = 0;
     let swapped = 0;
     const lost = [];
+    const names = new Set();                                   // 差し替えた絵の、元画像の名前
+    const nameOf = (source, rel) => state.inked.names.get(ikey(source, rel)) || rel;
     for (const { obj, ref } of assetImages()) {
       try {
         const changedAt = (src, path, stamp) => (state.inked.changed.has(ikey(src, path)) ? stamp : null);
@@ -928,13 +931,13 @@
               if (done) lost.push(`${stem(pair.name)}「${verLabel(pair.version)}」→ ${pair.default ? '既定' : '元画像'}`);
             }
           } else if (state.inked.changed.has(ikey(ref.source, ref.rel)) && obj.__ikbVersion !== version) {
-            if (await replaceElement(obj, ref.source, ref.rel, version)) refreshed += 1;
+            if (await replaceElement(obj, ref.source, ref.rel, version)) { refreshed += 1; names.add(nameOf(ref.source, ref.rel)); }
           }
         } else if (state.autoSwap) {
           const pair = await pairOf(ref.source, ref.rel);
           const inkedSrc = pair && (pair.inkedName || 'inked');
           if (pair && pair.inked && await replaceElement(obj, inkedSrc, pair.inked.path,
-            changedAt(inkedSrc, pair.inked.path, pair.inked.version))) swapped += 1;
+            changedAt(inkedSrc, pair.inked.path, pair.inked.version))) { swapped += 1; names.add(pair.name || ref.rel); }
         }
       } catch (e) {
         console.error('[inkdeus]', e);
@@ -944,6 +947,13 @@
       canvas.requestRenderAll();
       optional(() => updateLayerPanel());
       if (swapped || lost.length) optional(() => saveStateByManual());
+    }
+    if (refreshed || swapped) {
+      // どのきっかけ（書き出しの通知・つなぎ直し・オブジェクトの作り直し）で見直したときでも、差し替えたここで数える。
+      // 通知を受けた側で数えると、先に走っていた別の見直しが差し替えを済ませたときに数え漏らす
+      state.hot.updated += 1;
+      state.hot.last = Array.from(names).pop() || null;
+      say(`${Array.from(names).join('、')} を更新しました`);
     }
     if (lost.length) {
       state.hot.fallback += lost.length;
@@ -955,15 +965,21 @@
 
   let syncChain = Promise.resolve();
   let syncTimer = 0;
+  let syncWaiters = [];
   function queueSync(delay) {
+    // 予約を取り直すと前のタイマーは捨てられる。前に待っていた相手も、次に走る見直しの結果で起こす
+    // （捨てたタイマーの約束が永久に終わらないと、それを待つ処理が止まったままになる）
     clearTimeout(syncTimer);
     return new Promise((resolve) => {
+      syncWaiters.push(resolve);
       syncTimer = setTimeout(() => {
+        const waiters = syncWaiters;
+        syncWaiters = [];
         syncChain = syncChain.then(async () => {
           for (let i = 0; i < 100 && has('isProjectBusy') && isProjectBusy(); i++) await sleep(100);
           return syncPage();
         }).catch((e) => { console.error('[inkdeus]', e); return { refreshed: 0, swapped: 0, fallback: 0 }; });
-        syncChain.then(resolve);
+        syncChain.then((result) => waiters.forEach((wake) => wake(result)));
       }, delay === undefined ? 150 : delay);
     });
   }
@@ -985,10 +1001,12 @@
       Object.entries(data.versions || {}).forEach(([rel, stamp]) => { now[ikey(name, rel)] = stamp; });
     }
     const old = state.inked.versions;
+    let changed = 0;
     if (old) {
-      Object.keys(now).forEach((key) => { if (old[key] !== now[key]) state.inked.changed.add(key); });
+      Object.keys(now).forEach((key) => { if (old[key] !== now[key]) { state.inked.changed.add(key); changed += 1; } });
     }
     state.inked.versions = now;
+    state.inked.lastChanged = changed;
     return true;
   }
 
@@ -1001,15 +1019,11 @@
     const key = ikey(ev.source || 'inked', ev.file);          // source = その画像フォルダの白黒のソース名
     state.inked.versions[key] = ev.stamp || (typeof ev.version === 'number' ? ev.version : Date.now());
     state.inked.changed.add(key);
+    if (ev.name) state.inked.names.set(key, ev.name);          // 知らせに出す名前（元画像の名前）
     state.inked.pairs.clear();
     const viewing = !!kindOf(state.source);
     listSources().then(() => (viewing ? loadItems(false) : null)).catch(() => {});
-    const result = await queueSync(0);
-    if (result.refreshed || result.swapped) {
-      state.hot.updated += 1;
-      state.hot.last = ev.name;
-      say(`${ev.name} を更新しました`);
-    }
+    await queueSync(0);                                         // 差し替えた回数と知らせは syncPage が出す
     renderSelection(true);
   }
 
@@ -1038,6 +1052,15 @@
     renderSelection(true);
   }
 
+  // 直近の出来事の控え（接続・受けた通知・差し替え）。不具合を追うときに window.inkdeusBridge.debug() で読む
+  const trail = [];
+  function note(kind, detail) {
+    trail.push({ at: Date.now(), kind, detail: detail === undefined ? null : detail });
+    if (trail.length > 200) trail.shift();
+    if (kind === 'event') state.events.last = { at: Date.now(), type: detail && detail.type, name: detail && detail.name,
+      file: detail && detail.file, stamp: detail && detail.stamp };
+  }
+
   let eventSource = null;
   function connectEvents() {
     if (typeof EventSource === 'undefined') return;
@@ -1047,18 +1070,23 @@
     eventSource = new EventSource('/api/events?role=manga');
     eventSource.onopen = () => {
       const again = state.events.opened > 0;
+      note('open', { again });
       state.events.connected = true;
       state.events.opened += 1;
-      if (again) {
-        // つながり直した。切れている間の書き出しを取りこぼしているかもしれないので読み直す
-        refreshVersions().then(() => { state.inked.pairs.clear(); return refresh(); }).then(() => queueSync(0))
-          .catch((e) => console.error('[inkdeus]', e));
-      }
+      // つながった（つながり直した）時点で、白黒版の更新時刻を必ず突き合わせる。
+      // 最初の接続でも行う: 起動時に更新時刻を読んでから購読が始まるまでの間に書き出された分は、通知が届かない
+      refreshVersions().then(() => {
+        if (!again && !state.inked.lastChanged) return null;     // 最初の接続で、取りこぼしが無ければ何もしない
+        note('reconcile', { again, changed: state.inked.lastChanged });
+        state.inked.pairs.clear();
+        return (again ? refresh() : Promise.resolve()).then(() => queueSync(0));
+      }).catch((e) => console.error('[inkdeus]', e));
     };
-    eventSource.onerror = () => { state.events.connected = false; };      // 再接続はブラウザが自動で行う
+    eventSource.onerror = () => { state.events.connected = false; note('error', { readyState: eventSource.readyState }); };      // 再接続はブラウザが自動で行う
     eventSource.onmessage = (msg) => {
       let ev;
       try { ev = JSON.parse(msg.data); } catch (e) { return; }
+      note('event', ev);
       if (ev.type === 'exported') onExported(ev).catch((e) => console.error('[inkdeus]', e));
       else if (ev.type === 'versions') onVersionsEvent(ev).catch((e) => console.error('[inkdeus]', e));
       else if (ev.type === 'manga-command') runCommand(ev);
@@ -1784,6 +1812,9 @@
     exportPage, exportAllPages,
     // 白黒化の画面との行き来
     openEditor, adjustSelected, swapSelected, syncPage: () => queueSync(0), reconnectEvents: connectEvents,
+    // 不具合を追うための控え: 直近の出来事と、白黒版の更新時刻の表
+    debug: () => ({ now: Date.now(), trail: trail.slice(), versions: Object.assign({}, state.inked.versions || {}),
+      changed: Array.from(state.inked.changed) }),
     // バージョン（同じ元画像から作る、設定の違う白黒版）
     switchVersion, newVersionAndAdjust,
     setPreferInked(on) { state.preferInked = !!on; ui.prefer.value = on ? '1' : '0'; },
