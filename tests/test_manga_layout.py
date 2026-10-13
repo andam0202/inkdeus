@@ -14,6 +14,9 @@ from inkdeus.projects import create_project
 from inkdeus.server import create_app
 from test_manga_bridge import SKIP_FIRST_RUN, WAIT_MS, MangaEnv, find_upstream, images_on_canvas
 
+pytestmark = pytest.mark.manga          # 実物の漫画エディタ（上流のクローン）が要る
+XDIST_SPLIT_PARAM = "env"               # 並列では、差分あり・なしを別のワーカーで回す
+
 PANELS = """() => canvas.getObjects().filter(o => o.isPanel).map(p => ({guid: p.guid, cell: p.ikCell || null, name: p.name,
     selectable: p.selectable, evented: p.evented, stroke: p.strokeWidth,
     pts: getAbsolutePolygonPoints(p).map(q => [q.x, q.y])}))"""
@@ -299,16 +302,19 @@ def test_positions_follow_the_window_size_and_do_not_roll_back(lay):
     image = place(lay, info(lay)["cells"][0]["guid"])
     before = info(lay)
     size = lay.evaluate("() => [canvas.getWidth(), canvas.getHeight()]")
-    lay.set_viewport_size({"width": 1100, "height": 560})
+    # 画面を大きくする（小さくする方は、漫画エディタの画面が縦にはみ出す間はキャンバスが変わらず、
+    # はみ出すかどうかが、その PC のフォントで決まる文字の大きさに左右される）
+    lay.set_viewport_size({"width": 1900, "height": 1100})
     lay.wait_for_function("(w) => Math.abs(canvas.getWidth() - w) > 5", arg=size[0])
     lay.wait_for_timeout(300)
     assert matches_layout(lay)                                      # 新しい大きさでも、レイアウトの計算どおり
     assert near(boxes(info(lay)["cells"]), boxes(before["cells"]), tol=1e-6)     # ページに対する割合は変わらない
-    # 小さい画面のまま操作して、元の大きさへ戻す。操作の結果が巻き戻らない
+    # 別の大きさの画面のまま操作して、元の大きさへ戻す。操作の結果が巻き戻らない
     lay.evaluate("() => window.inkdeusBridge.layout.gutter(0.06, 0.05)")
     changed = info(lay)
+    resized = lay.evaluate("() => canvas.getWidth()")
     lay.set_viewport_size({"width": 1500, "height": 900})
-    lay.wait_for_function("(w) => Math.abs(canvas.getWidth() - w) < 2", arg=size[0])
+    lay.wait_for_function("(w) => Math.abs(canvas.getWidth() - w) > 5", arg=resized)
     lay.wait_for_timeout(300)
     assert matches_layout(lay) and near(boxes(info(lay)["cells"]), boxes(changed["cells"]), tol=1e-6)
     pic = next(i for i in linked(lay) if i["guid"] == image["guid"])

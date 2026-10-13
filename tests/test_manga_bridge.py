@@ -23,7 +23,9 @@ from inkdeus import manga
 from inkdeus.projects import add_asset_source, create_project
 from inkdeus.server import create_app
 
-WAIT_MS = 180_000
+pytestmark = pytest.mark.manga          # 実物の漫画エディタ（上流のクローン）が要る
+
+WAIT_MS = int(os.environ.get("INKDEUS_TEST_WAIT_MS", "180000"))   # 待ちの上限（不具合を追うときは短くできる）
 # 初回起動の案内（言語選択・チュートリアル）を出さないための、上流側の保存値。
 # 上流の自動保存（60 秒ごとに IndexedDB へ保存し、次に開いたページで「Recover Auto-save」の確認を出す）も切っておく。
 # 切らないと、同じブラウザコンテキストで先に開いていた漫画の画面が 60 秒を超えて生きていたときだけ、

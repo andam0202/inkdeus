@@ -238,10 +238,10 @@ def test_the_tool_in_the_toolbar_and_batch_export(live, capsys):
     page.evaluate("() => window.inkdeus.maskedit.settle()")
     page.keyboard.press("h")
     assert page.evaluate("() => window.inkdeus.maskedit.state().view") is None and page.evaluate("() => window.inkdeus.state.highlight") is None
-    assert (pixels(page) == base).all()
+    wait_pixels(page, base)                                      # （描き直しが済むのを待つ。負荷のかかった実行では、少し遅れる）
     page.keyboard.press("Control+z")                             # 全部取り消したのを、取り消す
     page.evaluate("() => window.inkdeus.maskedit.settle()")
-    assert (pixels(page) == img).all()
+    wait_pixels(page, img)
     saved(page)
     # 一括書き出しにも反映される（別の画像を開いた状態から）
     page.evaluate("() => window.inkdeus.open('b.png')")

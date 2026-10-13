@@ -93,17 +93,79 @@ def main_site(tmp_path_factory):
     server.shutdown()
 
 
+def browser_env() -> dict:
+    """ヘッドレス Chromium に渡す環境変数。フォントの探し先を、OS に標準で入っている場所だけにする。
+
+    漫画エディタ（上流）は起動のたびに、200 個ほどのフォント名を 1 つずつ描いて「入っているか」を調べる。
+    利用者のフォント設定（fontconfig）に遅い置き場（ネットワーク越し・別 OS のフォントフォルダなど）が入っていると、
+    1 つ調べるのに数十ミリ秒かかり、漫画の画面を開くたびに十数秒を使う（結合テストの時間の大半がこれだった）。
+    テストの結果が、その PC に入っているフォントに左右されないようにする意味もある。
+    INKDEUS_TEST_SYSTEM_FONTS=1 で、利用者のフォント設定をそのまま使う"""
+    env = dict(os.environ)
+    if os.environ.get("INKDEUS_TEST_SYSTEM_FONTS") == "1" or not sys.platform.startswith("linux"):
+        return env
+    folder = Path(tempfile.gettempdir()) / "inkdeus-test-fontconfig"
+    conf = folder / "fonts.conf"
+    text = ('<?xml version="1.0"?>\n<!DOCTYPE fontconfig SYSTEM "fonts.dtd">\n<fontconfig>\n'
+            "  <dir>/usr/share/fonts</dir>\n  <dir>/usr/local/share/fonts</dir>\n"
+            f"  <cachedir>{folder / 'cache'}</cachedir>\n</fontconfig>\n")
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        if not conf.is_file() or conf.read_text(encoding="utf-8") != text:
+            tmp = folder / f"fonts.conf.{os.getpid()}.tmp"       # 並列のワーカーが同時に書いても、壊れた物を読ませない
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, conf)
+    except OSError:
+        return env
+    env["FONTCONFIG_FILE"] = str(conf)
+    return env
+
+
 @pytest.fixture(scope="session")
 def browser():
     sync_api = pytest.importorskip("playwright.sync_api")
     with sync_api.sync_playwright() as pw:
         try:
-            b = pw.chromium.launch(args=CHROMIUM_ARGS)
+            b = pw.chromium.launch(args=CHROMIUM_ARGS, env=browser_env())
         except Exception as e:  # noqa: BLE001
             pytest.skip(f"Chromium を起動できません（uv run playwright install chromium）: {e}")
         evidence.watch_browser(b)                 # 作られる全ページのコンソール・エラー・通信の失敗を覚えておく
         yield b
         b.close()
+
+
+# ---- 印（範囲を絞って回すための目印）と、並列実行の割り振り ----
+# ui     ブラウザ（ヘッドレス Chromium）を使うテスト。fixture から自動で付く
+# server ブラウザを使わないテスト（サーバ・コマンド・純粋な関数）。自動で付く
+# manga  実物の漫画エディタ（上流のクローン）が要る結合テスト。各ファイルの pytestmark で付ける
+# slow   1 本で何十秒もかかる物（大きな画像など）。各テストに付ける
+#
+# 並列（pytest-xdist）では、同じファイルのテストを同じワーカーで、書いた順に回す（--dist loadgroup）。
+# モジュール単位の fixture（漫画の画面・サーバ）を共有し、前のテストの結果を使うテストがあるため。
+# ファイルが XDIST_SPLIT_PARAM = "<fixture 名>" を持つときは、その fixture の値ごとに別の組にする。
+
+@pytest.hookimpl(tryfirst=True)       # xdist が組の名前を読む（同じ名前のフック）より先に、印を付けておく
+def pytest_collection_modifyitems(config, items):
+    for item in items:
+        names = set(getattr(item, "fixturenames", ()))
+        item.add_marker(pytest.mark.ui if "browser" in names else pytest.mark.server)
+        group = Path(str(item.fspath)).stem
+        split = getattr(item.module, "XDIST_SPLIT_PARAM", None)
+        callspec = getattr(item, "callspec", None)
+        if split and callspec is not None and split in callspec.params:
+            group += f"[{callspec.params[split]}]"
+        item.add_marker(pytest.mark.xdist_group(group))
+
+
+def pytest_xdist_auto_num_workers(config):
+    """-n auto のワーカー数: CPU のコア数の 1/4（2〜6。2 コア以下なら 1）。INKDEUS_TEST_WORKERS で変えられる。
+    ソフトウェア描画の WebGL は、ワーカー 1 つで CPU を 3 個ほど使う。16 コアの PC での全件は、4 ワーカーで約 6 分・
+    6 ワーカーで約 5 分半（コアを使い切り、ほかの作業が重くなる。それ以上増やしても、いちばん長いファイルの時間より短くはならない）"""
+    given = os.environ.get("INKDEUS_TEST_WORKERS", "")
+    if given.isdigit() and int(given) > 0:
+        return int(given)
+    cores = os.cpu_count() or 2
+    return 1 if cores <= 2 else max(2, min(6, cores // 4))
 
 
 @pytest.hookimpl(hookwrapper=True)

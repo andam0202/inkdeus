@@ -21,6 +21,7 @@ dev = [
     "playwright>=1.45",
     "fonttools>=4.50",
     "pypdf>=6.20.0",
+    "pytest-xdist>=3.6",
 ]
 
 [build-system]
@@ -36,4 +37,11 @@ packages = ["src/inkdeus"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+# 既定で並列に回す（ワーカー数は tests/conftest.py。直列は -n 0）。同じファイルのテストは同じワーカーで順に回す
+addopts = "-ra -n auto --dist loadgroup"
+markers = [
+    "ui: ブラウザ（ヘッドレス Chromium）を使うテスト（自動で付く）",
+    "server: ブラウザを使わないテスト（自動で付く）",
+    "manga: 実物の漫画エディタ（上流のクローン。INKDEUS_MANGA_SRC）が要る結合テスト",
+    "slow: 1 本で何十秒もかかるテスト（-m \"not slow\" で外せる）",
+]

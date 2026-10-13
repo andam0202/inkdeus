@@ -628,6 +628,7 @@ def test_standalone_mode_without_api(browser, site, tmp_path):
 # 大きな画像（5120x3840）
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 @pytest.mark.skipif(os.environ.get("INKDEUS_SKIP_BIG") == "1", reason="INKDEUS_SKIP_BIG=1")
 def test_large_image_end_to_end(browser, main_site, capsys):
     w, h = 5120, 3840

@@ -612,6 +612,7 @@ def test_old_server_without_parts_feature_keeps_working(live):
 
 # ---- 大きな画像（5120x3840）＋ 3 部分: 合成の重さが、領域の数に比例して増えないこと ----
 
+@pytest.mark.slow
 @pytest.mark.skipif(os.environ.get("INKDEUS_SKIP_BIG") == "1", reason="INKDEUS_SKIP_BIG=1")
 def test_large_image_with_three_parts(tmp_path, browser, capsys):
     w, h = 5120, 3840

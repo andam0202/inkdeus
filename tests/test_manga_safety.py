@@ -9,6 +9,8 @@ from test_manga_bridge import (  # noqa: F401 — manga_env / ctx は fixture
     apply_template, ctx, images_on_canvas, manga_env, open_manga,
 )
 
+pytestmark = pytest.mark.manga          # 実物の漫画エディタ（上流のクローン）が要る
+
 # 閉じる・再読み込みの前に引き止めるか。連携スクリプトの判断（status().unsaved）と、実際の beforeunload の扱いの両方を見る
 # （漫画エディタ自身にも「保存していない変更」の確認があるので、beforeunload は「引き止める」側だけを確かめる）
 ASK = """() => { const e = new Event('beforeunload', {cancelable: true}); window.dispatchEvent(e);

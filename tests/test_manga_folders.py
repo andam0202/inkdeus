@@ -17,6 +17,8 @@ from test_manga_bridge import (  # noqa: F401 — ctx は fixture（この下の
     PROBE, WAIT_MS, MangaEnv, apply_template, ctx, find_upstream, geometry, open_manga,
 )
 
+pytestmark = pytest.mark.manga          # 実物の漫画エディタ（上流のクローン）が要る
+
 
 @pytest.fixture(scope="module")
 def manga_env(tmp_path_factory):

@@ -14,6 +14,8 @@ from inkdeus import cli
 from test_manga_bridge import (  # noqa: F401 — manga_env / ctx は fixture
     apply_template, ctx, manga_env, open_manga)
 
+pytestmark = pytest.mark.manga          # 実物の漫画エディタ（上流のクローン）が要る
+
 pypdf = pytest.importorskip("pypdf")
 
 MM = 72.0 / 25.4

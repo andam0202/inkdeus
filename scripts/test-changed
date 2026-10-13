@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""変更したファイルに関係するテストだけを回す（手元での素早い確認用。push の前は全件 = uv run pytest）。
+
+    scripts/test-changed [基準] [--list] [-- pytest へ渡す引数…]
+
+基準（省略時は origin/main）からの差分（コミット済み・未コミット・追跡前のファイル）を見て、下の対応表で
+テストを選ぶ。対応表に無いファイル・「どこに効くか分からない」ファイルが 1 つでもあれば、全件を回す。
+--list は、選んだ結果を表示するだけで実行しない。
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ALL = "ALL"                      # 全件
+NONE: list[str] = []             # テストに影響しない（文書など）
+
+# 実物の漫画エディタを使う結合テスト（印 manga）と、白黒化の画面の結合テスト（印 "ui and not manga"）は、印で選ぶ
+MANGA = "mark:manga"
+EDITOR_UI = "mark:ui and not manga"
+SERVER = "mark:server"
+
+# 対応表: 上から順に見て、最初に当てはまった行を使う（パターンはリポジトリ直下からの相対パス。* は / もまたぐ）
+RULES: list[tuple[str, object]] = [
+    # --- テスト自身 ---
+    ("tests/conftest.py", ALL), ("tests/evidence.py", ALL), ("tests/synth*.py", ALL),
+    ("tests/test_manga_bridge.py", MANGA),                    # ほかの漫画の結合テストが、ここの部品を使う
+    ("tests/test_*.py", "self"),                              # そのファイルだけ
+    # --- 文書・設定の見本（テストに影響しない） ---
+    ("*.md", NONE), ("LICENSE", NONE), (".claude/*", NONE), ("inkdeus.local.toml.example", NONE), (".gitignore", NONE),
+    ("scripts/*", NONE),
+    # --- 漫画の構成（連携スクリプト・上流への差分） ---
+    ("web/manga-bridge/layout-core.js", ["tests/test_layout_core.py", "tests/test_manga_layout.py"]),
+    ("web/manga-bridge/layout.js", ["tests/test_manga_layout.py"]),
+    ("web/manga-bridge/pdf.js", ["tests/test_manga_pdf_ui.py"]),
+    ("web/manga-bridge/*", MANGA),
+    ("patches/*", [MANGA, "tests/test_manga.py", "tests/test_manga_patches.py"]),
+    ("src/inkdeus/manga.py", [MANGA, "tests/test_manga.py", "tests/test_manga_patches.py"]),
+    ("src/inkdeus/pdf.py", ["tests/test_manga_pdf.py", "tests/test_manga_pdf_ui.py"]),
+    ("src/inkdeus/fonts.py", ["tests/test_fonts.py", "tests/test_manga_bridge.py"]),
+    ("src/inkdeus/assets.py", ["tests/test_assets.py", MANGA]),
+    # --- 白黒化の画面 ---
+    ("web/js/gallery.js", ["tests/test_gallery.py", "tests/test_folders_ui.py", "tests/test_apply_ui.py"]),
+    ("web/js/styles.js", ["tests/test_styles_ui.py"]),
+    ("web/js/safety.js", ["tests/test_safety_ui.py"]),
+    ("web/js/maskedit.js", ["tests/test_maskedit_ui.py"]),
+    ("web/js/paint.js", ["tests/test_paint_ui.py", "tests/test_maskedit_ui.py"]),
+    ("web/js/tools.js", ["tests/test_paint_ui.py", "tests/test_maskedit_ui.py"]),
+    ("web/js/*", EDITOR_UI), ("web/index.html", EDITOR_UI), ("web/*.css", EDITOR_UI),
+    # --- サーバ・コマンド ---
+    ("src/inkdeus/applyparams.py", ["tests/test_apply.py", "tests/test_apply_ui.py"]),
+    ("src/inkdeus/backup.py", ["tests/test_backup.py", "tests/test_backup_api.py", "tests/test_maintenance.py",
+                               "tests/test_apply.py"]),
+    ("src/inkdeus/maintenance.py", ["tests/test_maintenance.py", "tests/test_maskedit.py", "tests/test_apply.py"]),
+    ("src/inkdeus/portable.py", ["tests/test_maintenance.py"]),
+    ("src/inkdeus/styles.py", ["tests/test_styles.py", "tests/test_styles_ui.py"]),
+    ("src/inkdeus/parts.py", ["tests/test_parts.py", "tests/test_parts_ui.py"]),
+    ("src/inkdeus/maskedit.py", ["tests/test_maskedit.py", "tests/test_maskedit_ui.py"]),
+    ("src/inkdeus/folders.py", ["tests/test_folders.py", "tests/test_folders_ui.py", "tests/test_manga_folders.py"]),
+    ("src/inkdeus/ctl.py", SERVER), ("src/inkdeus/cli.py", SERVER), ("src/inkdeus/projects.py", SERVER),
+    # --- どこにでも効く（迷う変更は全件） ---
+    ("src/inkdeus/server.py", ALL), ("src/inkdeus/schema.py", ALL), ("web/schema.json", ALL),
+    ("pyproject.toml", ALL), ("uv.lock", ALL),
+]
+
+
+def git(*args: str) -> list[str]:
+    out = subprocess.run(["git", *args], check=True, capture_output=True, text=True, encoding="utf-8").stdout
+    return [line for line in out.splitlines() if line.strip()]
+
+
+def changed_files(base: str) -> list[str]:
+    files = set(git("-c", "core.quotepath=off", "diff", "--name-only", base, "--"))
+    files.update(git("-c", "core.quotepath=off", "ls-files", "--others", "--exclude-standard"))
+    return sorted(files)
+
+
+def rule_for(path: str):
+    for pattern, target in RULES:
+        if fnmatch.fnmatchcase(path, pattern):
+            return pattern, target
+    return None, ALL                                          # 対応表に無いファイル
+
+
+def files_with_mark(expr: str) -> list[str]:
+    """その印の付いたテストがあるファイル（pytest に集めさせて調べる）"""
+    run = subprocess.run(["uv", "run", "pytest", "--collect-only", "-q", "-n", "0", "-m", expr],
+                         capture_output=True, text=True, encoding="utf-8")
+    return sorted({line.split("::", 1)[0] for line in run.stdout.splitlines() if "::" in line})
+
+
+def select(files: list[str]) -> tuple[list[str] | str, list[tuple[str, str, str]]]:
+    """(回すテストのファイル または ALL, 判断の内訳)"""
+    picked: set[str] = set()
+    marks: set[str] = set()
+    why = []
+    everything = False
+    for path in files:
+        pattern, target = rule_for(path)
+        if target == ALL:
+            everything = True
+            why.append((path, pattern or "（対応表に無い）", "全件"))
+            continue
+        if target == "self":
+            target = [path] if Path(path).is_file() else []      # 消したテストは回せない
+        items = [target] if isinstance(target, str) else list(target)
+        for item in items:
+            (marks if item.startswith("mark:") else picked).add(item)
+        why.append((path, pattern, ", ".join(items) or "なし"))
+    if everything:
+        return ALL, why
+    for mark in sorted(marks):
+        picked.update(files_with_mark(mark[len("mark:"):]))
+    return sorted(p for p in picked if Path(p).is_file()), why
+
+
+def main(argv: list[str]) -> int:
+    extra: list[str] = []
+    if "--" in argv:
+        at = argv.index("--")
+        argv, extra = argv[:at], argv[at + 1:]
+    only_list = "--list" in argv
+    rest = [a for a in argv if a != "--list"]
+    if any(a in ("-h", "--help") for a in rest) or len(rest) > 1:
+        print(__doc__)
+        return 0 if rest and rest[0] in ("-h", "--help") else 2
+    base = rest[0] if rest else "origin/main"
+    os.chdir(Path(__file__).resolve().parent.parent)
+    try:
+        files = changed_files(base)
+    except subprocess.CalledProcessError as e:
+        print(f"git で差分を読めません（基準: {base}）: {e.stderr.strip()}", file=sys.stderr)
+        return 2
+    if not files:
+        print(f"{base} からの変更はありません")
+        return 0
+    chosen, why = select(files)
+    width = max(len(p) for p, _r, _t in why)
+    print(f"変更されたファイル（基準: {base}）")
+    for path, pattern, target in why:
+        print(f"  {path:<{width}}  ← {pattern} → {target}")
+    if chosen == ALL:
+        command = ["uv", "run", "pytest", *extra]
+        print("→ 全件を回します")
+    elif not chosen:
+        print("→ 関係するテストはありません")
+        return 0
+    else:
+        command = ["uv", "run", "pytest", *chosen, *extra]
+        print(f"→ {len(chosen)} ファイル: {' '.join(chosen)}")
+    if only_list:
+        return 0
+    sys.stdout.flush()
+    os.execvp(command[0], command)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

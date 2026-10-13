@@ -716,6 +716,9 @@ def test_layer_ids_are_filled_on_open_and_saved_without_making_exports_stale(liv
     old = deep_merge(BLANK, {"layers": [layer(threshold=0.9), layer(threshold=0.5, angle=135)]})     # 層の id が入る前の設定
     (out / "mix.inkdeus.json").write_text(json.dumps(old), encoding="utf-8")
     Image.new("L", (W, H), 255).save(out / "mix.png")
+    # ここで置いた設定ファイルを、サーバの見張りに「前からあった物」として覚えさせる。そうしないと、見張り（0.5 秒ごと）が
+    # 「外部からの変更」を知らせるのと、画面が開いて層の id を補うのとが重なったとき、画面が古い中身を読み直してしまう
+    live["app"].config["INKDEUS_SESSION"].scan()
     row = {i["name"]: i for i in api(live, "/api/images")["images"]}["mix.png"]
     assert row["hasExport"] and row["exportFresh"]
     stamp = (out / "mix.inkdeus.json").stat().st_mtime_ns
@@ -944,6 +947,7 @@ def test_works_in_memory_without_any_server(browser, tmp_path):
 
 # ---- 4 倍の画像 ----
 
+@pytest.mark.slow
 @pytest.mark.skipif(os.environ.get("INKDEUS_SKIP_BIG") == "1", reason="INKDEUS_SKIP_BIG=1")
 def test_large_image_strokes_save_and_export(browser, tmp_path, capsys):
     w, h = 5120, 3840

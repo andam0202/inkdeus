@@ -14,6 +14,8 @@ from test_manga_bridge import (  # noqa: F401 — manga_env / ctx は fixture
     BLACK, PROBE, WAIT_MS, apply_template, ctx, geometry, manga_env, open_manga,
 )
 
+pytestmark = pytest.mark.manga          # 実物の漫画エディタ（上流のクローン）が要る
+
 
 def call(env, path: str, body: dict | None = None, method: str | None = None) -> dict:
     data = None if body is None else json.dumps(body).encode("utf-8")
