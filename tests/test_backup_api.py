@@ -267,6 +267,12 @@ def test_manga_data_keeps_earlier_versions(env):
     assert rows["book"]["backups"] == 2 and rows["autosave"]["backups"] == 0
     listed = client.get("/api/manga/backups/book").get_json()["backups"]
     assert len(listed) == 2 and listed[0]["time"] > listed[1]["time"]
+    # 自動保存にも世代バックアップが効く（上書きのたびに、前の自動保存が残る）
+    for text in (b"auto2", b"auto3"):
+        assert client.put("/api/manga/project/autosave", data=manga_data(text)).status_code == 200
+    assert contents(store, "_manga/autosave.lz4") == [manga_data(b"auto2"), manga_data(b"auto"), "<absent>"]
+    auto = client.get("/api/manga/backups/autosave").get_json()["backups"]
+    assert len(auto) == 2 and client.get(f"/api/manga/backup/autosave/{auto[0]['at']}").data == manga_data(b"auto2")
     r = client.get(f"/api/manga/backup/book/{listed[1]['at']}")
     assert r.status_code == 200 and r.data == manga_data(b"one")              # 以前の版の中身（いまの保存データは変えない）
     assert client.get("/api/manga/project/book").data == manga_data(b"three")

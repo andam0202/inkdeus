@@ -907,6 +907,22 @@ def looks_like_manga_data(data: bytes) -> bool:
     return isinstance(header, list) and all(isinstance(f, dict) and "name" in f and "size" in f for f in header)
 
 
+def manga_page_count(path: Path) -> int | None:
+    """漫画データに入っているページ数（見出しの項目の数）。読めなければ None"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4)
+            if len(head) < 4:
+                return None
+            (size,) = struct.unpack("<I", head)
+            if size < 2 or size > (1 << 24):
+                return None
+            header = json.loads(f.read(size).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    return len(header) if isinstance(header, list) else None
+
+
 def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
                out_dir: Path | str | None = None,
                project: dict | None = None, watch: bool = True,
@@ -1213,7 +1229,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
                     st = p.stat()
                     key = f"{backup_mod.MANGA_PREFIX}/{p.name}"
                     rows.append({"name": p.stem, "bytes": st.st_size, "mtime": st.st_mtime,
-                                 "autosave": p.stem == MANGA_AUTOSAVE,
+                                 "autosave": p.stem == MANGA_AUTOSAVE, "pages": manga_page_count(p),
                                  "backups": len([e for e in backups.entries(key) if not e.absent])})
         return jsonify({"dir": str(manga_dir), "autosaveName": MANGA_AUTOSAVE, "projects": rows})
 

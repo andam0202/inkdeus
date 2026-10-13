@@ -27,19 +27,14 @@ pytestmark = pytest.mark.manga          # 実物の漫画エディタ（上流�
 
 WAIT_MS = int(os.environ.get("INKDEUS_TEST_WAIT_MS", "180000"))   # 待ちの上限（不具合を追うときは短くできる）
 # 初回起動の案内（言語選択・チュートリアル）を出さないための、上流側の保存値。
-# 上流の自動保存（60 秒ごとに IndexedDB へ保存し、次に開いたページで「Recover Auto-save」の確認を出す）も切っておく。
-# 切らないと、同じブラウザコンテキストで先に開いていた漫画の画面が 60 秒を超えて生きていたときだけ、
-# あとから開いた画面に全面の確認ダイアログが出て、パネルへのクリックが届かなくなる
-# （全件実行や負荷のかかった実行でだけ、ホットリロードのテストなどが時間切れで落ちていた原因）。
-# 確認ダイアログが出ている状態そのものは、test_upstream_recovery_dialog_… が狙って作って確かめる
+# 上流の自動保存（60 秒ごとに IndexedDB へ保存し、次に開いたページで「Recover Auto-save」の確認を全画面で出す）は、
+# 連携スクリプトが止める（inkdeus の保存に一本化）ので、ここでは切らない。止まること・止めない設定のときの挙動は
+# test_manga_autosave.py が確かめる
 SKIP_FIRST_RUN = """
 try {
   localStorage.setItem('tutorial_lang_selected', 'true');
   localStorage.setItem('manga_tutorial_state',
     JSON.stringify({quickStartCompleted: true, hintsShown: {}, comfyUIGuideShown: true}));
-  if (localStorage.getItem('localSettingsData') === null) {
-    localStorage.setItem('localSettingsData', JSON.stringify({autoSaveEnabled: false}));
-  }
 } catch (e) {}
 """
 UPSTREAM_DIALOG = ".confirm-dialog-overlay"       # 上流の確認ダイアログ（画面全体を覆い、ポインタ操作を受け止める）
@@ -695,42 +690,6 @@ def test_local_font_is_listed_applied_saved_and_exported(ctx, manga_env):
         assert dark == pytest.approx(both * scale * scale, rel=0.2)
     finally:
         fresh.close()
-
-
-# ---- 上流の自動保存の復元確認（全画面のダイアログ）が出ているとき ----
-
-def test_upstream_recovery_dialog_covers_the_panel_until_it_is_answered(ctx, manga_env):
-    """上流の漫画エディタは、自分でも 60 秒ごとに IndexedDB へ自動保存し、次に開いたページで復元するかを全画面で尋ねる。
-    その間、素材パネルへのポインタ操作は届かない（連携スクリプト自体は動いている）。答えれば、元どおり操作できる。
-    ほかのテストは SKIP_FIRST_RUN で上流の自動保存を切っているので、ここでだけ狙って保存させる"""
-    from playwright.sync_api import TimeoutError as PlaywrightTimeout
-
-    first, status = open_manga(ctx, manga_env)
-    second = None
-    try:
-        assert status["ok"]
-        first.evaluate("() => window.inkdeusBridge.setAutosave({enabled: false})")
-        apply_template(first)
-        assert first.evaluate("(s) => document.querySelector(s) === null", UPSTREAM_DIALOG)
-        first.evaluate("() => AutoSaveManager.save()")                    # 60 秒たって上流の自動保存が走ったのと同じ
-        first.wait_for_function("""async () => !!(await localforage.createInstance(
-            {name: 'autoSaveStorage', storeName: 'projectAutoSave'}).getItem('metadata'))""")
-        second, status = open_manga(ctx, manga_env)
-        second.wait_for_selector(UPSTREAM_DIALOG)
-        assert status["ok"]                                               # 連携スクリプトの準備は、確認を待たずに済む
-        second.wait_for_function("() => window.inkdeusBridge.status().events.connected === true")
-        second.wait_for_selector(".ikb-tab:has-text('白黒')")
-        with pytest.raises(PlaywrightTimeout, match="intercepts pointer events"):
-            second.click(".ikb-tab:has-text('白黒')", timeout=3000)       # 確認が出ている間は、パネルを押せない
-        second.click(f"{UPSTREAM_DIALOG} button:has-text('Decide later')")
-        second.wait_for_selector(UPSTREAM_DIALOG, state="detached")
-        second.click(".ikb-tab:has-text('白黒')")                         # 答えれば押せる
-        second.wait_for_function("() => window.inkdeusBridge.status().source === 'inked'")
-    finally:
-        first.evaluate("() => AutoSaveManager.clearAutoSave()")           # 後続のテストに確認を出させない
-        if second is not None:
-            second.close()
-        first.close()
 
 
 def test_exports_made_before_the_event_stream_opens_are_picked_up_on_the_first_connect(ctx, manga_env):

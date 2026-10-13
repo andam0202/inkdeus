@@ -21,10 +21,13 @@
      btmWaitForPageReady, btmUpdateHandleText, chengeCanvasByGuid, multiLoadLz4, clearAllProjectPages,
      getContentObjectCount, getCropAndDownloadLinkByMultiplier, removeGrid, drawGrid, showConfirmDialog,
      flushHistory, OP_showLoading, OP_hideLoading, waitNextFrame, withoutHistory, saveInitialState,
-     fmFontData:writable, FontSelectorManager, collectUsedFontNames, usesFontFamily, projectFontData */
+     fmFontData:writable, FontSelectorManager, collectUsedFontNames, usesFontFamily, projectFontData,
+     AutoSaveManager, localforage */
   const G = {
     fabric: () => fabric,
     canvas: () => canvas,
+    AutoSaveManager: () => AutoSaveManager,
+    localforage: () => localforage,
     lz4Compressor: () => lz4Compressor,
     btmProjectsMap: () => btmProjectsMap,
     stateStack: () => stateStack,
@@ -73,6 +76,9 @@
   }
 
   const AUTOSAVE_NAME = 'autosave';
+  const AUTOSAVE_SECONDS = [10, 30, 60, 120];   // 変更から自動保存までの間隔の選択肢（既定 30 秒）
+  const AUTOSAVE_DEFAULT = 30;
+  const UPSTREAM_AUTOSAVE_KEY = 'inkdeus.manga.upstreamAutosave';   // "keep" なら、漫画エディタ自身の自動保存を止めない
   const NAME_RE = /^[\p{L}\p{N}_-]{1,64}$/u;
   const SIZES = [[1024, '長辺 1024'], [2048, '長辺 2048'], [4096, '長辺 4096'], [0, '原寸']];
   const PAGE_SIZE = 60;
@@ -100,8 +106,13 @@
     name: '',                    // 保存名
     saved: [],                   // 保存済みの漫画データ
     busy: false,                 // 連携スクリプトが保存・読み込み・書き出しの最中
-    autosave: { enabled: true, seconds: 60, lastSig: null, dirtySince: 0, pageChanged: false, lastAt: 0,
+    autosave: { enabled: true, seconds: 30, lastSig: null, dirtySince: 0, pageChanged: false, lastAt: 0,
       failed: false, retryMs: 0, retryAt: 0 },                 // 失敗したら、間隔を広げながら再試行する
+    // 漫画エディタ自身の自動保存（ブラウザの中 = IndexedDB への保存と、起動時の復元の確認）の扱い。
+    // mode: pending = まだ決まっていない / stopped = 止めた（inkdeus の保存に一本化）/ kept = 利用者の設定で、そのまま /
+    //       unavailable = 止められなかった（対応していない版）/ none = 自動保存の無い版。
+    // old = ブラウザの中に残っている、以前の自動保存
+    upstreamAuto: { mode: 'pending', old: null, original: null },
     build: null,                 // 読み込んだときのサーバのビルド識別（変わったら「再読み込みしてください」と知らせる）
     notices: {},                 // 画面の上の帯に出している知らせ（種類 → 文言）
     preferInked: true,           // 元画像のタブから入れるとき、白黒版があれば白黒版を入れる
@@ -112,6 +123,35 @@
     // ローカルフォント（利用者のPCにあるフォント。inkdeus のサーバが配信する）
     fonts: { list: [], loaded: new Set(), loading: new Map(), failed: new Map(), registered: false, supported: true },
   };
+
+  // ---- 漫画エディタ自身の自動保存を止める ----
+  // 漫画エディタは、自分でも 60 秒ごとにブラウザの中（IndexedDB）へ全ページを保存し、次に開いたとき復元するかを
+  // 全画面で尋ねる。inkdeus 経由ではプロジェクトの manga/autosave へ保存するので、二重になる。
+  // 公開されている入口（AutoSaveManager の init / checkRecovery など）を、漫画エディタの起動処理が呼ぶ前に
+  // 「何もしない物」へ差し替えて止める（漫画エディタのファイルは変えない。ブラウザの中に残っているデータも消さない）。
+  // この連携スクリプトは </body> の直前で読み込まれ、漫画エディタの起動処理（DOMContentLoaded）より先に登録できる。
+  function tameUpstreamAutosave() {
+    const u = state.upstreamAuto;
+    if (u.mode !== 'pending') return;
+    let keep = false;
+    try { keep = localStorage.getItem(UPSTREAM_AUTOSAVE_KEY) === 'keep'; } catch (e) { /* 読めなければ既定（止める） */ }
+    const M = optional(() => AutoSaveManager);
+    if (keep) { u.mode = 'kept'; return; }
+    if (!M) { u.mode = 'none'; return; }                       // 自動保存の無い版（止める物が無い）
+    if (typeof M.init !== 'function' || typeof M.checkRecovery !== 'function') { u.mode = 'unavailable'; return; }
+    u.original = { init: M.init, checkRecovery: M.checkRecovery, save: M.save, clearAutoSave: M.clearAutoSave };
+    optional(() => M.stop());                                  // もう始まっていたら止める
+    M.init = async function () {};                             // タイマーを始めない（設定欄の変更も拾わない）
+    M.start = function () {};
+    M.restart = function () {};
+    M.setEnabled = function () {};
+    M.setInterval = function () {};
+    M.save = async function () {};                             // IndexedDB へ書かない
+    M.checkRecovery = async function () { return false; };     // 復元の確認を出さない（残っているデータはパネルで尋ねる）
+    u.mode = 'stopped';
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', tameUpstreamAutosave);
+  else tameUpstreamAutosave();
 
   // ---- 小物 ----
 
@@ -240,6 +280,10 @@
   function buildPanel() {
     ui.msg = el('div', { class: 'ikb-msg', role: 'status', hidden: true });
     ui.resume = el('div', { class: 'ikb-resume', hidden: true });
+    // 漫画エディタ自身の自動保存（ブラウザの中）に、以前のデータが残っているときの問いかけ
+    ui.upstreamOld = el('div', { class: 'ikb-resume ikb-upstream-old', hidden: true });
+    // 漫画エディタ自身の自動保存を止めていない（止められなかった）ときの案内
+    ui.upstreamNote = el('div', { class: 'ikb-dim ikb-upstream-note', hidden: true });
     // 導入済みの漫画エディタに、未適用の差分（inkdeus が上流へ当てる変更）があるときの案内
     ui.patchNotice = el('div', { class: 'ikb-msg ikb-patch-notice', 'data-kind': 'error', hidden: true });
     ui.projectName = el('span', { class: 'ikb-project-name' });
@@ -296,6 +340,9 @@
     ui.btnExport = el('button', { type: 'button', text: 'このページを書き出す', onclick: () => run(() => exportPage()) });
     ui.btnExportAll = el('button', { type: 'button', text: '全ページを書き出す', onclick: () => run(() => exportAllPages()) });
     ui.autosave = el('input', { type: 'checkbox', id: 'ikb-autosave' });
+    ui.autosaveSeconds = el('select', { class: 'ikb-autosave-seconds', 'aria-label': '変更から自動保存までの間隔',
+      title: '変更してから、この時間が経つと自動保存します（ページの切り替え・タブを離れたときは、待たずに保存します）' },
+    AUTOSAVE_SECONDS.map((v) => el('option', { value: String(v), text: `${v} 秒` })));
     ui.autosaveState = el('span', { class: 'ikb-dim' });
     ui.dir = el('div', { class: 'ikb-dim ikb-dir' });
     ui.fontInfo = el('span', { class: 'ikb-dim ikb-font-info' });
@@ -312,6 +359,7 @@
       ui.msg,
       ui.patchNotice,
       ui.resume,
+      ui.upstreamOld,
       ui.sel,
       el('div', { class: 'ikb-section ikb-assets' }, [
         ui.tabs,
@@ -331,8 +379,9 @@
         ui.versions,
         el('div', { class: 'ikb-row' }, [ui.btnExport, ui.btnExportAll]),
         el('div', { class: 'ikb-row ikb-autosave-row' }, [
-          ui.autosave, el('label', { for: 'ikb-autosave', text: '自動保存' }), ui.autosaveState,
+          ui.autosave, el('label', { for: 'ikb-autosave', text: '自動保存' }), ui.autosaveSeconds, ui.autosaveState,
         ]),
+        ui.upstreamNote,
         el('div', { class: 'ikb-row ikb-save-row' }, [el('span', { class: 'ikb-dim', text: '保存の状態:' }), ui.saveState]),
         ui.fontRow,
         ui.dir,
@@ -365,6 +414,11 @@
       store.set('autosave', state.autosave.enabled);
       renderStatus();
     });
+    ui.autosaveSeconds.addEventListener('change', () => {
+      setAutosaveSeconds(parseInt(ui.autosaveSeconds.value, 10));
+      store.set('autosaveSeconds', state.autosave.seconds);
+      renderStatus();
+    });
 
     ui.prefer.addEventListener('change', () => {
       state.preferInked = ui.prefer.value === '1';
@@ -385,6 +439,8 @@
     ui.size.value = String(state.imageMax);
     state.autosave.enabled = store.get('autosave', true) !== false;
     ui.autosave.checked = state.autosave.enabled;
+    const seconds = store.get('autosaveSeconds', AUTOSAVE_DEFAULT);
+    setAutosaveSeconds(AUTOSAVE_SECONDS.includes(seconds) ? seconds : AUTOSAVE_DEFAULT);
 
     document.documentElement.classList.add('ikb-docked');
     document.body.appendChild(ui.root);
@@ -593,6 +649,20 @@
     ui.count.textContent = state.total ? `${state.items.length} / ${state.total} 枚` : '';
   }
 
+  // 自動保存までの間隔（秒）。選択肢に無い値（外からの指定）は、その場かぎりの選択肢として出す
+  function setAutosaveSeconds(seconds) {
+    if (!(seconds >= 1)) return;
+    state.autosave.seconds = Number(seconds);
+    const value = String(state.autosave.seconds);
+    Array.from(ui.autosaveSeconds.options).filter((o) => o.dataset.custom).forEach((o) => o.remove());
+    if (!Array.from(ui.autosaveSeconds.options).some((o) => o.value === value)) {
+      const custom = el('option', { value, text: `${value} 秒` });
+      custom.dataset.custom = '1';
+      ui.autosaveSeconds.appendChild(custom);
+    }
+    ui.autosaveSeconds.value = value;
+  }
+
   function renderSaved() {
     const rows = state.saved.slice().sort((a, b) => b.mtime - a.mtime);
     ui.saved.replaceChildren(...(rows.length ? rows.map((p) => el('option', {
@@ -608,6 +678,7 @@
     ui.btnExport.disabled = !f.export;
     ui.btnExportAll.disabled = !f.exportAll;
     ui.autosave.disabled = !f.save;
+    ui.autosaveSeconds.disabled = !f.save || !state.autosave.enabled;
     const a = state.autosave;
     ui.autosaveState.textContent = !f.save ? '' : !a.enabled ? 'オフ'
       : a.lastAt ? `${formatTime(a.lastAt / 1000)} に保存` : `変更から ${a.seconds} 秒後`;
@@ -1598,13 +1669,24 @@
     return getContentObjectCount() > 0 || btmGetGuidsSize() > 1;
   }
 
-  async function confirmReplace(label) {
-    const message = `いま開いているページをすべて閉じて「${label}」を開きます。保存していない変更は失われます。`;
+  async function confirmDanger(title, message, okText) {
     const dialog = optional(() => showConfirmDialog);
-    if (dialog) {
-      return !!(await dialog({ title: 'プロジェクトから開く', message, okText: '開く', cancelText: 'やめる', danger: true }));
-    }
+    if (dialog) return !!(await dialog({ title, message, okText, cancelText: 'やめる', danger: true }));
     return window.confirm(message);
+  }
+
+  function confirmReplace(label) {
+    return confirmDanger('プロジェクトから開く',
+      `いま開いているページをすべて閉じて「${label}」を開きます。保存していない変更は失われます。`, '開く');
+  }
+
+  // いまの中身を「未保存の変更あり」にする（漫画エディタ側の復元など、履歴の印が変わらない読み込みのあと用）
+  function markDirtyNow() {
+    const a = state.autosave;
+    a.lastSig = signature();
+    a.guid = currentGuid();
+    if (!a.dirtySince && optional(() => contentExists())) a.dirtySince = Date.now();
+    renderStatus();
   }
 
   // 読み込み。漫画エディタの「プロジェクトを読み込む」（置き換え）と同じ手順
@@ -1689,23 +1771,108 @@
     return autosaveNow();
   }
 
+  function savedLabel(p) {
+    const label = p.name === AUTOSAVE_NAME ? '自動保存' : p.name;
+    return `${label} — ${formatTime(p.mtime)}${p.pages ? `・${p.pages} ページ` : ''}`;
+  }
+
+  // 前回の続き: 名前を付けて保存した最後の物と、自動保存。新しい方を既定で示し、どちらを開くか選べる
   async function offerResume() {
     if (!state.features.open) return;
     const rows = await listSaved();
     const last = store.get('lastName', '');
     if (last && !ui.name.value) { ui.name.value = last; state.name = last; }
-    const candidates = rows.filter((p) => p.name === AUTOSAVE_NAME || p.name === last);
+    const candidates = rows.filter((p) => p.name === AUTOSAVE_NAME || p.name === last)
+      .sort((a, b) => b.mtime - a.mtime);
     if (!candidates.length) return;
-    const pick = candidates.sort((a, b) => b.mtime - a.mtime)[0];
-    const label = pick.name === AUTOSAVE_NAME ? '自動保存' : pick.name;
+    const picked = () => {
+      const on = ui.resume.querySelector('input[name="ikb-resume-pick"]:checked');
+      return on ? on.value : candidates[0].name;
+    };
     ui.resume.replaceChildren(
-      el('div', { text: `前回の続きを開きますか？ ${label}（${formatTime(pick.mtime)}）` }),
+      el('div', { text: candidates.length > 1 ? '前回の続きを開きますか？（新しい方を選んであります）' : '前回の続きを開きますか？' }),
+      ...candidates.map((p, i) => el('label', { class: 'ikb-row ikb-resume-pick', 'data-name': p.name }, [
+        el('input', { type: 'radio', name: 'ikb-resume-pick', value: p.name, checked: i === 0,
+          onchange: () => { ui.resume.dataset.name = picked(); } }),
+        el('span', { text: savedLabel(p) }),
+      ])),
       el('div', { class: 'ikb-row' }, [
-        el('button', { type: 'button', class: 'ikb-primary', text: '開く', onclick: () => run(() => open(pick.name)) }),
+        el('button', { type: 'button', class: 'ikb-primary', text: '開く', onclick: () => run(() => open(picked())) }),
         el('button', { type: 'button', text: '閉じる', onclick: () => { ui.resume.hidden = true; } }),
       ]));
     ui.resume.hidden = false;
-    ui.resume.dataset.name = pick.name;
+    ui.resume.dataset.name = candidates[0].name;
+    setOpen(true, true);
+  }
+
+  // ---- 漫画エディタ自身の自動保存（ブラウザの中）に残っているデータ ----
+
+  function upstreamStore() {
+    return localforage.createInstance({ name: 'autoSaveStorage', storeName: 'projectAutoSave' });
+  }
+
+  async function readUpstreamOld() {
+    if (!has('localforage')) return null;
+    try {
+      const meta = await upstreamStore().getItem('metadata');
+      if (!meta || !meta.timestamp) return null;
+      return { timestamp: meta.timestamp, pages: Array.isArray(meta.pageOrder) ? meta.pageOrder.length : 0 };
+    } catch (e) { return null; }
+  }
+
+  function renderUpstreamNote() {
+    const mode = state.upstreamAuto.mode;
+    const text = mode === 'kept'
+      ? '漫画エディタ側の自動保存が有効です（inkdeus の自動保存と二重に保存され、開くたびに復元の確認が出ます）'
+      : mode === 'unavailable'
+        ? '漫画エディタ側の自動保存が有効です（この版では止められませんでした。inkdeus の自動保存と二重に保存されます）'
+        : '';
+    ui.upstreamNote.textContent = text;
+    ui.upstreamNote.hidden = !text;
+    if (mode === 'stopped') {
+      // 漫画エディタの設定欄の「自動保存」は働かない。そのことが分かるようにしておく
+      ['autoSaveCheckbox', 'autoSaveInterval'].forEach((id) => {
+        const node = document.getElementById(id);
+        if (node) { node.disabled = true; node.title = 'inkdeus 経由では、素材パネルの「自動保存」（プロジェクトの manga/autosave）を使います'; }
+      });
+    }
+  }
+
+  // 止める前に漫画エディタが残した自動保存があれば、初回だけ尋ねる（開く / 無視する / 消す）。勝手には消さない
+  async function offerUpstreamOld() {
+    const u = state.upstreamAuto;
+    renderUpstreamNote();
+    if (u.mode !== 'stopped') return;
+    u.old = await readUpstreamOld();
+    if (!u.old || store.get('upstreamOldSeen', 0) === u.old.timestamp) return;
+    const done = (seen) => { if (seen) store.set('upstreamOldSeen', u.old.timestamp); ui.upstreamOld.hidden = true; };
+    ui.upstreamOld.replaceChildren(
+      el('div', { text: '漫画エディタ側に、以前の自動保存が残っています'
+        + `（${formatTime(u.old.timestamp / 1000)}${u.old.pages ? `・${u.old.pages} ページ` : ''}）。`
+        + 'いまは inkdeus がプロジェクトへ自動保存するので、漫画エディタ側の自動保存は止めてあります' }),
+      el('div', { class: 'ikb-row' }, [
+        el('button', { type: 'button', class: 'ikb-primary', 'data-act': 'open', text: '開く',
+          title: '漫画エディタの復元の画面で、中身を確かめて開きます',
+          onclick: () => run(async () => {
+            ui.upstreamOld.hidden = true;
+            const recovered = await u.original.checkRecovery.call(AutoSaveManager);
+            if (recovered) { done(true); markDirtyNow(); say('漫画エディタ側の自動保存を開きました。残すには「プロジェクトに保存」を押してください'); }
+            else if (await readUpstreamOld()) ui.upstreamOld.hidden = false;      // 「あとで決める」。また尋ねる
+            else done(false);                                                     // 復元の画面で削除した
+          }) }),
+        el('button', { type: 'button', 'data-act': 'ignore', text: '無視する（次回から尋ねない）',
+          title: 'データは消さずに残します', onclick: () => done(true) }),
+        el('button', { type: 'button', 'data-act': 'delete', text: '消す',
+          onclick: () => run(async () => {
+            if (!(await confirmDanger('漫画エディタ側の自動保存を消す',
+              '漫画エディタ側（ブラウザの中）に残っている以前の自動保存を消します。元に戻せません。', '消す'))) return;
+            await u.original.clearAutoSave.call(AutoSaveManager);
+            u.old = null;
+            ui.upstreamOld.hidden = true;
+            say('漫画エディタ側の以前の自動保存を消しました');
+          }) }),
+      ]));
+    ui.upstreamOld.hidden = false;
     setOpen(true, true);
   }
 
@@ -1904,6 +2071,8 @@
     } catch (e) {
       fail(e, '保存済みの漫画データの一覧を読めません');
     }
+    tameUpstreamAutosave();                                    // （DOMContentLoaded で済んでいる。念のため）
+    await offerUpstreamOld().catch((e) => console.warn('[inkdeus]', e));
     await loadModules();
     return { ok: problems.length === 0 && complete, complete, features: Object.assign({}, state.features),
       missing: Object.assign({}, state.missing) };
@@ -1955,6 +2124,7 @@
       inkedFiles: Object.keys(state.inked.versions || {}),
       fonts: { names: state.fonts.list.map((x) => x.name), loaded: Array.from(state.fonts.loaded),
         failed: Array.from(state.fonts.failed.keys()), supported: state.fonts.supported },
+      upstreamAutosave: { mode: state.upstreamAuto.mode, old: state.upstreamAuto.old },
       autosave: { enabled: state.autosave.enabled, seconds: state.autosave.seconds,
         dirty: !!state.autosave.dirtySince, lastAt: state.autosave.lastAt, failed: state.autosave.failed,
         retryMs: state.autosave.retryMs },
@@ -1972,7 +2142,7 @@
     setAutosave(opts) {
       const o = opts || {};
       if (typeof o.enabled === 'boolean') { state.autosave.enabled = o.enabled; ui.autosave.checked = o.enabled; }
-      if (o.seconds >= 1) state.autosave.seconds = Number(o.seconds);
+      if (o.seconds >= 1) setAutosaveSeconds(Number(o.seconds));
       renderStatus();
     },
     // 書き出し

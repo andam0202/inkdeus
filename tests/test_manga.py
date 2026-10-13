@@ -296,6 +296,7 @@ def test_manga_project_roundtrip(tmp_path, images):
     assert set(rows) == {"第1話", "autosave"}
     assert rows["第1話"]["bytes"] == len(newer) and rows["第1話"]["autosave"] is False and rows["第1話"]["mtime"] > 0
     assert rows["autosave"]["autosave"] is True
+    assert rows["第1話"]["pages"] == 3 and rows["autosave"]["pages"] == 2              # ページ数（「前回の続き」に出す）
 
 
 def test_manga_project_rejects_bad_names_and_data(tmp_path, images):
