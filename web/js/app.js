@@ -8,6 +8,7 @@ import { createTools } from './tools.js';
 import { createStyleUI, customOf } from './styles.js';
 import { layerTarget, isTarget, unionRect } from './paint.js';
 import { createNotices, packTiles, choose } from './safety.js';
+import { MaskEdits, bitmapToMask, PERSON as MASK_PERSON } from './maskedit.js';
 import {
   SCHEMA, normalize, defaultParams, applyStyle, effectiveUnit, effectiveWatermark, STYLES,
   withoutIds, withoutParts, inheritIds, layerIds, regionLabel, isPartName,
@@ -44,6 +45,7 @@ const state = {
   paintOK: false,       // サーバが消しゴム・ペンを保存できるか（できなければメモリ上だけで働く）
   paintTilesOK: false,  // サーバが「変わったタイルだけの保存」に対応しているか（筆を置いた直後に送る）
   backupOK: false,      // サーバが世代バックアップ（以前の状態に戻す）に対応しているか
+  maskEditOK: false,    // サーバが部分マスク・人物マスクの手直しを保存できるか（できなければ、ツールを出さない）
   broken: null,         // 開いた画像の設定ファイルが壊れている（利用者が扱いを選ぶまで、保存しない）
   build: null,          // 読み込んだときのサーバのビルド識別（変わったら「再読み込みしてください」と知らせる）
   partsOK: true,        // 部分（髪・肌・服など）まわりの設定を保存できるか（知らない古いサーバへは、除いて保存する）
@@ -88,6 +90,8 @@ let renderPending = false;
 let drawPending = false;
 let lastRenderMs = 0;
 let renderSeq = 0;                      // 描画のたびに増える（書き出しの途中で絵が変わったことを知るため）
+let exporting = false;                  // 手動の書き出しの最中
+let maskView = null;                    // 部分マスクのツールを使っている間の表示 { target, lines }（使っていなければ null）
 
 // ---- 表示まわりの小物 ----
 
@@ -119,14 +123,17 @@ function setBusy(on) {
 // 「保存済み」「保存中…」「未保存の変更あり」「保存に失敗（再試行中）」。変更が無いときは、最後の出来事（「外部から更新」など）
 
 let cleanLabel = '';
-const saveFail = { params: false, paint: false, delay: RETRY_MIN_MS, timer: null, notified: false };
+const saveFail = { params: false, paint: false, mask: false, delay: RETRY_MIN_MS, timer: null, notified: false };
+const failing = () => saveFail.params || saveFail.paint || saveFail.mask;
 
 /** 保存の状態。state: none（保存先が無い）/ failed / saving / dirty / saved */
 function saveStatus() {
   if (!canAutoSave()) return { state: 'none', label: cleanLabel };
-  if (saveFail.params || saveFail.paint) return { state: 'failed', label: '保存に失敗（再試行中）' };
-  if (saving || paintSync.running || paintSync.sending > 0) return { state: 'saving', label: '保存中…' };
-  if (saveTimer || paintSync.timer) return { state: 'dirty', label: '未保存の変更あり' };
+  if (failing()) return { state: 'failed', label: '保存に失敗（再試行中）' };
+  if (saving || paintSync.running || paintSync.sending > 0 || maskSync.running || maskSync.sending > 0) {
+    return { state: 'saving', label: '保存中…' };
+  }
+  if (saveTimer || paintSync.timer || maskSync.timer) return { state: 'dirty', label: '未保存の変更あり' };
   return { state: 'saved', label: cleanLabel };
 }
 
@@ -170,7 +177,7 @@ function saveFailed(kind, text, error) {
 function saveRecovered(kind) {
   if (!saveFail[kind]) return;
   saveFail[kind] = false;
-  if (!saveFail.params && !saveFail.paint) {
+  if (!failing()) {
     clearTimeout(saveFail.timer);
     saveFail.timer = null;
     saveFail.delay = RETRY_MIN_MS;
@@ -181,13 +188,14 @@ function saveRecovered(kind) {
 
 function resetSaveFail() {
   clearTimeout(saveFail.timer);
-  Object.assign(saveFail, { params: false, paint: false, delay: RETRY_MIN_MS, timer: null, notified: false });
+  Object.assign(saveFail, { params: false, paint: false, mask: false, delay: RETRY_MIN_MS, timer: null, notified: false });
 }
 
 async function retrySaves() {
   saveFail.timer = null;
   if (saveFail.params) await saveNow();
   if (saveFail.paint) await savePaint();
+  if (saveFail.mask) await saveMask();
 }
 
 function stemOf(name) {
@@ -340,6 +348,12 @@ function noteDropped() {
   }
 }
 
+/** 画面に出す絵の「ソロ表示」。マスクの手直しで「線画だけ表示」のときは、線画だけを薄く出す（書き出しの間は使わない） */
+function viewSolo() {
+  if (state.solo) return state.solo;
+  return maskView && maskView.lines && !batch.running && !exporting ? { lines: true } : null;
+}
+
 function requestDraw() {
   if (drawPending) return;
   drawPending = true;
@@ -352,7 +366,7 @@ function renderNow() {
   let result = null;
   try {
     renderSeq += 1;
-    result = renderer.render(state.params, { solo: state.solo });
+    result = renderer.render(state.params, { solo: viewSolo() });
     lastRenderMs = result.ms;
     if (renderer.W) $('timing').textContent = `再描画 ${result.ms.toFixed(1)} ms`;
     noteDropped();
@@ -700,7 +714,11 @@ function stepHistory(delta) {
   if (next < 0 || next >= history.length || (tools && tools.stroking())) return;
   // 筆の記録は「その状態へ進むとき」の物。戻るときは今の状態の記録を、進むときは次の状態の記録を当てる
   const step = hsteps[delta < 0 ? hpos : next];
-  if (step) {
+  if (step && step.maskedit) {
+    const before = maskBefore(step.parts.map((part) => part.target));
+    maskEdits.swap(step);
+    afterMaskChange(step, before);
+  } else if (step) {
     const usedBefore = renderer.paint.has(step.target);
     const revBefore = renderer.paint.rev(step.target);
     renderer.paint.swap(step);
@@ -802,6 +820,7 @@ async function flushSave({ keepalive = false } = {}) {
     ok = await saveNow({ keepalive });
   }
   if (!(await flushPaint({ keepalive }))) ok = false;
+  if (!(await flushMask({ keepalive }))) ok = false;
   return ok;
 }
 
@@ -1064,6 +1083,7 @@ function selectLayer(region, id) {
 
 function beginStroke(target, brush) {
   if (!renderer || !renderer.W || batch.running) return false;
+  if (target.startsWith('mask:')) return beginMaskStroke(target.slice(5), brush);
   if (brush.mode === 'restore' && !renderer.paint.has(target)) return false;     // 消した所が無い（戻す物が無い）
   try {
     renderer.paint.beginStroke(target, brush);
@@ -1082,7 +1102,7 @@ function strokeRender() {
   strokeDirty = null;
   try {
     renderSeq += 1;
-    lastStrokeMs = renderer.render(state.params, { solo: state.solo, rect }).ms;
+    lastStrokeMs = renderer.render(state.params, { solo: viewSolo(), rect }).ms;
   } catch (e) {
     showMessage(`描画に失敗しました: ${e.message}`, 'error');
   }
@@ -1090,6 +1110,11 @@ function strokeRender() {
 }
 
 function stampStroke(x, y, radius) {
+  if (maskStroke) {
+    maskEdits.stamp(x, y, radius);
+    drawTrail(x, y, radius);
+    return;
+  }
   strokeDirty = unionRect(strokeDirty, renderer.paint.stamp(x, y, radius));
   if (strokePending || !strokeDirty) return;
   strokePending = true;
@@ -1100,6 +1125,10 @@ function stampStroke(x, y, radius) {
 
 /** 1筆を終える: 履歴に1件として積み、正規の合成をして、保存と自動書き出しを予約する */
 function endStroke() {
+  if (maskStroke) {
+    endMaskStroke();
+    return;
+  }
   const active = renderer.paint.stroke;
   const usedBefore = active ? renderer.paint.has(active.target) : false;
   const revBefore = active ? renderer.paint.rev(active.target) : 0;
@@ -1168,6 +1197,7 @@ function computeStats() {
   if (!renderer || !renderer.W) return null;
   const stats = renderer.stats(state.params, { solo: state.solo });
   stats.paint.targets = stats.paint.targets.filter(paintReferenced);
+  stats.maskEdits = maskEdits.targets();           // マスクの手直しのある対象（person / 部分名）
   return { name: state.name, version: state.version, rev: state.rev, renderMs: Math.round(lastRenderMs * 10) / 10, ...stats };
 }
 
@@ -1241,6 +1271,7 @@ function connectEvents() {
     else if (ev.type === 'exported') onExported(ev);
     else if (ev.type === 'versions') onVersions(ev).catch((e) => console.warn(e));
     else if (ev.type === 'paint') onPaintEvent(ev).catch((e) => console.warn(e));
+    else if (ev.type === 'maskedit') onMaskEvent(ev).catch((e) => console.warn(e));
     else if (ev.type === 'styles') { if (styleUI && ev.source !== CLIENT_ID) styleUI.refresh(); }   // 自分用スタイルが外で変わった
     else if (batch.running && (ev.type === 'open' || ev.type === 'export')) return;   // 一括書き出しの最中は受けない
     else if (ev.type === 'open') openByName(ev.name, ev.version, ev.folder).catch((e) => console.warn(e));
@@ -1556,6 +1587,9 @@ async function setImageBlob(blob, name, remote) {
   state.remote = remote;
   state.hasMask = false;
   state.parts = [];                    // 部分マスクは画像ごと（setImage が部分マップも捨てている）
+  maskEdits.reset(bitmap.width, bitmap.height);       // マスクの手直しも画像ごと
+  resetMaskSync();
+  maskApplied = false;
   state.highlight = null;
   state.lastExport = '';
   state.solo = null;
@@ -1645,6 +1679,7 @@ async function openIndex(i, version = '') {
         if (m.ok) await setMaskBlob(await m.blob());
       }
       await loadParts(item);
+      await loadMaskEdits(item);           // マスクの手直し（画像ごと。全バージョンで共通）を重ねる
       if (!['person', 'background', ...state.parts].includes(state.tab)) state.tab = 'person';
     }
     state.version = version;
@@ -1709,6 +1744,331 @@ async function openIndex(i, version = '') {
     if (gallery) gallery.setCurrent();
   }
   if (state.broken) askBroken();
+}
+
+// ---- 部分マスク・人物マスクの手直し（元のマスクに対する上書き。画像ごと・全バージョンで共通）----
+
+const maskEdits = new MaskEdits();
+const maskOrig = { key: null, loading: null, person: null, codes: null, names: [] };   // 元のマスクの画素（必要になったら読む）
+const maskSync = { timer: null, running: null, onServer: new Set(), saved: new Map(), sent: new Map(), sending: 0,
+  chain: Promise.resolve(), tileSaves: 0 };
+let maskStroke = null;                 // 手直しの筆の最中 { target, before }
+let maskChain = Promise.resolve();     // 手直しを描画へ反映する処理の列（順番を守る）
+let maskApplied = false;               // 手直しを合成したマスクを、描画に渡してあるか
+
+const maskEditPersistent = () => state.maskEditOK && canAutoSave();
+const maskURL = (name, target, folder, extra = '') => `api/maskedit/${encodeURIComponent(name)}`
+  + (target ? `/${encodeURIComponent(target)}` : '') + queryOf('', folder, extra);
+
+/** 手直しできる対象（その画像にマスクのある部分と、人物） */
+function maskTargetList() {
+  return [...state.parts.map((p) => ({ value: p, label: regionLabel(p) })), { value: MASK_PERSON, label: '人物' }];
+}
+
+function resetMaskSync() {
+  clearTimeout(maskSync.timer);
+  maskSync.timer = null;
+  maskSync.onServer.clear();
+  maskSync.saved.clear();
+  maskSync.sent.clear();
+}
+
+/** 元の人物マスクと部分マスクを、画素の並びとして読む（手直しを重ねるときに要る。画像ごとに 1 回） */
+function loadMaskOriginals() {
+  const item = currentItem();
+  const key = `${state.folder}|${state.name}`;
+  if (maskOrig.key === key && maskOrig.loading) return maskOrig.loading;
+  const { W, H } = renderer;
+  const names = state.parts.slice();
+  maskOrig.key = key;
+  maskOrig.loading = (async () => {
+    const read = async (url) => {
+      const r = await fetch(url, { cache: 'no-store' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const bitmap = await createImageBitmap(await r.blob(), BITMAP_OPTS);
+      try { return bitmapToMask(bitmap, W, H); } finally { bitmap.close(); }
+    };
+    const person = item && item.hasMask ? await read(apiPath('mask', state.name)) : null;
+    let codes = null;
+    for (let k = 0; k < names.length; k++) {
+      const part = await read(`api/part/${encodeURIComponent(state.name)}/${encodeURIComponent(names[k])}${queryOf()}`);
+      if (!codes) codes = new Uint8Array(W * H);
+      for (let i = 0; i < part.length; i++) if (part[i]) codes[i] = k + 1;     // 重なったら、並びの後ろの部分が勝つ
+    }
+    Object.assign(maskOrig, { person, codes, names });
+    return maskOrig;
+  })();
+  return maskOrig.loading;
+}
+
+/** 元のマスクに手直しを重ねた物を、描画に渡す（手直しが 1 つも無く、まだ渡してもいなければ何もしない） */
+async function applyMasks() {
+  if (!renderer || !renderer.W) return;
+  if (!maskApplied && !maskEdits.targets().length) return;
+  const name = state.name;
+  const orig = await loadMaskOriginals();
+  if (state.name !== name) return;
+  const { person, codes } = maskEdits.compose(orig.person, orig.codes, orig.names);
+  renderer.setMask(person ? { data: person, width: renderer.W, height: renderer.H } : null);
+  state.hasMask = renderer.hasMask;
+  renderer.setPartMap(codes, orig.names);
+  renderer.invalidate();
+  maskApplied = true;
+}
+
+/** 表示中の画像の手直しを読み込む（別の画像の物は引き継がない） */
+async function loadMaskEdits(item) {
+  maskEdits.reset(renderer.W, renderer.H);
+  resetMaskSync();
+  Object.assign(maskOrig, { key: null, loading: null, person: null, codes: null, names: [] });
+  maskApplied = false;
+  maskStroke = null;
+  if (!maskEditPersistent() || !item || !Array.isArray(item.maskEdits) || !item.maskEdits.length) return;
+  const name = item.name;
+  const folder = state.folder;
+  const list = await getJSON(maskURL(name, '', folder));
+  for (const row of (list && Array.isArray(list.targets) ? list.targets : [])) {
+    if (row.target !== MASK_PERSON && !state.parts.includes(row.target)) continue;
+    try {
+      const r = await fetch(maskURL(name, row.target, folder, `v=${row.stamp || 0}`), { cache: 'no-store' });
+      if (!r.ok) throw new Error(r.status === 422 ? '保存してある手直しが壊れています' : `HTTP ${r.status}`);
+      const bitmap = await createImageBitmap(await r.blob(), BITMAP_OPTS);
+      try {
+        maskSync.saved.set(row.target, maskEdits.load(row.target, bitmap));
+      } finally {
+        bitmap.close();
+      }
+      maskSync.onServer.add(row.target);
+    } catch (e) {
+      showMessage(`マスクの手直しを読み込めませんでした（${row.target}）: ${e.message}`, 'error');
+    }
+  }
+  await applyMasks();
+}
+
+/** 筆の跡（描いている最中の目印。離すと、手直しを重ねた絵に置き換わる） */
+function drawTrail(x, y, radius) {
+  const trail = $('strokeTrail');
+  const box = $('viewer').getBoundingClientRect();
+  if (trail.width !== Math.round(box.width) || trail.height !== Math.round(box.height)) {
+    trail.width = Math.round(box.width);
+    trail.height = Math.round(box.height);
+  }
+  trail.hidden = false;
+  const [cx, cy] = clientPoint(x, y);
+  const c = trail.getContext('2d');
+  c.fillStyle = maskStroke && maskStroke.mode === 'remove' ? 'rgba(70, 150, 255, 0.4)' : 'rgba(240, 138, 44, 0.4)';
+  c.beginPath();
+  c.arc(cx - box.left, cy - box.top, Math.max(1, (radius * state.view.zoom) / (window.devicePixelRatio || 1)), 0, Math.PI * 2);
+  c.fill();
+}
+
+function clearTrail() {
+  const trail = $('strokeTrail');
+  if (trail.hidden) return;
+  trail.getContext('2d').clearRect(0, 0, trail.width, trail.height);
+  trail.hidden = true;
+}
+
+/** 対象ごとの、いまの状態（[手直しがあるか, 版]）。タイルの保存が、サーバの絵と食い違わないかを確かめるのに使う */
+const maskBefore = (targets) => new Map(targets.map((t) => [t, [maskEdits.has(t), maskEdits.rev(t)]]));
+
+function beginMaskStroke(target, brush) {
+  if (!maskEditPersistent() || (target !== MASK_PERSON && !state.parts.includes(target))) return false;
+  const others = target === MASK_PERSON ? [] : state.parts.filter((p) => p !== target);
+  maskStroke = { target, mode: brush.mode, before: maskBefore([target, ...others]) };
+  maskEdits.begin(target, { mode: brush.mode, hardness: brush.hardness, others });
+  return true;
+}
+
+function endMaskStroke() {
+  const before = maskStroke.before;
+  maskStroke = null;
+  const step = maskEdits.end();
+  if (!step) {
+    clearTrail();
+    return;
+  }
+  pushHistory(JSON.stringify(state.params), step);
+  historyStash.clear();               // 手直しは全バージョンで共通。ほかのバージョンの取り消しの履歴は、もう当てはまらない
+  afterMaskChange(step, before);
+}
+
+/** 手直しが変わったあと: 変わった所をすぐ送り、描画へ反映し、保存と書き出しを予約する */
+function afterMaskChange(step, before) {
+  if (step) sendMaskTiles(step, before);
+  maskChain = maskChain.then(() => applyMasks()).catch((e) => showMessage(`マスクを反映できませんでした: ${e.message}`, 'error'))
+    .then(() => {
+      clearTrail();
+      const item = currentItem();
+      if (item) {
+        item.maskEdits = maskEdits.targets();
+        // 手直しは全バージョンの絵に効く。開いていないバージョンの白黒版も「古い」になる
+        verOf(item);
+        for (const v of item.versions) mark(item.name, v.name, { exportFresh: false });
+      }
+      rebuild();
+      renderNow();
+      touchMask();
+      touchAutoExport();
+    });
+}
+
+/** 対象の手直しを取り消す（target を省くと、この画像の手直しを全部）。取り消し Ctrl+Z で戻せる */
+function clearMask(target = null) {
+  if (!renderer || !renderer.W || batch.running || (tools && tools.stroking())) return false;
+  const step = maskEdits.clear(target ? [target] : null);
+  if (!step) return false;
+  pushHistory(JSON.stringify(state.params), step);
+  historyStash.clear();
+  afterMaskChange(null, null);        // 消した対象は、全体の保存（削除）で片付ける
+  return true;
+}
+
+/** 1 筆（または取り消し・やり直し）で変わったタイルだけを、いますぐサーバへ送る（消しゴム・ペンと同じ方式） */
+function sendMaskTiles(step, before) {
+  if (!state.paintTilesOK || !maskEditPersistent()) return;
+  const name = state.name;
+  const folder = state.folder;
+  const here = () => state.remote && state.name === name && state.folder === folder;
+  for (const part of step.parts) {
+    const target = part.target;
+    const [usedBefore, revBefore] = before.get(target) || [true, -1];
+    const known = maskSync.sent.has(target) ? maskSync.sent.get(target)
+      : (maskSync.onServer.has(target) ? maskSync.saved.get(target) : (usedBefore ? null : revBefore));
+    if (known !== revBefore) continue;                   // サーバの絵が直前の状態と違うかもしれない。全体の保存に任せる
+    const rev = maskEdits.rev(target);
+    const body = packTiles(maskEdits.mw, maskEdits.mh, 1,
+      part.tiles.map((t) => ({ x: t.x, y: t.y, w: t.w, h: t.h, data: maskEdits.readTile(target, t) })));
+    maskSync.sent.set(target, rev);
+    maskSync.sending += 1;
+    const request = fetch(maskURL(name, target, folder), {
+      method: 'PATCH', body, headers: { 'X-Inkdeus-Client': CLIENT_ID, 'Content-Type': 'application/octet-stream' },
+      keepalive: body.length <= KEEPALIVE_MAX,
+    });
+    request.catch(() => {});
+    maskSync.chain = maskSync.chain.then(async () => {
+      try {
+        const r = await request;
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const j = await r.json();
+        if (!here()) return;
+        maskSync.saved.set(target, rev);
+        if (j.deleted) maskSync.onServer.delete(target); else maskSync.onServer.add(target);
+        maskSync.tileSaves += 1;
+      } catch (e) {
+        if (here()) { maskSync.sent.delete(target); touchMask(); }
+      } finally {
+        maskSync.sending -= 1;
+        refreshSaveState();
+      }
+    });
+  }
+  refreshSaveState();
+}
+
+function touchMask() {
+  if (!maskEditPersistent()) return;
+  clearTimeout(maskSync.timer);
+  maskSync.timer = setTimeout(() => { maskSync.timer = null; saveMask(); }, PAINT_SAVE_DELAY_MS);
+  refreshSaveState();
+}
+
+/** 変わった対象を保存し、手直しの無くなった対象をサーバからも消す */
+function saveMask({ keepalive = false } = {}) {
+  if (!maskEditPersistent()) return Promise.resolve();
+  if (maskSync.running) return maskSync.running.then(() => saveMask({ keepalive }));
+  const name = state.name;
+  const folder = state.folder;
+  const here = () => state.remote && state.name === name && state.folder === folder;
+  const headers = { 'X-Inkdeus-Client': CLIENT_ID };
+  maskSync.running = (async () => {
+    try {
+      await maskSync.chain;
+      for (const target of new Set([...maskEdits.info.keys(), ...maskSync.onServer])) {
+        if (!here()) return;
+        if (maskEdits.has(target)) {
+          if (maskSync.onServer.has(target) && maskSync.saved.get(target) === maskEdits.rev(target)) continue;
+          const made = await maskEdits.encode(target);
+          if (!here()) return;
+          if (made && made.stale) { touchMask(); continue; }
+          if (made) {
+            const r = await fetch(maskURL(name, target, folder), { method: 'PUT', body: made.blob,
+              headers: { ...headers, 'Content-Type': 'image/png' }, keepalive: keepalive && made.blob.size <= KEEPALIVE_MAX });
+            if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: r.status });
+            maskSync.saved.set(target, made.rev);
+            maskSync.sent.delete(target);
+            maskSync.onServer.add(target);
+            continue;
+          }
+        }
+        if (maskSync.onServer.has(target)) {
+          const r = await fetch(maskURL(name, target, folder), { method: 'DELETE', headers, keepalive });
+          if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: r.status });
+          maskSync.onServer.delete(target);
+          maskSync.saved.delete(target);
+          maskSync.sent.delete(target);
+        }
+      }
+      if (here()) saveRecovered('mask');
+      if (!saveTimer && !paintSync.timer && !maskSync.timer && here()) setSaveState('保存済み');
+    } catch (e) {
+      if (here()) saveFailed('mask', 'マスクの手直しを保存できませんでした', e);
+    } finally {
+      maskSync.running = null;
+      refreshSaveState();
+    }
+  })();
+  refreshSaveState();
+  return maskSync.running;
+}
+
+async function flushMask({ keepalive = false } = {}) {
+  await maskChain;
+  if (maskSync.timer || saveFail.mask) {
+    clearTimeout(maskSync.timer);
+    maskSync.timer = null;
+    await saveMask({ keepalive });
+  }
+  if (maskSync.running) await maskSync.running;
+  await maskSync.chain;
+  return !saveFail.mask;
+}
+
+/** どこかで（別のタブ・コマンド・復元）手直しが変わった。開いている画像の物なら読み直す */
+async function onMaskEvent(ev) {
+  if (folderOf(ev) !== state.folder || ev.source === CLIENT_ID) return;
+  const item = state.images.find((i) => i.name === ev.name);
+  if (item) {
+    verOf(item);
+    for (const v of item.versions) mark(item.name, v.name, { exportFresh: false });
+  }
+  if (!state.remote || ev.name !== state.name || batch.running) return;
+  if (tools) tools.pointerUp();
+  await flushMask().catch(() => {});
+  await refreshImages();
+  await loadMaskEdits(currentItem());
+  if (!maskEdits.targets().length) {             // 全部取り消された: 元のマスクへ戻す
+    maskApplied = true;
+    await applyMasks();
+  }
+  resetHistory();
+  rebuild();
+  renderNow();
+  touchAutoExport();
+  showMessage('マスクの手直しが外部から変更されました（取り消しの履歴は消えます）');
+}
+
+/** 部分マスクのツールを使っている間の表示（対象の領域を色つきで重ねる・線画だけ表示）。使い終えたら null */
+function setMaskView(view) {
+  const next = view ? { target: view.target, lines: !!view.lines } : null;
+  const changed = JSON.stringify(next) !== JSON.stringify(maskView);
+  const linesChanged = !!(next && next.lines) !== !!(maskView && maskView.lines);
+  maskView = next;
+  // ツールを使っている間は、対象の領域を色つきで重ねたままにする（画像を替えた・ほかの強調表示を離した、のあとも）
+  if (next && state.highlight !== next.target) setHighlight(next.target);
+  else if (!next && changed) setHighlight(null);
+  if (linesChanged) requestRender();
 }
 
 // ---- 壊れた設定ファイル（上書きせず、利用者に選んでもらう）----
@@ -1837,7 +2197,7 @@ function onHello(ev) {
     // サーバが起動し直された。開いている画像を伝え直し、保存に失敗していた分があればすぐ試す
     state.build = { ...state.build, boot: build.boot };
     postState();
-    if (saveFail.params || saveFail.paint) { clearTimeout(saveFail.timer); retrySaves(); }
+    if (failing()) { clearTimeout(saveFail.timer); retrySaves(); }
   }
   if (build.id !== state.build.id) {
     notices.show('reload', 'inkdeus が更新されました。再読み込みしてください', {
@@ -1975,6 +2335,7 @@ async function exportNow() {
   }
   setBusy(true);
   await new Promise((resolve) => setTimeout(resolve, 0));
+  exporting = true;                           // 「線画だけ表示」のまま書き出さない
   try {
     state.solo = null;                          // ソロ表示のまま書き出さない
     let blob = null;
@@ -2006,7 +2367,9 @@ async function exportNow() {
     showMessage(`書き出しに失敗しました: ${e.message}`, 'error');
     throw e;
   } finally {
+    exporting = false;
     setBusy(false);
+    if (maskView && maskView.lines) requestRender();
   }
 }
 
@@ -2050,7 +2413,7 @@ function runAutoExport() {
     autoExport.again = true;                    // 書き出し中に来た変更は、終わってから1回だけやり直す（溜めない）
     return autoExport.running;
   }
-  if (state.solo || renderPending || (tools && tools.stroking())) {
+  if (state.solo || viewSolo() || renderPending || (tools && tools.stroking())) {
     // ソロ表示の間は書き出さない（その層だけの絵になってしまう）。戻るのを待つ（筆の最中も待つ）
     autoExport.timer = setTimeout(runAutoExport, 500);
     return Promise.resolve();
@@ -2302,6 +2665,7 @@ async function init() {
   state.paintOK = features.includes('paint');
   state.paintTilesOK = features.includes('paintTiles');
   state.backupOK = features.includes('backup') && !(config.backup && config.backup.enabled === false);
+  state.maskEditOK = features.includes('maskEdit');
   checkBuild(state.server && config ? config.build : null);
   showMissing(config && config.missingFolders);
   // 部分（regions.<部分名>）と solid.lineKnockout。サーバなしのときは、画面だけで使える（部分マスクはサーバから読む）
@@ -2338,6 +2702,13 @@ async function init() {
     usedTargets: () => paintTargets(),
     persistent: () => paintPersistent(),
     beginStroke, stamp: stampStroke, endStroke, clearTarget,
+    // 部分マスク・人物マスクの手直し
+    maskOK: () => maskEditPersistent() && !!renderer && renderer.W > 0,
+    maskTargets: () => maskTargetList(),
+    maskDefault: () => (state.parts.includes(state.tab) ? state.tab : null),
+    maskUsed: () => maskEdits.targets(),
+    clearMask: (target) => clearMask(target),
+    maskView: (view) => setMaskView(view),
     message: (text, kind) => showMessage(text, kind),
   });
   wireViewer();
@@ -2477,9 +2848,30 @@ const hooks = {
       return true;
     },
   },
+  // 部分マスク・人物マスクの手直し
+  maskedit: {
+    ok: () => maskEditPersistent(),
+    state: () => ({ targets: maskEdits.targets(), size: [maskEdits.mw, maskEdits.mh], view: maskView,
+      onServer: [...maskSync.onServer].sort(), tileSaves: maskSync.tileSaves,
+      saving: !!maskSync.timer || !!maskSync.running || maskSync.sending > 0 }),
+    setTarget: (target) => tools.setMaskTarget(target),
+    setMode: (mode) => tools.setMaskMode(mode),
+    setLines: (on) => tools.setMaskLines(on),
+    /** 筆を1本、座標の並び [[x, y, 半径(画像px)], …] で直接描く（履歴・保存は画面の操作と同じ道を通る） */
+    stroke: async (target, mode, points, hardness = 1) => {
+      if (!beginStroke(`mask:${target}`, { mode, hardness })) return false;
+      for (const [x, y, r] of points) stampStroke(x, y, r);
+      endStroke();
+      await maskChain;
+      return true;
+    },
+    clear: async (target = null) => { const done = clearMask(target); await maskChain; return done; },
+    settle: () => maskChain,
+    flush: () => flushMask(),
+  },
   save: async () => { clearTimeout(saveTimer); saveTimer = null; await saveNow(); },
   /** 保存の状態（state: none / failed / saving / dirty / saved と、ヘッダに出している文言） */
-  saveStatus: () => ({ ...saveStatus(), unsaved: hasUnsaved(), failing: saveFail.params || saveFail.paint,
+  saveStatus: () => ({ ...saveStatus(), unsaved: hasUnsaved(), failing: failing(),
     retryMs: saveFail.delay, tileSaves: paintSync.tileSaves, tiles: state.paintTilesOK }),
   flushSave: (opts) => flushSave(opts || {}),
   /** 以前の状態に戻す（世代バックアップ） */

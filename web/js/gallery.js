@@ -34,6 +34,9 @@ function badgesOf(item) {
   if (item.hasExport && item.exportFresh) out.push(['fresh', '書出', '書き出し済み（白黒版は最新）']);
   else if (item.hasExport) out.push(['stale', '古い', '書き出しが古い（白黒版が、設定・元画像・マスクより古い）']);
   if (!item.hasMask) out.push(['nomask', 'マスク無', 'マスクなし（人物マスクが無い画像）']);
+  if (Array.isArray(item.maskEdits) && item.maskEdits.length) {
+    out.push(['maskedit', 'マスク直', 'マスク手直しあり（部分マスク・人物マスクに、画面で手を入れてある）']);
+  }
   if (Array.isArray(item.parts) && item.parts.length) {
     out.push(['parts', '部分', `部分マスクあり（${item.parts.join('・')}）`]);
   }

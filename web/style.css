@@ -241,3 +241,6 @@ dialog.chooser h3 { margin: 0; font-size: 15px; }
 /* 保存の状態の文言が変わっても、ヘッダの高さ（＝プレビューの位置）が動かないようにする */
 #saveState, #exportState { flex: none; white-space: nowrap; }
 #saveState { min-width: 11.5em; text-align: right; }
+
+/* 部分マスクの手直し: 描いている最中の筆の跡 */
+#strokeTrail { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }

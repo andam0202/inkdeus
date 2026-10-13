@@ -60,7 +60,7 @@ PAINT_ALL = "all-targets"                              # 削除でだけ使え�
 MAX_PAINT_BYTES = 1 << 28
 # 画面が、サーバにある機能を確かめるための名前
 FEATURES = ["layerIds", "paint", "parts", "userStyles", "mangaPdf", "mangaCommand",
-            "backup", "build", "paintTiles"]
+            "backup", "build", "paintTiles", "maskEdit"]
 log = logging.getLogger("inkdeus")
 MANGA_COMMANDS = ("pdf", "pdf-abort", "layout")       # 漫画の構成の画面へ出せる指示
 MANGA_RESULT_KEEP = 32                                 # 覚えておく指示の結果の数

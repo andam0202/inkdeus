@@ -198,7 +198,14 @@ export class Renderer {
     if (!source || !this.W) return;
     const mask = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, mask);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    if (source.data instanceof Uint8Array) {
+      // 画素の並び（1 バイト/画素。手直しを合成した人物マスク）をそのまま渡す
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, source.width, source.height, 0, gl.RED, gl.UNSIGNED_BYTE, source.data);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    } else {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    }
     for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
       [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) {
       gl.texParameteri(gl.TEXTURE_2D, k, v);
@@ -242,6 +249,28 @@ export class Renderer {
     this.drop('partMap');
     this.parts = [];
     for (const { name, source } of list || []) this.addPart(name, source);
+  }
+
+  /**
+   * 部分マップを、画素の並び（1 バイト/画素。0 = どの部分でもない、1〜 = names の番号）からそのまま作る
+   * （手直しを合成した結果を渡すための物。画像と同じ大きさであること）
+   */
+  setPartMap(codes, names) {
+    const gl = this.gl;
+    this.drop('partMap');
+    this.parts = [];
+    if (!this.W || !codes || !names || !names.length) return;
+    const map = this.work('partMap', gl.R8);
+    gl.bindTexture(gl.TEXTURE_2D, map);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.W, this.H, gl.RED, gl.UNSIGNED_BYTE, codes);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    this.parts = names.slice(0, MAX_PARTS);
+  }
+
+  /** マスク・部分マップを入れ替えたあと、それに依る中間結果を作り直させる */
+  invalidate() {
+    this.keys = {};
   }
 
   /** 部分マスクを 1 つ、部分マップへ足す（1 枚ずつ読んで足せるように。足せたら true） */
@@ -418,8 +447,10 @@ export class Renderer {
     const regions = effectiveRegions(params, this.hasMask, this.parts);
     const bg = params.regions.background;
     const soloing = !!solo;
+    // solo.lines: 線画だけを薄く表示する（マスクの手直しのとき、領域の色分けを見やすくするため）
+    const linesOnly = soloing && solo.lines === true;
     const mode = soloing ? 0 : { keep: 0, white: 1, lines: 2 }[regions.mode] || 0;
-    const lineStrength = params.lines.enabled && !soloing ? params.lines.strength : 0;
+    const lineStrength = linesOnly ? 0.45 : (params.lines.enabled && !soloing ? params.lines.strength : 0);
 
     // 領域の並び: 0 = 人物、1 = 背景、2〜 = 別の設定にした部分（linked の部分は、人物の領域で描く）
     const makeSet = (name, reg, r) => {

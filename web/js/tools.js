@@ -1,4 +1,4 @@
-// プレビューの上のツールバー（手のひら / 消しゴム / ペン）と、プレビュー上での筆の操作。
+// プレビューの上のツールバー（手のひら / 消しゴム / ペン / 部分マスク）と、プレビュー上での筆の操作。
 // 描く物そのもの（GPU 上のマスクとペンの絵）は paint.js、履歴・保存とのつなぎは app.js が受け持つ。
 
 import { el } from './panel.js';
@@ -11,6 +11,8 @@ const RANGES = {
   eraser: { size: { min: 1, max: 500, step: 1, def: 40 }, hardness: { min: 0, max: 1, step: 0.05, def: 0.8 },
     strength: { min: 0.05, max: 1, step: 0.05, def: 1 } },
   pen: { size: { min: 0.5, max: 100, step: 0.5, def: 3 }, hardness: { min: 0, max: 1, step: 0.05, def: 1 } },
+  // 部分マスクの手直し（部分・人物の領域を塗って直す）
+  mask: { size: { min: 1, max: 500, step: 1, def: 40 }, hardness: { min: 0, max: 1, step: 0.05, def: 1 } },
 };
 const ERASE_TARGETS = [['layer', '選択中の層'], ['solid', 'ベタ'], ['lines', '線画'], ['all', 'すべて']];
 
@@ -23,10 +25,11 @@ function loadSettings() {
   const s = {
     eraser: { size: RANGES.eraser.size.def, hardness: RANGES.eraser.hardness.def, strength: RANGES.eraser.strength.def },
     pen: { size: RANGES.pen.size.def, hardness: RANGES.pen.hardness.def, pressure: true },
+    mask: { size: RANGES.mask.size.def, hardness: RANGES.mask.hardness.def },
   };
   try {
     const saved = JSON.parse(localStorage.getItem(KEY) || '{}') || {};
-    for (const tool of ['eraser', 'pen']) {
+    for (const tool of ['eraser', 'pen', 'mask']) {
       for (const [k, r] of Object.entries(RANGES[tool])) {
         const v = saved[tool] && saved[tool][k];
         if (typeof v === 'number' && Number.isFinite(v)) s[tool][k] = snap(v, r);
@@ -45,7 +48,10 @@ function loadSettings() {
 export function createTools(root, cursor, host) {
   const settings = loadSettings();
   const view = {
-    tool: 'hand',                    // 'hand' | 'eraser' | 'pen'
+    tool: 'hand',                    // 'hand' | 'eraser' | 'pen' | 'mask'
+    maskTarget: null,                // 手直しする対象（'person' または部分名）
+    maskMode: 'add',                 // 'add'（その対象に加える）| 'remove'（その対象から外す）
+    maskLines: false,                // 線画だけを薄く表示する（領域の色分けを見やすくする）
     eraseTarget: 'layer',
     eraseMode: 'erase',              // 'erase' | 'restore'
     penColor: 'black',               // 'black' | 'white'
@@ -132,6 +138,36 @@ export function createTools(root, cursor, host) {
     el('label', { class: 'check', title: 'ペンタブレットの筆圧で太さを変える（筆圧の無いマウスは一定）' }, pressure, '筆圧で太さ'),
     penClear);
 
+  // ---- 部分マスク（部分・人物の領域の手直し）----
+  const maskSel = el('select', { id: 'maskTarget', title: '手直しする対象（部分、または人物）' });
+  maskSel.addEventListener('change', () => {
+    view.maskTarget = maskSel.value;
+    maskSel.blur();
+    refresh();
+  });
+  const maskAdd = el('button', { type: 'button', id: 'maskModeAdd', title: 'その対象に加える（塗る） (X で切り替え)',
+    onclick: () => { view.maskMode = 'add'; refresh(); } }, '塗る');
+  const maskRemove = el('button', { type: 'button', id: 'maskModeRemove', title: 'その対象から外す（消す） (X で切り替え)',
+    onclick: () => { view.maskMode = 'remove'; refresh(); } }, '消す');
+  const maskLines = el('input', { type: 'checkbox', id: 'maskLines' });
+  maskLines.addEventListener('change', () => { view.maskLines = maskLines.checked; refresh(); });
+  const maskClear = el('button', { type: 'button', id: 'maskClear', title: 'この対象の手直しを取り消す（取り消し Ctrl+Z で戻せます）',
+    onclick: () => { host.clearMask(view.maskTarget); refresh(); } }, 'この対象の手直しを取り消す');
+  const maskClearAll = el('button', { type: 'button', id: 'maskClearAll',
+    title: 'この画像の手直しを全部取り消す（取り消し Ctrl+Z で戻せます）',
+    onclick: () => { host.clearMask(null); refresh(); } }, '全部取り消す');
+  const maskBox = el('span', { class: 'tool-opts', id: 'maskOpts', hidden: true },
+    maskSel,
+    el('span', { class: 'tool-group', role: 'group', 'aria-label': 'モード' }, maskAdd, maskRemove),
+    slider('mask', 'size', '太さ', '筆の太さ（基準px）。[ ] で変える'),
+    slider('mask', 'hardness', '硬さ', '1 で縁がくっきり、下げるほど縁がなだらか'),
+    el('label', { class: 'check', title: 'トーンとベタを隠して線画だけを薄く残し、領域の色分けを見やすくする（書き出しには影響しません）' },
+      maskLines, '線画だけ表示'),
+    maskClear, maskClearAll);
+  const maskMark = el('span', { id: 'maskMark', class: 'tool-mark', hidden: true,
+    title: 'この画像には、マスクの手直しがあります（全バージョンで共通）' }, 'マスク手直しあり');
+  let maskKey = '';
+
   const penMark = el('span', { id: 'penMark', class: 'tool-mark', hidden: true, title: 'この絵にはペンで描いた物があります' }, 'ペンあり');
   const eraseMark = el('span', { id: 'eraseMark', class: 'tool-mark', hidden: true, title: 'この絵には消しゴムで消した所があります' }, '消しあり');
   const note = el('span', { id: 'paintNote', class: 'tool-note warn', hidden: true,
@@ -141,8 +177,9 @@ export function createTools(root, cursor, host) {
     el('span', { class: 'tool-group', role: 'group', 'aria-label': 'ツール' },
       toolButton('hand', '手のひら', '移動 (H)。ホイールで拡大縮小'),
       toolButton('eraser', '消しゴム', '消しゴム (E)。移動はスペースを押しながらドラッグ、または中ボタン'),
-      toolButton('pen', 'ペン', 'ペン (B)。移動はスペースを押しながらドラッグ、または中ボタン')),
-    eraserBox, penBox, eraseMark, penMark, note);
+      toolButton('pen', 'ペン', 'ペン (B)。移動はスペースを押しながらドラッグ、または中ボタン'),
+      toolButton('mask', '部分マスク', '部分マスク・人物マスクの手直し (M)。部分や人物の領域を、塗って直す')),
+    eraserBox, penBox, maskBox, eraseMark, penMark, maskMark, note);
 
   // ---- 状態の表示 ----
 
@@ -153,6 +190,31 @@ export function createTools(root, cursor, host) {
     }
     eraserBox.hidden = view.tool !== 'eraser';
     penBox.hidden = view.tool !== 'pen';
+    // 部分マスクの手直し（サーバが対応していないとき・サーバなしのときは、ツールごと出さない）
+    const maskOK = host.maskOK();
+    toolButtons.mask.hidden = !maskOK;
+    if (!maskOK && view.tool === 'mask') view.tool = 'hand';
+    maskBox.hidden = view.tool !== 'mask';
+    const targets = maskOK ? host.maskTargets() : [];
+    const key = targets.map((t) => `${t.value}=${t.label}`).join('|');
+    if (key !== maskKey) {
+      maskKey = key;
+      maskSel.replaceChildren(...targets.map((t) => el('option', { value: t.value }, t.label)));
+    }
+    if (!targets.some((t) => t.value === view.maskTarget)) {
+      view.maskTarget = targets.length ? (host.maskDefault() || targets[0].value) : null;
+    }
+    if (view.maskTarget) maskSel.value = view.maskTarget;
+    maskAdd.classList.toggle('on', view.maskMode === 'add');
+    maskRemove.classList.toggle('on', view.maskMode === 'remove');
+    maskAdd.textContent = view.maskTarget === 'person' ? '人物に加える' : '塗る';
+    maskRemove.textContent = view.maskTarget === 'person' ? '人物から外す' : '消す';
+    maskLines.checked = view.maskLines;
+    const edited = maskOK ? host.maskUsed() : [];
+    maskClear.disabled = !edited.includes(view.maskTarget);
+    maskClearAll.disabled = !edited.length;
+    maskMark.hidden = !edited.length;
+    host.maskView(view.tool === 'mask' && view.maskTarget ? { target: view.maskTarget, lines: view.maskLines } : null);
     targetSel.value = view.eraseTarget;
     modeErase.classList.toggle('on', view.eraseMode === 'erase');
     modeRestore.classList.toggle('on', view.eraseMode === 'restore');
@@ -175,7 +237,11 @@ export function createTools(root, cursor, host) {
   const active = () => view.tool !== 'hand' && !view.space;
 
   function setTool(tool) {
-    if (!['hand', 'eraser', 'pen'].includes(tool) || view.stroking) return;
+    if (!['hand', 'eraser', 'pen', 'mask'].includes(tool) || view.stroking) return;
+    if (tool === 'mask') {
+      if (!host.maskOK()) return;
+      view.maskTarget = host.maskDefault() || view.maskTarget;      // 開いているタブの部分を既定にする
+    }
     view.tool = tool;
     refresh();
   }
@@ -183,6 +249,7 @@ export function createTools(root, cursor, host) {
   function toggleMode() {
     if (view.tool === 'eraser') view.eraseMode = view.eraseMode === 'erase' ? 'restore' : 'erase';
     else if (view.tool === 'pen') view.penColor = view.penColor === 'black' ? 'white' : 'black';
+    else if (view.tool === 'mask') view.maskMode = view.maskMode === 'add' ? 'remove' : 'add';
     else return false;
     refresh();
     return true;
@@ -204,7 +271,7 @@ export function createTools(root, cursor, host) {
 
   // ---- 筆の大きさを示す円 ----
 
-  const sizeOf = () => (view.tool === 'pen' ? settings.pen.size : settings.eraser.size);
+  const sizeOf = () => (settings[view.tool] || settings.eraser).size;
 
   function placeCursor() {
     const show = active() && view.pointer && host.hasImage() && !host.locked();
@@ -243,6 +310,10 @@ export function createTools(root, cursor, host) {
       }
       target = found.target;
       brush = { mode: view.eraseMode, hardness: settings.eraser.hardness, strength: settings.eraser.strength };
+    } else if (view.tool === 'mask') {
+      if (!view.maskTarget) return true;
+      target = `mask:${view.maskTarget}`;
+      brush = { mode: view.maskMode, hardness: settings.mask.hardness };
     }
     if (!host.beginStroke(target, brush)) return true;
     view.stroking = true;
@@ -286,6 +357,7 @@ export function createTools(root, cursor, host) {
     if (k === 'e') setTool('eraser');
     else if (k === 'b') setTool('pen');
     else if (k === 'h') setTool('hand');
+    else if (k === 'm') { if (!host.maskOK()) return false; setTool('mask'); }
     else if (k === 'x') return toggleMode();
     else if (k === '[' || k === ']') return resize(k === ']' ? 1 : -1);    // 手のひらのときは false（前後の画像）
     else return false;
@@ -308,9 +380,13 @@ export function createTools(root, cursor, host) {
     tool: () => view.tool,
     stroking: () => view.stroking,
     setEraseTarget: (kind) => { if (ERASE_TARGETS.some(([k]) => k === kind)) { view.eraseTarget = kind; refresh(); } },
+    setMaskTarget: (target) => { view.maskTarget = target; refresh(); return view.maskTarget; },
+    setMaskMode: (mode) => { if (mode === 'add' || mode === 'remove') { view.maskMode = mode; refresh(); } },
+    setMaskLines: (on) => { view.maskLines = !!on; refresh(); },
     state: () => ({ tool: view.tool, eraseTarget: view.eraseTarget, eraseMode: view.eraseMode, penColor: view.penColor,
-      space: view.space, stroking: view.stroking,
-      eraser: { ...settings.eraser }, pen: { ...settings.pen } }),
+      space: view.space, stroking: view.stroking, maskTarget: view.maskTarget, maskMode: view.maskMode,
+      maskLines: view.maskLines,
+      eraser: { ...settings.eraser }, pen: { ...settings.pen }, mask: { ...settings.mask } }),
     /** 太さ・硬さ・強さを直接決める（テスト・自動化用） */
     set: (tool, values) => {
       for (const [k, v] of Object.entries(values || {})) {
