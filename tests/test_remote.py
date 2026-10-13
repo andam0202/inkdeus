@@ -104,6 +104,7 @@ def test_external_file_edit_is_hot_reloaded(live):
     page.evaluate("() => window.inkdeus.render()")
     assert (pixels(page) == before).all()
     # 壊れた JSON を書かれても落ちない（メッセージを出して今の設定のまま）
+    settle(page)            # 取り消しの分の保存を済ませておく（あとから保存が走ると、壊れたファイルが見張りに見つかる前に置き換わる）
     path.write_text("{ broken", encoding="utf-8")
     page.locator("#messages .msg.error").first.wait_for(timeout=15000)
     assert (pixels(page) == before).all()
