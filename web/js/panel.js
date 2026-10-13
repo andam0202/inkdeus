@@ -380,7 +380,7 @@ function watermarkSection(ctx) {
 
 function outputSection(ctx) {
   const { params, lastExport, server, remote, images, autoExport, batchForce, batchDefaultOnly, versionsOK,
-    batchAllFolders, folders, lastBatch } = ctx.state;
+    batchAllFolders, folders, lastBatch, backupOK, broken } = ctx.state;
   const allFolders = el('input', { type: 'checkbox', id: 'chkExportAllFolders' });
   allFolders.checked = !!batchAllFolders;
   allFolders.addEventListener('change', () => ctx.setBatchAllFolders(allFolders.checked));
@@ -412,6 +412,10 @@ function outputSection(ctx) {
     el('div', { class: 'buttons' },
       el('button', { id: 'btnSaveJSON', onclick: () => ctx.saveJSON() }, '設定を保存 (JSON)'),
       el('button', { id: 'btnOpenJSON', onclick: () => ctx.openJSON() }, '設定を開く')),
+    server && remote && backupOK && !broken && el('div', { class: 'buttons' },
+      el('button', { id: 'btnRestore', onclick: () => ctx.restore(),
+        title: 'この画像・バージョンの設定と消しゴム・ペンを、保存のたびに残している前の版から選んで戻します（戻したあとで取り消せます）' },
+      '以前の状態に戻す…')),
     el('div', { class: 'note' }, server
       ? '設定は変更のたびに画像ごとに自動保存されます。設定ファイルを外から書き換えると、この画面にも反映されます。'
       : 'サーバなしで動作中です。設定は JSON で保存・読み込みしてください。'),

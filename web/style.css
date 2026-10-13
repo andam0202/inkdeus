@@ -210,3 +210,34 @@ body.batching #toolbar { pointer-events: none; opacity: 0.55; }
 .style-row-name { font-weight: 700; }
 .style-origin { font-size: 11px; border: 1px solid var(--line); border-radius: 3px; padding: 0 5px; color: #9ec5ff; }
 .style-origin[data-origin="project"] { color: #a8d8a0; }
+
+/* 知らせの帯（更新・サーバの再起動・見つからない元画像の場所・壊れた設定ファイル） */
+#notices { flex: none; display: flex; flex-direction: column; }
+.notice {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; padding: 6px 12px;
+  background: #5a4410; color: #fff3d6; border-bottom: 1px solid #8a6a1c; font-weight: 600;
+}
+.notice.error { background: #5c1f22; color: #ffe1e1; border-bottom-color: #8f3237; }
+.notice-detail { font-weight: 400; opacity: 0.9; }
+.notice-action { margin-left: auto; background: rgba(255, 255, 255, 0.14); border-color: rgba(255, 255, 255, 0.4); }
+#saveState[data-state="failed"] { color: #ff8589; font-weight: 700; }
+#saveState[data-state="dirty"], #saveState[data-state="saving"] { color: var(--accent); }
+.msg-action { margin-left: 8px; pointer-events: auto; }
+
+/* 選ぶダイアログ（以前の状態に戻す・壊れた設定ファイルの扱い） */
+dialog.chooser {
+  background: var(--bg2); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px;
+  width: min(560px, 92vw); max-height: 80vh; display: flex; flex-direction: column; gap: 8px;
+}
+dialog.chooser:not([open]) { display: none; }
+dialog.chooser::backdrop { background: rgba(0, 0, 0, 0.55); }
+dialog.chooser h3 { margin: 0; font-size: 15px; }
+.chooser-message, .chooser-empty { margin: 0; white-space: pre-wrap; color: var(--dim); }
+.chooser-list { display: flex; flex-direction: column; gap: 3px; overflow: auto; min-height: 0; }
+.chooser-row { display: flex; gap: 12px; text-align: left; padding: 5px 9px; }
+.chooser-label { flex: none; font-variant-numeric: tabular-nums; }
+.chooser-note { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chooser-buttons { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; margin-top: 4px; }
+/* 保存の状態の文言が変わっても、ヘッダの高さ（＝プレビューの位置）が動かないようにする */
+#saveState, #exportState { flex: none; white-space: nowrap; }
+#saveState { min-width: 11.5em; text-align: right; }

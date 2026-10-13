@@ -135,15 +135,19 @@ def test_new_requires_images(env, capsys):
     assert not (env["root"] / "p").exists()
 
 
-def test_open_reports_missing_or_empty_source(env, capsys):
+def test_open_reports_missing_or_empty_source(env, capsys, monkeypatch):
     assert run(capsys, "new", "gone", "--images", str(env["images"]), "--masks", str(env["masks"]))[0] == 0
     for p in env["images"].iterdir():
         p.unlink()
     code, _, err = run(capsys, "open", "gone")
     assert code == 1 and "画像がありません" in err
     env["images"].rmdir()
-    code, _, err = run(capsys, "open", "gone")
-    assert code == 1 and "元画像フォルダが見つかりません" in err and str(env["images"]) in err and "--force" in err
+    # 元画像の場所が見つからなくても起動はする（画面に、付け替え方の案内が出る。test_relink.py）
+    started = {}
+    monkeypatch.setattr(cli, "serve", lambda app, host, port, project=None: started.update(app=app) or 0)
+    code, out, err = run(capsys, "open", "gone")
+    assert code == 0 and "元画像の場所が見つかりません" in err and str(env["images"]) in err and "inkdeus relink gone" in err
+    assert started["app"].config["INKDEUS_LIBRARY"].missing is True
     assert "元画像フォルダが見つかりません" in run(capsys, "projects")[1]
     code, _, err = run(capsys, "open", "no-such-project")
     assert code == 1 and "プロジェクトが見つかりません" in err and "gone" in err

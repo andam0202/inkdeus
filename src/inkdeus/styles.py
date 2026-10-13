@@ -24,7 +24,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from . import schema
+from . import backup, schema
 
 FORMAT = 1
 FILE = "styles.json"
@@ -205,6 +205,7 @@ class Store:
             "project": Path(project_dir) / FILE if project_dir else None,
         }
         self._lock = threading.Lock()
+        self.before_write = None            # (scope, path, これから書く中身) を受け取る呼び出し（世代バックアップ用）
 
     def path(self, scope: str) -> Path:
         if scope not in SCOPES:
@@ -250,12 +251,16 @@ class Store:
             try:
                 json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
-                # 壊れたファイルを上書きする前に、写しを残す
-                os.replace(path, path.with_name(path.name + ".broken"))
+                # 壊れたファイルは上書きせず、<名前>.broken-<時刻> として残す
+                backup.move_broken(path)
         data = {"version": FORMAT, "styles": entries}
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
-        os.replace(tmp, path)
+        raw = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        if self.before_write is not None and path.is_file():
+            try:
+                self.before_write(scope, path, raw)
+            except OSError:
+                pass                                 # 退避に失敗しても、保存そのものは止めない
+        backup.atomic_write(path, raw)
 
     def save(self, raw: dict, scope: str = "user") -> tuple[dict, bool]:
         """保存する（同じ名前があれば上書き）。戻り値は (保存した物, 上書きしたか)"""

@@ -283,6 +283,18 @@ export class Paint {
     return buf;
   }
 
+  /** 対象の絵の大きさと、1 画素のバイト数（マスクは 1、ペンは 2） */
+  dims(target) {
+    const at = this.place(target);
+    return { w: at.w, h: at.h, channels: at.pen ? 2 : 1 };
+  }
+
+  /** タイルの並び（x, y, w, h）の、いまの画素 */
+  readTiles(target, tiles) {
+    const at = this.place(target);
+    return tiles.map(({ x, y, w, h }) => ({ x, y, w, h, data: this.readRect(at, at.tex, x, y, w, h) }));
+  }
+
   /** 対象の矩形の画素（マスクは 1 バイト/画素、ペンは 2 バイト/画素） */
   readRect(at, tex, x, y, w, h) {
     const rgba = this.readRGBA(tex, x, y, w, h);

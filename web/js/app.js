@@ -7,6 +7,7 @@ import { createGallery } from './gallery.js';
 import { createTools } from './tools.js';
 import { createStyleUI, customOf } from './styles.js';
 import { layerTarget, isTarget, unionRect } from './paint.js';
+import { createNotices, packTiles, choose } from './safety.js';
 import {
   SCHEMA, normalize, defaultParams, applyStyle, effectiveUnit, effectiveWatermark, STYLES,
   withoutIds, withoutParts, inheritIds, layerIds, regionLabel, isPartName,
@@ -24,6 +25,9 @@ const HISTORY_MAX = 200;
 const PAINT_SAVE_DELAY_MS = 1000;                  // 筆を置き終えてから、この時間が経ったら消しゴム・ペンを保存する
 const PAINT_HISTORY_BYTES = 256 * 1024 * 1024;     // 筆の取り消し用に持つ画素の上限（超えたら古い履歴から捨てる）
 const STROKE_SLOW_MS = 40;                         // 筆の最中の合成がこれより遅い環境では、合成の頻度を落とす
+const RETRY_MIN_MS = 1000;                         // 保存に失敗したときの再試行の間隔（失敗のたびに倍にする）
+const RETRY_MAX_MS = 30000;
+const KEEPALIVE_MAX = 60000;                       // ページを閉じる間際でも送り切れる本体の大きさ（ブラウザの上限は合計 64KB）
 const ZOOM_MIN = 0.02;
 const ZOOM_MAX = 32;
 
@@ -38,6 +42,10 @@ const state = {
   versionsOK: false,    // サーバがバージョンに対応しているか（古いサーバにつないだときは既定だけで動く）
   idsOK: false,         // サーバが層の id を知っているか（知らない古いサーバへは、id を除いて保存する）
   paintOK: false,       // サーバが消しゴム・ペンを保存できるか（できなければメモリ上だけで働く）
+  paintTilesOK: false,  // サーバが「変わったタイルだけの保存」に対応しているか（筆を置いた直後に送る）
+  backupOK: false,      // サーバが世代バックアップ（以前の状態に戻す）に対応しているか
+  broken: null,         // 開いた画像の設定ファイルが壊れている（利用者が扱いを選ぶまで、保存しない）
+  build: null,          // 読み込んだときのサーバのビルド識別（変わったら「再読み込みしてください」と知らせる）
   partsOK: true,        // 部分（髪・肌・服など）まわりの設定を保存できるか（知らない古いサーバへは、除いて保存する）
   parts: [],            // 表示中の画像にマスクのある部分名（部分マップに入っている順）
   partNames: [],        // いまの画像フォルダの部分名（部分マスクの置き場にある部分）
@@ -64,6 +72,7 @@ const state = {
 };
 
 let renderer = null;
+let notices = null;                     // ヘッダの下の知らせの帯（更新・サーバの再起動・見つからない元画像の場所）
 let gallery = null;                     // 画像一覧パネル（サーバありのときだけ）
 let tools = null;                       // プレビューの上のツールバー（手のひら / 消しゴム / ペン）
 let styleUI = null;                     // 自分用スタイル（一覧・保存・管理のダイアログ）
@@ -82,22 +91,103 @@ let renderSeq = 0;                      // 描画のたびに増える（書き�
 
 // ---- 表示まわりの小物 ----
 
-function showMessage(text, kind = 'info', timeout = kind === 'error' ? 0 : 9000) {
+function showMessage(text, kind = 'info', timeout = kind === 'error' ? 0 : 9000, action = null) {
   const box = document.createElement('div');
   box.className = `msg ${kind}`;
   box.textContent = text;
   box.title = 'クリックで閉じる';
   box.addEventListener('click', () => box.remove());
+  if (action) {
+    // 知らせに付けるボタン（「取り消す」など）
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'msg-action';
+    button.textContent = action.label;
+    button.addEventListener('click', (e) => { e.stopPropagation(); box.remove(); action.run(); });
+    box.append(' ', button);
+  }
   $('messages').append(box);
   if (timeout) setTimeout(() => box.remove(), timeout);
+  return box;
 }
 
 function setBusy(on) {
   $('busy').hidden = !on;
 }
 
+// ---- 保存の状態（ヘッダに常に出す）----
+// 「保存済み」「保存中…」「未保存の変更あり」「保存に失敗（再試行中）」。変更が無いときは、最後の出来事（「外部から更新」など）
+
+let cleanLabel = '';
+const saveFail = { params: false, paint: false, delay: RETRY_MIN_MS, timer: null, notified: false };
+
+/** 保存の状態。state: none（保存先が無い）/ failed / saving / dirty / saved */
+function saveStatus() {
+  if (!canAutoSave()) return { state: 'none', label: cleanLabel };
+  if (saveFail.params || saveFail.paint) return { state: 'failed', label: '保存に失敗（再試行中）' };
+  if (saving || paintSync.running || paintSync.sending > 0) return { state: 'saving', label: '保存中…' };
+  if (saveTimer || paintSync.timer) return { state: 'dirty', label: '未保存の変更あり' };
+  return { state: 'saved', label: cleanLabel };
+}
+
+function refreshSaveState() {
+  const status = saveStatus();
+  $('saveState').textContent = status.label;
+  $('saveState').dataset.state = status.state;
+}
+
+/** 変更が無いときに出す文言を決める（「保存済み」「外部から更新」など） */
 function setSaveState(text) {
-  $('saveState').textContent = text;
+  cleanLabel = text;
+  refreshSaveState();
+}
+
+/** 保存していない変更がある（保存の途中・再試行中を含む）。ページを閉じる前の確認に使う */
+function hasUnsaved() {
+  return canAutoSave() && saveStatus().state !== 'saved';
+}
+
+/** 保存に失敗した。つながらない・サーバ側の一時的な失敗なら、変更をメモリに持ったまま間隔を広げながら再試行する */
+function saveFailed(kind, text, error) {
+  const retry = !error.status || error.status >= 500;          // 4xx は、やり直しても同じ結果になる
+  if (!retry) {
+    showMessage(`${text}: ${error.message}`, 'error');
+    setSaveState('保存に失敗');
+    return;
+  }
+  saveFail[kind] = true;
+  if (!saveFail.notified) {
+    saveFail.notified = true;
+    showMessage(`${text}: ${error.message}\n変更はこの画面が持っています。つながり次第、自動で保存します（この画面を閉じないでください）`, 'error');
+  }
+  clearTimeout(saveFail.timer);
+  saveFail.timer = setTimeout(retrySaves, saveFail.delay);
+  saveFail.delay = Math.min(RETRY_MAX_MS, saveFail.delay * 2);
+  refreshSaveState();
+}
+
+/** 保存できた（失敗していたなら、復旧を知らせる） */
+function saveRecovered(kind) {
+  if (!saveFail[kind]) return;
+  saveFail[kind] = false;
+  if (!saveFail.params && !saveFail.paint) {
+    clearTimeout(saveFail.timer);
+    saveFail.timer = null;
+    saveFail.delay = RETRY_MIN_MS;
+    if (saveFail.notified) showMessage('保存できました（サーバにつながりました）');
+    saveFail.notified = false;
+  }
+}
+
+function resetSaveFail() {
+  clearTimeout(saveFail.timer);
+  Object.assign(saveFail, { params: false, paint: false, delay: RETRY_MIN_MS, timer: null, notified: false });
+}
+
+async function retrySaves() {
+  saveFail.timer = null;
+  if (saveFail.params) await saveNow();
+  if (saveFail.paint) await savePaint();
 }
 
 function stemOf(name) {
@@ -465,9 +555,20 @@ function wireViewer() {
     showOriginal(false);
     if (tools) { tools.setSpace(false); tools.pointerUp(); }
   });
-  // タブを離れる・閉じるときは、待ち時間を待たずに保存を済ませる（設定と、消しゴム・ペン）
+  // タブを離れる・閉じるときは、待ち時間を待たずに保存を済ませる（設定と、消しゴム・ペン）。
+  // ページが消える間際でも届くよう、小さな本体は keepalive で送る
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && !batch.running) flushSave().catch((e) => console.warn(e));
+    if (document.hidden && !batch.running) flushSave({ keepalive: true }).catch((e) => console.warn(e));
+  });
+  window.addEventListener('pagehide', () => {
+    if (hasUnsaved() && !batch.running) flushSave({ keepalive: true }).catch(() => {});
+  });
+  // 保存していない変更・保存の途中があるときは、閉じる・再読み込みの前に確かめる（その間に保存を進める）
+  window.addEventListener('beforeunload', (e) => {
+    if (!hasUnsaved()) return;
+    flushSave({ keepalive: true }).catch(() => {});
+    e.preventDefault();
+    e.returnValue = '';
   });
   new ResizeObserver(resizeCanvas).observe($('viewer'));
 }
@@ -492,6 +593,7 @@ const ctx = {
   // 自分用スタイル（その領域の選択欄に出す物）。サーバが対応していなければ null（選択欄に何も足さない）
   userStyles: (region) => (state.userStylesOK && styleUI ? styleUI.listFor(region) : null),
   exportNow: () => exportNow(),
+  restore: () => openRestore(),
   setAutoExport: (on) => setAutoExport(on),
   exportAll: () => exportAll({ force: state.batchForce, defaultOnly: state.batchDefaultOnly,
     allFolders: state.batchAllFolders }),
@@ -598,7 +700,12 @@ function stepHistory(delta) {
   if (next < 0 || next >= history.length || (tools && tools.stroking())) return;
   // 筆の記録は「その状態へ進むとき」の物。戻るときは今の状態の記録を、進むときは次の状態の記録を当てる
   const step = hsteps[delta < 0 ? hpos : next];
-  if (step) renderer.paint.swap(step);
+  if (step) {
+    const usedBefore = renderer.paint.has(step.target);
+    const revBefore = renderer.paint.rev(step.target);
+    renderer.paint.swap(step);
+    sendTiles(step, usedBefore, revBefore);          // 筆の取り消し・やり直しも、変わった所だけをすぐ送る
+  }
   const before = history[hpos];
   hpos = next;
   state.params = JSON.parse(history[hpos]);
@@ -631,14 +738,15 @@ function loadParams(raw, { fresh = false, save = true } = {}) {
 }
 
 function canAutoSave() {
-  return state.server && state.remote && !!state.name;
+  // 壊れた設定ファイルを開いている間は、利用者が扱いを選ぶまで何も保存しない（上書きしない）
+  return state.server && state.remote && !!state.name && !state.broken;
 }
 
 function scheduleSave() {
   if (!canAutoSave()) return;
-  setSaveState('未保存');
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => { saveTimer = null; saveNow(); }, SAVE_DELAY_MS);
+  refreshSaveState();
 }
 
 /** サーバへ保存する形の設定（サーバが知らない項目を除く） */
@@ -650,40 +758,51 @@ function forServer(params) {
 }
 
 /** 設定を保存する。idsOnly は「層の id を補っただけ」の保存（見た目は変わらないので、白黒版を「古い」にしない） */
-async function saveNow({ idsOnly = false } = {}) {
-  if (!canAutoSave()) return;
+async function saveNow({ idsOnly = false, keepalive = false } = {}) {
+  if (!canAutoSave()) return true;
   const name = state.name;
   const version = state.version;
+  // 層の id・部分の項目を知らない古いサーバは、それらのある設定を外部操作（ctl）で受け付けなくなるので、除いて保存する
+  const body = JSON.stringify(forServer(state.params));
   saving = true;
+  refreshSaveState();
   try {
     const r = await fetch(apiPath('params', name, version), {
-      // 層の id・部分の項目を知らない古いサーバは、それらのある設定を外部操作（ctl）で受け付けなくなるので、除いて保存する
-      method: 'PUT', body: JSON.stringify(forServer(state.params)),
+      method: 'PUT', body,
       headers: { 'Content-Type': 'application/json', 'X-Inkdeus-Client': CLIENT_ID,
         ...(idsOnly ? { 'X-Inkdeus-Ids-Only': '1' } : {}) },
+      keepalive: keepalive && body.length <= KEEPALIVE_MAX,
     });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: r.status });
     const j = await r.json();
     mark(name, version, { hasParams: true });
     if (name === state.name && version === state.version) state.rev = j.rev;
+    saveRecovered('params');
     if (!saveTimer) setSaveState('保存済み');
+    return true;
   } catch (e) {
-    setSaveState('保存に失敗');
-    showMessage(`設定を保存できませんでした: ${e.message}`, 'error');
+    saveFailed('params', '設定を保存できませんでした', e);
+    return false;
   } finally {
     saving = false;
+    refreshSaveState();
     scheduleStats();
   }
 }
 
-/** 待っている保存（設定と、消しゴム・ペン）を、いますぐ済ませる */
-async function flushSave() {
-  if (saveTimer) {
+/**
+ * 待っている保存（設定と、消しゴム・ペン）を、いますぐ済ませる。
+ * 戻り値は「保存していない変更が残っていない」（サーバにつながらないときは false）
+ */
+async function flushSave({ keepalive = false } = {}) {
+  let ok = true;
+  if (saveTimer || saveFail.params) {
     clearTimeout(saveTimer);
     saveTimer = null;
-    await saveNow();
+    ok = await saveNow({ keepalive });
   }
-  await flushPaint();
+  if (!(await flushPaint({ keepalive }))) ok = false;
+  return ok;
 }
 
 // ---- 消しゴム・ペン（人が画面で描く物）: 筆・履歴・保存 ----
@@ -692,6 +811,11 @@ const paintSync = {
   timer: null, running: null, again: false, loading: false,
   onServer: new Set(),                // サーバに保存してある対象
   saved: new Map(),                   // 対象 → 保存してある版（renderer.paint.rev）
+  // 筆を置いた直後の「変わったタイルだけの保存」
+  chain: Promise.resolve(),           // 送る順番を守るための列
+  sending: 0,                         // 送っている最中の数
+  sent: new Map(),                    // 対象 → 送った分が届けばサーバがなるはずの版
+  tileSaves: 0,                       // タイルで保存できた回数（確認用）
 };
 let usedKey = '';                     // パネルに出している「消しあり」の印の元（変わったらパネルを作り直す）
 let strokeDirty = null;               // 筆の最中に変わった範囲（まだ合成し直していない分）
@@ -718,6 +842,7 @@ function resetPaintSync() {
   paintSync.again = false;
   paintSync.onServer.clear();
   paintSync.saved.clear();
+  paintSync.sent.clear();
   strokeDirty = null;
 }
 
@@ -734,6 +859,10 @@ async function loadPaint() {
     if (!isTarget(row.target) || !paintReferenced(row.target)) continue;
     try {
       const r = await fetch(paintURL(name, row.target, version, folder, `v=${row.stamp || 0}`), { cache: 'no-store' });
+      if (r.status === 422) {
+        // 保存してある絵が壊れている（0 バイトなど）。上書きはされない（次に保存するとき、.broken-<時刻> として残る）
+        throw new Error('保存してある絵が壊れています。出力パネルの「以前の状態に戻す…」で戻せます');
+      }
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const bitmap = await createImageBitmap(await r.blob(), BITMAP_OPTS);
       try {
@@ -752,13 +881,70 @@ async function loadPaint() {
 function touchPaint() {
   if (!paintPersistent() || !renderer) return;
   if (!renderer.paint.info.size && !paintSync.onServer.size) return;
-  setSaveState('未保存');
   clearTimeout(paintSync.timer);
   paintSync.timer = setTimeout(() => { paintSync.timer = null; savePaint(); }, PAINT_SAVE_DELAY_MS);
+  refreshSaveState();
+}
+
+/**
+ * 1 筆（または筆の取り消し・やり直し）で変わったタイルだけを、いますぐサーバへ送る。
+ * 全体の PNG を作って保存するのは 1 秒ほど後だが、それを待たずに、ポインタを離した時点で変更がサーバへ渡る
+ * （送る本体は連長圧縮で数 KB。ページを閉じる間際でも届くよう keepalive で送る）。
+ * サーバの絵がこの筆の直前の状態と同じだと分かっているときだけ使い、そうでなければ後の全体の保存に任せる
+ */
+function sendTiles(step, usedBefore, revBefore) {
+  if (!step || !state.paintTilesOK || !paintPersistent() || !paintReferenced(step.target)) return;
+  const { paint } = renderer;
+  const target = step.target;
+  const name = state.name;
+  const version = state.version;
+  const folder = state.folder;
+  // 設定がまだ保存されていない画像は、先に設定を保存する必要がある（全体の保存がそれを行う）
+  if (!(verOf(state.images.find((i) => i.name === name), version) || {}).hasParams) return;
+  const known = paintSync.sent.has(target) ? paintSync.sent.get(target)
+    : (paintSync.onServer.has(target) ? paintSync.saved.get(target) : (usedBefore ? null : revBefore));
+  if (known !== revBefore) return;
+  let body;
+  const rev = paint.rev(target);
+  try {
+    const size = paint.dims(target);
+    body = packTiles(size.w, size.h, size.channels, paint.readTiles(target, step.tiles));
+  } catch (e) {
+    console.warn('タイルを読めませんでした', e);
+    return;
+  }
+  const here = () => state.remote && state.name === name && state.version === version && state.folder === folder;
+  paintSync.sent.set(target, rev);
+  paintSync.sending += 1;
+  refreshSaveState();
+  const request = fetch(paintURL(name, target, version, folder), {
+    method: 'PATCH', body, headers: { 'X-Inkdeus-Client': CLIENT_ID, 'Content-Type': 'application/octet-stream' },
+    keepalive: body.length <= KEEPALIVE_MAX,
+  });
+  request.catch(() => {});
+  paintSync.chain = paintSync.chain.then(async () => {
+    try {
+      const r = await request;
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      if (!here()) return;
+      paintSync.saved.set(target, rev);
+      if (j.deleted) paintSync.onServer.delete(target); else paintSync.onServer.add(target);
+      paintSync.tileSaves += 1;
+      mark(name, version, { exportFresh: false });            // いまの白黒版は、もう最新ではない
+    } catch (e) {
+      // 届かなかった・サーバの絵と合わなかった。この対象は、後の全体の保存でそろえる
+      if (here()) { paintSync.sent.delete(target); touchPaint(); }
+    } finally {
+      paintSync.sending -= 1;
+      if (here() && !saveTimer && !paintSync.timer && !paintSync.running && !paintSync.sending) setSaveState('保存済み');
+      else refreshSaveState();
+    }
+  });
 }
 
 /** 変わった対象を保存し、無くなった対象（空になった・層が消えた）をサーバからも消す */
-function savePaint() {
+function savePaint({ keepalive = false } = {}) {
   if (!paintPersistent()) return Promise.resolve();
   if (paintSync.running) {
     paintSync.again = true;
@@ -777,6 +963,7 @@ function savePaint() {
   paintSync.running = (async () => {
     let changed = false;
     try {
+      await paintSync.chain;                // 先に送ったタイルの保存が済んでから（順番を入れ替えない）
       // 設定がまだ保存されていない画像なら、先に設定を保存する（層の消しゴムは、設定に書かれた層の id と結び付くため）
       const wanted = [...paint.info.keys()].some((t) => paint.has(t));
       if (wanted && !(verOf(state.images.find((i) => i.name === name), version) || {}).hasParams) {
@@ -799,44 +986,52 @@ function savePaint() {
             }
             if (made) {
               const r = await fetch(paintURL(name, target, version, folder), {
-                method: 'PUT', body: made.blob, headers: { ...headers, 'Content-Type': 'image/png' } });
-              if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                method: 'PUT', body: made.blob, headers: { ...headers, 'Content-Type': 'image/png' },
+                keepalive: keepalive && made.blob.size <= KEEPALIVE_MAX });
+              if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: r.status });
               paintSync.saved.set(target, made.rev);
+              paintSync.sent.delete(target);
               paintSync.onServer.add(target);
               changed = true;
               continue;
             }
           }
           if (paintSync.onServer.has(target)) {
-            const r = await fetch(paintURL(name, target, version, folder), { method: 'DELETE', headers });
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const r = await fetch(paintURL(name, target, version, folder), { method: 'DELETE', headers, keepalive });
+            if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: r.status });
             paintSync.onServer.delete(target);
             paintSync.saved.delete(target);
+            paintSync.sent.delete(target);
             changed = true;
           }
         }
         if (!paintSync.again) break;
       }
       if (changed && here()) mark(name, version, { exportFresh: false });      // いまの白黒版は、もう最新ではない
+      if (here()) saveRecovered('paint');
       if (!saveTimer && !paintSync.timer && here()) setSaveState('保存済み');
       if (usedKey !== paint.targets().join()) rebuild();      // 「戻す」で空になった対象の印を消す
     } catch (e) {
-      setSaveState('保存に失敗');
-      showMessage(`消しゴム・ペンを保存できませんでした: ${e.message}`, 'error');
+      if (here()) saveFailed('paint', '消しゴム・ペンを保存できませんでした', e);
     } finally {
       paintSync.running = null;
+      refreshSaveState();
     }
   })();
+  refreshSaveState();
   return paintSync.running;
 }
 
-async function flushPaint() {
-  if (paintSync.timer) {
+/** 待っている消しゴム・ペンの保存を済ませる。戻り値は「保存していない物が残っていない」 */
+async function flushPaint({ keepalive = false } = {}) {
+  if (paintSync.timer || saveFail.paint) {
     clearTimeout(paintSync.timer);
     paintSync.timer = null;
-    await savePaint();
+    await savePaint({ keepalive });
   }
   if (paintSync.running) await paintSync.running;
+  await paintSync.chain;
+  return !saveFail.paint;
 }
 
 /** 消しゴムの対象（'layer' | 'solid' | 'lines' | 'all'）から、実際のマスクの名前と表示名を決める */
@@ -905,8 +1100,13 @@ function stampStroke(x, y, radius) {
 
 /** 1筆を終える: 履歴に1件として積み、正規の合成をして、保存と自動書き出しを予約する */
 function endStroke() {
+  const active = renderer.paint.stroke;
+  const usedBefore = active ? renderer.paint.has(active.target) : false;
+  const revBefore = active ? renderer.paint.rev(active.target) : 0;
   const step = renderer.paint.endStroke();
   strokeDirty = null;
+  // ポインタを離したら、まず変わった所だけをサーバへ送る（描画や履歴より先に。保存の取りこぼしの窓をなくす）
+  sendTiles(step, usedBefore, revBefore);
   if (step) pushHistory(JSON.stringify(state.params), step);
   renderNow();
   if (!step) return;
@@ -1006,6 +1206,11 @@ async function onExternalParams(ev) {
   if (ev.source === CLIENT_ID || !state.remote || ev.name !== state.name || version !== state.version) return;
   if (ev.rev === null || ev.rev === state.rev) return;
   const r = await fetch(apiPath('params', ev.name, version), { cache: 'no-store' });
+  if (r.status === 422 && ev.name === state.name && version === state.version) {
+    showMessage('設定ファイルが外部から書き換えられて、壊れています（0 バイト、または JSON として読めません）。'
+      + 'この画面の設定はそのままです。次に保存すると、壊れたファイルは「.broken-<時刻>」として残ります', 'error');
+    return;
+  }
   if (!r.ok || ev.name !== state.name || version !== state.version) return;
   const rev = r.headers.get('X-Inkdeus-Rev');
   if (rev === state.rev) return;
@@ -1032,6 +1237,7 @@ function connectEvents() {
     let ev;
     try { ev = JSON.parse(msg.data); } catch { return; }
     if (ev.type === 'params') onExternalParams(ev).catch((e) => console.warn(e));
+    else if (ev.type === 'hello') onHello(ev);
     else if (ev.type === 'exported') onExported(ev);
     else if (ev.type === 'versions') onVersions(ev).catch((e) => console.warn(e));
     else if (ev.type === 'paint') onPaintEvent(ev).catch((e) => console.warn(e));
@@ -1092,6 +1298,7 @@ async function refreshImages() {
   const list = await getJSON(`api/images${queryOf()}`);
   if (!list || !Array.isArray(list.images)) return;
   state.images = list.images;
+  if (notices && Array.isArray(list.missingFolders)) showMissing(list.missingFolders);
   const sel = $('selImage');
   sel.replaceChildren(...state.images.map((item) => {
     const opt = document.createElement('option');
@@ -1137,7 +1344,10 @@ async function switchFolder(folder, name = null, version = '', { open = true } =
     if (open && name) await openByName(name, version);
     return;
   }
-  await flushSave();
+  if (!(await flushSave())) {
+    showMessage('保存できていない変更があるため、移動をやめました（サーバにつながり次第、自動で保存されます）', 'error');
+    return;
+  }
   await flushAutoExport();
   await refreshFolders();
   if (!state.folders.some((f) => f.name === folder)) {
@@ -1258,7 +1468,9 @@ async function dropPending() {
   autoExport.again = false;
   autoExport.dirty = false;
   resetPaintSync();
+  resetSaveFail();
   if (paintSync.running) await paintSync.running.catch(() => {});
+  await paintSync.chain.catch(() => {});
   if (autoExport.running) await autoExport.running.catch(() => {});
 }
 
@@ -1398,8 +1610,14 @@ async function loadParts(item) {
 /** サーバの一覧の i 番目を開く（マスクと保存済みの設定も読む）。version でバージョンを選ぶ（'' = 既定） */
 async function openIndex(i, version = '') {
   if (i < 0 || i >= state.images.length) return;
-  await flushSave();
+  if (!(await flushSave())) {
+    // 保存できていない変更を抱えたまま別の画像を開くと、その変更が失われる
+    showMessage('保存できていない変更があるため、移動をやめました（サーバにつながり次第、自動で保存されます）', 'error');
+    return;
+  }
   await flushAutoExport();             // 前の画像の「未反映の変更」を書き出してから離れる
+  state.broken = null;
+  if (notices) notices.hide('broken');
   const item = state.images[i];
   if (version && !verOf(item, version)) {
     showMessage(`${item.name} のバージョン「${version}」が見つかりません。既定のバージョンを開きます`, 'error');
@@ -1436,7 +1654,14 @@ async function openIndex(i, version = '') {
     // 保存済みの設定があればそれを読む。無ければ、既定のバージョンは直前の設定を引き継ぎ、名前付きは既定値から始める
     const rec = verOf(item, version);
     const saved = rec && rec.hasParams ? await fetch(apiPath('params', item.name, version), { cache: 'no-store' }) : null;
-    if (saved && saved.ok) {
+    const broken = saved && saved.status === 422 ? await saved.json().catch(() => null) : null;
+    if (broken && broken.broken) {
+      // 設定ファイルが壊れている（0 バイト、JSON として読めない）。既定値を表示するだけで、何も保存しない。
+      // どうするかは利用者が選ぶ（最新のバックアップから戻す / 既定値で始める）
+      state.broken = { name: item.name, version, backups: Array.isArray(broken.backups) ? broken.backups : [] };
+      loadParams({}, { fresh: true });
+      setSaveState('設定ファイルが壊れています');
+    } else if (saved && saved.ok) {
       const rev = saved.headers.get('X-Inkdeus-Rev');
       const loaded = loadParams(await saved.json(), { fresh: true });
       state.rev = rev;
@@ -1483,6 +1708,164 @@ async function openIndex(i, version = '') {
     updateVersionUI();                 // ヘッダの高さが変わりうるので、一覧の位置合わせより先に
     if (gallery) gallery.setCurrent();
   }
+  if (state.broken) askBroken();
+}
+
+// ---- 壊れた設定ファイル（上書きせず、利用者に選んでもらう）----
+
+/** 壊れた設定ファイルをどうするかを尋ねる。選ぶまでは、この画像には何も保存しない */
+async function askBroken() {
+  const info = state.broken;
+  if (!info) return null;
+  const label = `${info.name}${info.version ? ` @${info.version}` : ''}`;
+  const latest = info.backups[0];
+  notices.show('broken', `${label} の設定ファイルが壊れています（上書きしていません。いまは既定値を表示しています）`,
+    { kind: 'error', action: { label: 'どうするか選ぶ…', run: () => askBroken() } });
+  const picked = await choose({
+    id: 'brokenDialog', title: '設定ファイルが壊れています',
+    message: `${label} の設定ファイルは、0 バイトか、JSON として読めません。ファイルは上書きしていません。\n`
+      + 'どちらを選んでも、壊れたファイルは「<名前>.broken-<時刻>」として残ります。',
+    buttons: [
+      ...(latest ? [{ label: `最新のバックアップから戻す（${latest.label}）`, value: 'restore', primary: true }] : []),
+      { label: '既定値で始める', value: 'reset' }],
+    cancel: 'あとで決める' });
+  if (!picked || state.broken !== info) return null;
+  return repairBroken(picked);
+}
+
+async function repairBroken(action) {
+  const info = state.broken;
+  if (!info) return null;
+  const r = await fetch(`api/repair/${encodeURIComponent(info.name)}${queryOf(info.version)}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action }) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    showMessage(`設定ファイルを直せませんでした: ${j.error || `HTTP ${r.status}`}`, 'error');
+    return null;
+  }
+  state.broken = null;
+  notices.hide('broken');
+  await refreshImages();
+  await openIndex(state.images.findIndex((i) => i.name === info.name), info.version);
+  showMessage(action === 'restore' ? `最新のバックアップ（${j.restored ? j.restored.label : ''}）から設定を戻しました`
+    : '既定値で始めました', 'info');
+  return j;
+}
+
+// ---- 以前の状態に戻す（設定と消しゴム・ペンの世代バックアップ）----
+
+const backupURL = () => `api/backups/${encodeURIComponent(state.name)}${queryOf(state.version)}`;
+let lastRestore = null;               // 直近に戻したときの「取り消し先」
+
+async function listBackups() {
+  if (!state.backupOK || !canAutoSave()) return [];
+  const list = await getJSON(backupURL());
+  return list && Array.isArray(list.points) ? list.points : [];
+}
+
+/** その時点（一覧の at、または取り消し先の時刻）へ戻す。戻す前のいまの状態も、サーバが残す */
+async function restoreBackup(at) {
+  if (!state.backupOK || !canAutoSave()) throw new Error('この画像では使えません');
+  if (!(await flushSave())) throw new Error('保存できていない変更があります（サーバにつながりません）');
+  const name = state.name;
+  const version = state.version;
+  const r = await fetch(backupURL(), { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ at }) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+  // 戻した中身は、サーバからの「外部からの変更」の知らせで、この画面に読み込まれる
+  lastRestore = { name, version, undo: j.undo };
+  if (!j.restored.length) {
+    showMessage('何も変わりませんでした（すでにその時点と同じ中身です）');
+    return j;
+  }
+  showMessage(`以前の状態に戻しました（${j.restored.join(' / ')}）`, 'info', 30000,
+    { label: '取り消す', run: () => undoRestore().catch((e) => showMessage(e.message, 'error')) });
+  return j;
+}
+
+/** 直近の「以前の状態に戻す」を取り消す（戻す前の状態へ） */
+async function undoRestore() {
+  const last = lastRestore;
+  if (!last || last.name !== state.name || last.version !== state.version) throw new Error('取り消せる復元がありません');
+  const j = await restoreBackup(last.undo);
+  return j;
+}
+
+async function openRestore() {
+  if (!state.backupOK || !canAutoSave()) return null;
+  const points = await listBackups();
+  const label = `${state.name}${state.version ? ` @${state.version}` : ''}`;
+  const at = await choose({
+    id: 'restoreDialog', title: '以前の状態に戻す',
+    message: `${label} の設定と消しゴム・ペンを、選んだ時点の変更の直前の状態に戻します。\n`
+      + '戻す前のいまの状態も残るので、あとで取り消せます。',
+    rows: points.map((p) => ({ value: p.at, label: p.label, note: p.what.join(' / ') })),
+    empty: 'まだ、戻せる時点がありません（保存のたびに、上書きされる前の版が残っていきます）' });
+  if (at === null) return null;
+  try {
+    return await restoreBackup(at);
+  } catch (e) {
+    showMessage(`戻せませんでした: ${e.message}`, 'error');
+    return null;
+  }
+}
+
+// ---- サーバの更新・再起動に気づく（ビルド識別）----
+
+/** 読み込んだときのサーバのビルド識別を覚える。この画面のファイルの方が新しければ、サーバの再起動を促す */
+function checkBuild(build) {
+  if (!state.server) return;
+  if (!build) {
+    // /api/config にビルド識別が無い = この画面のファイルより古いサーバが動いている
+    notices.show('server', 'この画面は、起動中のサーバより新しい版です。サーバを再起動してください', {
+      detail: '再起動するまで、新しい機能の一部（バックアップ・筆の即時保存など）は使えません' });
+    return;
+  }
+  state.build = build;
+  if (build.stale) {
+    notices.show('server', 'サーバの起動後に inkdeus が更新されています。サーバを再起動してください', {
+      detail: 'サーバを起動し直すと、新しい機能がすべて使えるようになります' });
+  }
+}
+
+/** イベントの接続のたびに届く、サーバのビルド識別。読み込んだときと違えば、再読み込みを促す */
+function onHello(ev) {
+  const build = ev && ev.build;
+  if (!build || !state.build) return;
+  if (build.boot !== state.build.boot) {
+    // サーバが起動し直された。開いている画像を伝え直し、保存に失敗していた分があればすぐ試す
+    state.build = { ...state.build, boot: build.boot };
+    postState();
+    if (saveFail.params || saveFail.paint) { clearTimeout(saveFail.timer); retrySaves(); }
+  }
+  if (build.id !== state.build.id) {
+    notices.show('reload', 'inkdeus が更新されました。再読み込みしてください', {
+      detail: '保存していない変更は、再読み込みの前に保存されます',
+      action: { label: '保存して再読み込み', run: async () => {
+        if (!(await flushSave())) {
+          showMessage('保存できていない変更があります。サーバにつながってから再読み込みしてください', 'error');
+          return;
+        }
+        await flushAutoExport().catch(() => {});
+        location.reload();
+      } } });
+  } else if (!build.stale) {
+    notices.hide('server');
+  }
+}
+
+/** 元画像の場所が見つからない画像フォルダがあれば、付け替え方を知らせる */
+function showMissing(list) {
+  const gone = Array.isArray(list) ? list : [];
+  if (!gone.length) {
+    notices.hide('missing');
+    return;
+  }
+  const project = state.project ? state.project.name : '<プロジェクト>';
+  const where = gone.map((f) => (f.name === DEFAULT_FOLDER ? '既定のフォルダ' : `フォルダ「${f.label}」`)).join('、');
+  const hint = gone.map((f) => `inkdeus relink ${project}${f.name === DEFAULT_FOLDER ? '' : ` --folder ${f.name}`} --images <dir>`).join(' / ');
+  notices.show('missing', `元画像の場所が見つかりません（${where}）`, { kind: 'error', detail: `${hint} で付け替えてください` });
 }
 
 async function openLocalImage(file) {
@@ -1900,6 +2283,7 @@ async function init() {
     throw e;
   }
   const query = new URLSearchParams(location.search);
+  notices = createNotices($('notices'));
   const [config, folderData] = await Promise.all([getJSON('api/config'), getJSON('api/folders')]);
   state.folders = folderData && Array.isArray(folderData.folders) ? folderData.folders.filter((f) => !f.missing) : [];
   // 始めに開く画像フォルダ: 直リンクの ?folder= → 最後に開いていたフォルダ → 既定
@@ -1916,6 +2300,10 @@ async function init() {
   const features = state.server && config && Array.isArray(config.features) ? config.features : [];
   state.idsOK = features.includes('layerIds');
   state.paintOK = features.includes('paint');
+  state.paintTilesOK = features.includes('paintTiles');
+  state.backupOK = features.includes('backup') && !(config.backup && config.backup.enabled === false);
+  checkBuild(state.server && config ? config.build : null);
+  showMissing(config && config.missingFolders);
   // 部分（regions.<部分名>）と solid.lineKnockout。サーバなしのときは、画面だけで使える（部分マスクはサーバから読む）
   state.partsOK = !state.server || features.includes('parts');
   state.partNames = state.partsOK && list && Array.isArray(list.parts) ? list.parts.filter(isPartName) : [];
@@ -2090,6 +2478,22 @@ const hooks = {
     },
   },
   save: async () => { clearTimeout(saveTimer); saveTimer = null; await saveNow(); },
+  /** 保存の状態（state: none / failed / saving / dirty / saved と、ヘッダに出している文言） */
+  saveStatus: () => ({ ...saveStatus(), unsaved: hasUnsaved(), failing: saveFail.params || saveFail.paint,
+    retryMs: saveFail.delay, tileSaves: paintSync.tileSaves, tiles: state.paintTilesOK }),
+  flushSave: (opts) => flushSave(opts || {}),
+  /** 以前の状態に戻す（世代バックアップ） */
+  backups: {
+    ok: () => state.backupOK,
+    list: () => listBackups(),
+    restore: (at) => restoreBackup(at),
+    undo: () => undoRestore(),
+    open: () => openRestore(),
+  },
+  broken: () => (state.broken ? JSON.parse(JSON.stringify(state.broken)) : null),
+  repair: (action) => repairBroken(action),
+  notices: () => Object.fromEntries(notices.keys().map((k) => [k, notices.text(k)])),
+  build: () => state.build,
   readPixels: (x, y, w, h) => renderer.readPixels(x, y, w, h),
   readPixelsBase64: (x, y, w, h) => {
     const px = renderer.readPixels(x, y, w, h);

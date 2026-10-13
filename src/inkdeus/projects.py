@@ -16,12 +16,14 @@ from pathlib import Path
 from .assets import MODES as ASSET_MODES
 from .assets import AssetError
 from .assets import validate_name as validate_asset_name
+from . import backup as backup_mod
 from . import folders as folders_mod
 from . import parts as parts_mod
-from .server import PARAMS_SUFFIX, is_image, read_local_config
+from .server import PAINT_SUFFIX, PARAMS_SUFFIX, is_image, read_local_config
 
 PROJECT_FILE = "inkdeus.project.toml"
 DEFAULT_ROOT = "~/inkdeus-projects"
+UNSET_SOURCE = "source"              # 元画像の場所が未設定のプロジェクトで、仮に指しておく場所（プロジェクトの中）
 
 
 class ProjectError(Exception):
@@ -39,6 +41,7 @@ class Project:
     note: str
     folders: tuple = ()          # 追加の画像フォルダ（folders.FolderDef）。既定のフォルダは source / masks
     parts: Path | None = None    # 既定のフォルダの、部分マスク（髪・肌・服など）の置き場
+    unset: bool = False          # 元画像の場所がまだ決まっていない（元画像なしで取り込んだプロジェクト）
 
     @property
     def config(self) -> Path:
@@ -110,9 +113,23 @@ def _write_config(path: Path, name: str, created: str, source: Path | str, masks
                 lines.append(f"{key} = {_toml_string(entry[key])}")
         if isinstance(entry.get("recursive"), bool):
             lines.append(f"recursive = {'true' if entry['recursive'] else 'false'}")
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
-    os.replace(tmp, path)
+    data = ("\n".join(lines) + "\n").encode("utf-8")
+    if path.is_file():
+        try:
+            with open(path, "rb") as f:
+                tomllib.load(f)
+        except tomllib.TOMLDecodeError:
+            backup_mod.move_broken(path)               # 壊れた設定ファイルは上書きせず、<名前>.broken-<時刻> として残す
+        except OSError:
+            pass
+        else:
+            try:                                       # 上書きの直前に、いまの設定を退避する（<out>/.backup/_project/）
+                out_dir = _resolve_dir(path.parent, out)
+                store = backup_mod.Store(out_dir / backup_mod.DIR, backup_mod.read_config(read_local_config()))
+                store.stash(path, f"{backup_mod.PROJECT_PREFIX}/{path.name}", new_data=data)
+            except OSError:
+                pass
+    backup_mod.atomic_write(path, data)
 
 
 def _copy_images(src: Path, dst: Path, only_png_masks: bool = False) -> None:
@@ -399,10 +416,12 @@ def load_project(name_or_path: str, root: Path | None = None, check: bool = True
         raise ProjectError(f"{path / PROJECT_FILE} を読めません: {e}") from e
     if not isinstance(data.get("source"), str):
         raise ProjectError(f"{path / PROJECT_FILE} に source がありません")
+    unset = data["source"] == ""                     # 元画像の場所が未設定（元画像なしで取り込んだ。relink で決める）
     project = Project(
         name=str(data.get("name") or path.name),
         path=path,
-        source=_resolve_dir(path, data["source"]),
+        unset=unset,
+        source=path / UNSET_SOURCE if unset else _resolve_dir(path, data["source"]),
         masks=_resolve_dir(path, data["masks"]) if isinstance(data.get("masks"), str) else None,
         out=_resolve_dir(path, str(data.get("out") or "out")),
         created=str(data.get("created", "")),
@@ -411,9 +430,12 @@ def load_project(name_or_path: str, root: Path | None = None, check: bool = True
         parts=_resolve_dir(path, data["parts"]) if isinstance(data.get("parts"), str) and data["parts"] else None,
     )
     if check:
+        if unset:
+            raise ProjectError(f"プロジェクト「{project.name}」は元画像の場所が未設定です\n"
+                               f"inkdeus relink {project.name} --images <dir> で決めてください")
         if not project.source.is_dir():
             raise ProjectError(f"プロジェクト「{project.name}」の元画像フォルダが見つかりません: {project.source}\n"
-                               f"フォルダを戻すか、inkdeus new {project.name} --images <dir> --force で参照先を更新してください")
+                               f"フォルダを戻すか、inkdeus relink {project.name} --images <dir> で参照先を付け替えてください")
         if not list_images(project.source):
             raise ProjectError(f"プロジェクト「{project.name}」の元画像フォルダに画像がありません: {project.source}")
         if project.masks is not None and not project.masks.is_dir():
@@ -426,7 +448,8 @@ def summarize(project: Project) -> dict:
     row = {"name": project.name, "path": str(project.path), "source": str(project.source),
            "masks_dir": str(project.masks) if project.masks else None, "out": str(project.out),
            "created": project.created, "note": project.note,
-           "images": 0, "masks": 0, "configured": 0, "exported": 0, "updated": None, "missing": False}
+           "images": 0, "masks": 0, "configured": 0, "exported": 0, "updated": None, "missing": False,
+           "unset": project.unset}
     if not project.source.is_dir():
         row["missing"] = True
         return row
@@ -454,3 +477,84 @@ def list_projects(root: Path | None = None) -> list[dict]:
         except ProjectError as e:
             rows.append({"name": d.name, "path": str(d), "error": str(e)})
     return rows
+
+
+# ---- 元画像の場所の付け替え ----
+
+def _known_stems(out: Path) -> set[str]:
+    """保存先に残っている設定・書き出し・消しゴムの基底名（<名前> または <名前>@<バージョン>）"""
+    stems: set[str] = set()
+    try:
+        with os.scandir(out) as it:
+            for item in it:
+                for suffix in (PARAMS_SUFFIX, PAINT_SUFFIX, ".maskedit", ".png"):
+                    if item.name.endswith(suffix) and not item.name.startswith("."):
+                        stems.add(item.name[: -len(suffix)])
+                        break
+    except OSError:
+        pass
+    return stems
+
+
+def relink_report(project: Project, images: Path | str, folder: str | None = None) -> dict:
+    """付け替え先に同名の画像がどれだけあるか: matched（一致）/ missing（不足）/ extra（余分）。
+    「いまの画像」は、いまの参照先にある画像と、保存先に設定・書き出しが残っている画像"""
+    d = folder_def(project, folder)
+    new_dir = Path(images).expanduser().resolve()
+    if not new_dir.is_dir():
+        raise ProjectError(f"画像フォルダが見つかりません: {new_dir}")
+    new_files = list_images(new_dir)
+    new_names = {p.name for p in new_files}
+    new_stems = {p.stem for p in new_files}
+    old_names = {p.name for p in list_images(d.images)} if d.images.is_dir() else set()
+    matched = sorted(old_names & new_names)
+    missing = sorted(old_names - new_names)
+    known = {p.rsplit(".", 1)[0] for p in old_names}
+    # いまの参照先が無いときは、保存先に残っている基底名から「あったはずの画像」を数える
+    for stem in sorted(_known_stems(folders_mod.out_dir(project.out, d.name))):
+        base = stem if stem in new_stems or "@" not in stem else stem.rsplit("@", 1)[0]
+        if base in known or stem in known:
+            continue
+        known.add(base)
+        if base in new_stems:
+            matched.append(next(p.name for p in new_files if p.stem == base))
+        else:
+            missing.append(base)
+    extra = sorted(n for n in new_names if n not in matched and n.rsplit(".", 1)[0] not in known)
+    return {"project": project.name, "folder": d.name, "from": str(d.images), "to": str(new_dir),
+            "matched": sorted(set(matched)), "missing": sorted(set(missing)), "extra": extra}
+
+
+def relink(project: Project, images: Path | str, masks: Path | str | None = None,
+           parts: Path | str | None = None, folder: str | None = None, force: bool = False) -> dict:
+    """画像フォルダ（省略・"default" = 既定のフォルダ）の参照先を付け替える。
+    付け替え先に足りない画像があるときは、force でなければ中止する。戻り値は relink_report に applied を足した物"""
+    report = relink_report(project, images, folder)
+    report["applied"] = False
+    if report["missing"] and not force:
+        return report
+    new_dir = Path(images).expanduser().resolve()
+    masks_dir = None
+    if masks:
+        masks_dir = Path(masks).expanduser().resolve()
+        if not masks_dir.is_dir():
+            raise ProjectError(f"マスクフォルダが見つかりません: {masks_dir}")
+    parts_dir = _parts_dir(parts)
+    data = _read_raw(project)
+    if report["folder"] == folders_mod.DEFAULT:
+        data["source"] = str(new_dir)
+        if masks_dir is not None:
+            data["masks"] = str(masks_dir)
+        _rewrite_assets(project, data, _raw_assets(data),
+                        parts=str(parts_dir) if parts_dir is not None else _KEEP)
+    else:
+        existing = _raw_folders(data)
+        entry = next(e for e in existing if e.get("name") == report["folder"])
+        entry["images"] = str(new_dir)
+        if masks_dir is not None:
+            entry["masks"] = str(masks_dir)
+        if parts_dir is not None:
+            entry["parts"] = str(parts_dir)
+        _rewrite_assets(project, data, _raw_assets(data), existing)
+    report["applied"] = True
+    return report

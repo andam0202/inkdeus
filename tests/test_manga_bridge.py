@@ -56,6 +56,7 @@ class MangaEnv:
     project: Path
     requests: list
     font: str | None = None        # 合成したローカルフォントの表示名（fontTools が無ければ None）
+    app: object = None             # サーバのアプリ（イベントを直接流すテスト用）
 
 
 @pytest.fixture(scope="module")
@@ -92,7 +93,7 @@ def manga_env(tmp_path_factory):
     except ImportError:
         pass
     server, url = serve(app)
-    yield MangaEnv(url, project.path, [], font)
+    yield MangaEnv(url, project.path, [], font, app)
     server.shutdown()
 
 

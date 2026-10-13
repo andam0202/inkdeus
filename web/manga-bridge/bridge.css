@@ -236,3 +236,21 @@ html.ikb-resizing, html.ikb-resizing * { cursor: ew-resize !important; user-sele
 .ikl-overlay[hidden] { display: none; }
 .ikl-option { display: grid; grid-template-columns: auto 1fr; gap: 6px; align-items: center; margin: 0; }
 .ikl-option > select { min-width: 0; width: 100%; }
+
+/* 画面の上の知らせの帯（inkdeus の更新・サーバの再起動） */
+#inkdeus-banner {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 2147483000;
+  background: #5a4410; color: #fff3d6; border-bottom: 1px solid #8a6a1c;
+  font: 600 13px/1.5 system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+}
+#inkdeus-banner[hidden] { display: none; }
+#inkdeus-banner .ikb-banner-row { display: flex; align-items: center; gap: 12px; padding: 6px 14px; }
+#inkdeus-banner button {
+  margin-left: auto; font: inherit; color: inherit; cursor: pointer; padding: 2px 10px; border-radius: 4px;
+  background: rgba(255, 255, 255, 0.14); border: 1px solid rgba(255, 255, 255, 0.4);
+}
+.ikb-save-state[data-state="failed"] { color: #ff8f87; font-weight: 700; }
+.ikb-save-state[data-state="dirty"], .ikb-save-state[data-state="saving"] { color: #f0a857; }
+.ikb-versions { display: flex; flex-direction: column; gap: 4px; padding: 6px; border: 1px solid var(--ikb-line, #555); border-radius: 4px; }
+.ikb-versions[hidden] { display: none; }
+.ikb-version span:first-child { flex: 1; font-variant-numeric: tabular-nums; }

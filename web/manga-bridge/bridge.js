@@ -100,7 +100,10 @@
     name: '',                    // 保存名
     saved: [],                   // 保存済みの漫画データ
     busy: false,                 // 連携スクリプトが保存・読み込み・書き出しの最中
-    autosave: { enabled: true, seconds: 60, lastSig: null, dirtySince: 0, pageChanged: false, lastAt: 0 },
+    autosave: { enabled: true, seconds: 60, lastSig: null, dirtySince: 0, pageChanged: false, lastAt: 0,
+      failed: false, retryMs: 0, retryAt: 0 },                 // 失敗したら、間隔を広げながら再試行する
+    build: null,                 // 読み込んだときのサーバのビルド識別（変わったら「再読み込みしてください」と知らせる）
+    notices: {},                 // 画面の上の帯に出している知らせ（種類 → 文言）
     preferInked: true,           // 元画像のタブから入れるとき、白黒版があれば白黒版を入れる
     autoSwap: false,             // 白黒版ができたら、置いてある元画像を白黒版に置き換える
     inked: { versions: null, changed: new Set(), pairs: new Map(), names: new Map(), lastChanged: 0 },   // 白黒版の更新時刻と、開いてから変わった物
@@ -282,6 +285,14 @@
     ui.btnSave = el('button', { type: 'button', text: 'プロジェクトに保存', onclick: () => run(() => save()) });
     ui.saved = el('select', { class: 'ikb-saved', 'aria-label': '保存済みの漫画データ' });
     ui.btnOpen = el('button', { type: 'button', text: 'プロジェクトから開く', onclick: () => run(() => open(ui.saved.value)) });
+    // 保存のたびに残している前の版（世代バックアップ）から開く
+    ui.btnVersions = el('button', { type: 'button', class: 'ikb-versions-btn', text: '以前の版…', hidden: true,
+      title: '選んだ保存データの、上書きされる前の版を開きます（いまの保存データは変わりません）',
+      onclick: () => run(() => showBackups(ui.saved.value)) });
+    ui.versions = el('div', { class: 'ikb-versions', hidden: true });
+    ui.saveState = el('span', { class: 'ikb-save-state', title: '漫画データの保存の状態（自動保存）' });
+    // 画面の上に出す、消えない知らせの帯（inkdeus の更新・サーバの再起動）
+    ui.banner = el('div', { id: 'inkdeus-banner', role: 'status', hidden: true });
     ui.btnExport = el('button', { type: 'button', text: 'このページを書き出す', onclick: () => run(() => exportPage()) });
     ui.btnExportAll = el('button', { type: 'button', text: '全ページを書き出す', onclick: () => run(() => exportAllPages()) });
     ui.autosave = el('input', { type: 'checkbox', id: 'ikb-autosave' });
@@ -316,11 +327,13 @@
       el('details', { class: 'ikb-section ikb-file', open: true }, [
         el('summary', { text: '保存と書き出し' }),
         el('div', { class: 'ikb-row' }, [ui.name, ui.btnSave]),
-        el('div', { class: 'ikb-row' }, [ui.saved, ui.btnOpen]),
+        el('div', { class: 'ikb-row' }, [ui.saved, ui.btnOpen, ui.btnVersions]),
+        ui.versions,
         el('div', { class: 'ikb-row' }, [ui.btnExport, ui.btnExportAll]),
         el('div', { class: 'ikb-row ikb-autosave-row' }, [
           ui.autosave, el('label', { for: 'ikb-autosave', text: '自動保存' }), ui.autosaveState,
         ]),
+        el('div', { class: 'ikb-row ikb-save-row' }, [el('span', { class: 'ikb-dim', text: '保存の状態:' }), ui.saveState]),
         ui.fontRow,
         ui.dir,
       ]),
@@ -330,6 +343,7 @@
     ui.fileSection = ui.body.querySelector('.ikb-file');
     ui.root = el('aside', { id: 'inkdeus-bridge', class: 'ikb', 'aria-label': 'inkdeus の素材パネル' },
       [ui.resize, ui.toggle, ui.body]);
+    ui.saved.addEventListener('change', () => { ui.versions.hidden = true; renderStatus(); });
 
     // 入力欄でのキー操作が、漫画エディタ側のショートカット（Delete・Ctrl+Z など）として働かないようにする
     ['keydown', 'keyup', 'keypress', 'paste', 'copy', 'cut'].forEach((type) => {
@@ -599,7 +613,74 @@
       : a.lastAt ? `${formatTime(a.lastAt / 1000)} に保存` : `変更から ${a.seconds} 秒後`;
     ui.dir.textContent = state.mangaDir ? `保存先: ${state.mangaDir}` : '';
     ui.dir.title = state.mangaDir;
+    const row = state.saved.find((p) => p.name === ui.saved.value);
+    ui.btnVersions.hidden = !(f.open && hasServer('backup') && row && row.backups > 0);
+    const status = saveStatus();
+    ui.saveState.textContent = status.label;
+    ui.saveState.dataset.state = status.state;
   }
+
+  function hasServer(feature) { return (state.server || []).includes(feature); }
+
+  // 保存の状態（自動保存）: 保存済み / 保存中… / 未保存の変更あり / 保存に失敗（再試行中）
+  function saveStatus() {
+    const a = state.autosave;
+    if (!state.ready || !state.features.save) return { state: 'none', label: '' };
+    if (a.failed) return { state: 'failed', label: '保存に失敗（再試行中）' };
+    if (autosaving) return { state: 'saving', label: '保存中…' };
+    if (a.dirtySince) return { state: 'dirty', label: a.enabled ? '未保存の変更あり' : '未保存の変更あり（自動保存はオフ）' };
+    return { state: 'saved', label: '保存済み' };
+  }
+
+  // ---- 画面の上の知らせの帯（inkdeus の更新・サーバの再起動）----
+
+  function notice(key, text, action) {
+    if (!text) delete state.notices[key]; else state.notices[key] = { text, action: action || null };
+    const rows = Object.entries(state.notices);
+    ui.banner.hidden = rows.length === 0;
+    ui.banner.replaceChildren(...rows.map(([k, n]) => el('div', { class: 'ikb-banner-row', 'data-key': k }, [
+      el('span', { text: n.text }),
+      n.action ? el('button', { type: 'button', text: n.action.label, onclick: () => n.action.run() }) : null,
+    ].filter(Boolean))));
+  }
+
+  // 読み込んだときのサーバのビルド識別を覚える。この画面のファイルの方が新しければ、サーバの再起動を促す
+  function checkBuild(build) {
+    if (!build) {
+      notice('server', 'この画面は、起動中の inkdeus のサーバより新しい版です。サーバを再起動してください');
+      return;
+    }
+    state.build = build;
+    if (build.stale) notice('server', 'サーバの起動後に inkdeus が更新されています。サーバを再起動してください');
+  }
+
+  // イベントの接続のたびに届く、サーバのビルド識別。読み込んだときと違えば、再読み込みを促す
+  function onHello(ev) {
+    const build = ev && ev.build;
+    if (!build || !state.build) return;
+    if (build.boot !== state.build.boot) {
+      state.build = Object.assign({}, state.build, { boot: build.boot });
+      if (state.autosave.failed) state.autosave.retryAt = 0;   // サーバが起動し直された。失敗していた保存をすぐ試す
+    }
+    if (build.id !== state.build.id) {
+      notice('reload', 'inkdeus が更新されました。再読み込みしてください（保存していない変更は、先に保存されます）', {
+        label: '保存して再読み込み',
+        run: () => run(async () => {
+          if (state.autosave.dirtySince || state.autosave.failed) {
+            checkDirty();
+            await autosaveNow();
+            if (state.autosave.failed) throw new Error('保存できていない変更があります。サーバにつながってから再読み込みしてください');
+          }
+          optional(() => UnsavedGuard.markSaved());
+          leaving = true;
+          location.reload();
+        }),
+      });
+    } else if (!build.stale) {
+      notice('server', '');
+    }
+  }
+  let leaving = false;                                         // 保存を済ませてから自分で再読み込みする（確認を出さない）
 
   function renderTarget() {
     const src = currentSource();
@@ -1087,7 +1168,8 @@
       let ev;
       try { ev = JSON.parse(msg.data); } catch (e) { return; }
       note('event', ev);
-      if (ev.type === 'exported') onExported(ev).catch((e) => console.error('[inkdeus]', e));
+      if (ev.type === 'hello') onHello(ev);
+      else if (ev.type === 'exported') onExported(ev).catch((e) => console.error('[inkdeus]', e));
       else if (ev.type === 'versions') onVersionsEvent(ev).catch((e) => console.error('[inkdeus]', e));
       else if (ev.type === 'manga-command') runCommand(ev);
     };
@@ -1456,19 +1538,59 @@
     if (btmGetGuidsSize() <= 1 && getContentObjectCount() === 0) return Promise.resolve(null);   // 白紙1枚は保存しない
     state.busy = true;
     autosaving = (async () => {
+      const a = state.autosave;
       try {
-        const info = await putProject(AUTOSAVE_NAME);
-        state.autosave.lastAt = Date.now();
-        markClean();
         renderStatus();
+        const info = await putProject(AUTOSAVE_NAME);
+        a.lastAt = Date.now();
+        if (a.failed) say('自動保存できました（サーバにつながりました）');
+        Object.assign(a, { failed: false, retryMs: 0, retryAt: 0 });
+        markClean();
         listSaved().catch(() => {});
         return info;
+      } catch (e) {
+        // 変更は画面が持ったまま。間隔を広げながら再試行する（2 秒 → 4 秒 → … → 60 秒）
+        if (!a.failed) fail(e, '自動保存に失敗しました（変更はこの画面が持っています。つながり次第、保存します）');
+        a.failed = true;
+        a.retryMs = Math.min(60000, Math.max(2000, a.retryMs * 2));
+        a.retryAt = Date.now() + a.retryMs;
+        if (!a.dirtySince) a.dirtySince = Date.now();
+        return null;
       } finally {
         state.busy = false;
         autosaving = null;
+        renderStatus();
       }
     })();
     return autosaving;
+  }
+
+  // ---- 以前の版（保存のたびに残している、上書きされる前の漫画データ）----
+
+  async function listBackups(name) {
+    if (!name || !NAME_RE.test(name)) throw new Error('漫画データを選んでください');
+    return (await api('GET', '/api/manga/backups/' + encodeURIComponent(name))).backups || [];
+  }
+
+  async function showBackups(name) {
+    const rows = await listBackups(name);
+    const label = name === AUTOSAVE_NAME ? '自動保存' : name;
+    ui.versions.replaceChildren(
+      el('div', { class: 'ikb-dim', text: rows.length ? `「${label}」の以前の版（新しい順。開くだけで、いまの保存データは変わりません）`
+        : `「${label}」の以前の版は、まだありません` }),
+      ...rows.map((row) => el('div', { class: 'ikb-row ikb-version', 'data-at': row.at }, [
+        el('span', { text: row.label }),
+        el('span', { class: 'ikb-dim', text: `${Math.max(1, Math.round(row.bytes / 1024))} KB` }),
+        el('button', { type: 'button', text: '開く', onclick: () => run(() => openBackup(name, row.at)) }),
+      ])),
+      el('div', { class: 'ikb-row' }, [el('button', { type: 'button', text: '閉じる', onclick: () => { ui.versions.hidden = true; } })]));
+    ui.versions.hidden = false;
+    return rows;
+  }
+
+  // 以前の版を開く（読み込むだけ。保存し直すまで、いまの保存データは変わらない）
+  function openBackup(name, at, opts) {
+    return open(name, Object.assign({}, opts, { backup: at }));
   }
 
   function contentExists() {
@@ -1490,10 +1612,12 @@
     const o = opts || {};
     if (!name || !NAME_RE.test(name)) throw new Error('開く漫画データを選んでください');
     await waitIdle();
-    const label = name === AUTOSAVE_NAME ? '自動保存' : name;
+    const label = (name === AUTOSAVE_NAME ? '自動保存' : name) + (o.backup ? `（以前の版 ${o.backup}）` : '');
     if (!o.force && contentExists() && !(await confirmReplace(label))) return null;
     const result = await busyWhile('読み込んでいます…', async () => {
-      const res = await api('GET', '/api/manga/project/' + encodeURIComponent(name), undefined, true);
+      const res = await api('GET', o.backup
+        ? `/api/manga/backup/${encodeURIComponent(name)}/${encodeURIComponent(o.backup)}`
+        : '/api/manga/project/' + encodeURIComponent(name), undefined, true);
       const files = await lz4Compressor.unLz4FilesByBuffer(await res.arrayBuffer());
       clearAllProjectPages();
       const first = await multiLoadLz4(files);
@@ -1510,33 +1634,58 @@
       store.set('lastName', name);
     }
     ui.resume.hidden = true;
+    ui.versions.hidden = true;
     await nextFrames(2);
     markClean();
-    say(`開きました: ${label}（${result.pages} ページ）`);
+    say(`開きました: ${label}（${result.pages} ページ）`
+      + (o.backup ? '。この版を残すには「プロジェクトに保存」を押してください' : ''));
     return result;
   }
 
   // 自動保存: 変更に気づいてから一定時間後、またはページを切り替えたときに autosave へ保存する
-  function autosaveTick() {
+  // 前に見たときから変わっていたら「未保存の変更あり」にする
+  function checkDirty() {
     const a = state.autosave;
-    if (!state.ready || !state.features.save || !a.enabled || state.busy) return;
-    if (isProjectBusy()) return;
+    if (!state.ready || !state.features.save || isProjectBusy()) return false;
     const sig = signature();
-    if (sig === null) return;
+    if (sig === null) return false;
     if (sig !== a.lastSig) {
       const guid = currentGuid();
-      if (a.guid && guid !== a.guid) a.pageChanged = true;
+      // 白紙 1 枚（保存する物が無い）のうちは「未保存」にしない。起動直後に漫画エディタが積む履歴を、変更と数えないため
+      const blank = !optional(() => contentExists());
+      if (a.guid && guid !== a.guid && !blank) a.pageChanged = true;
       a.guid = guid;
       a.lastSig = sig;
-      if (!a.dirtySince) a.dirtySince = Date.now();
+      if (!a.dirtySince && !blank) { a.dirtySince = Date.now(); renderStatus(); }
     }
-    if (!a.dirtySince) return;
-    if (a.pageChanged || Date.now() - a.dirtySince >= a.seconds * 1000) {
-      autosaveNow().catch((e) => {
-        a.dirtySince = Date.now();                             // すぐには繰り返さない
-        fail(e, '自動保存に失敗しました');
-      });
+    return !!a.dirtySince;
+  }
+
+  // 保存していない変更がある（保存の途中・再試行中を含む）。閉じる前の確認に使う
+  function unsavedNow() {
+    checkDirty();
+    const a = state.autosave;
+    return !!(a.dirtySince || autosaving || a.failed);
+  }
+
+  function autosaveTick() {
+    const a = state.autosave;
+    if (!state.ready || !state.features.save || state.busy) return;
+    if (isProjectBusy()) return;
+    if (!checkDirty() || !a.enabled) return;
+    if (a.failed) {
+      if (Date.now() >= a.retryAt) autosaveNow();              // 失敗のあとは、広げた間隔で再試行する
+      return;
     }
+    if (a.pageChanged || Date.now() - a.dirtySince >= a.seconds * 1000) autosaveNow();
+  }
+
+  // タブが隠れた（別のタブへ移った・最小化した・閉じかけている）ら、待ち時間を待たずに保存する
+  function saveEarly() {
+    const a = state.autosave;
+    if (!state.ready || !state.features.save || !a.enabled) return null;
+    if (!checkDirty()) return null;
+    return autosaveNow();
   }
 
   async function offerResume() {
@@ -1704,7 +1853,9 @@
     renderStatus();
 
     try {
-      state.server = (await api('GET', '/api/config')).features || [];
+      const config = await api('GET', '/api/config');
+      state.server = config.features || [];
+      checkBuild(config.build || null);
     } catch (e) {
       state.server = [];
     }
@@ -1731,6 +1882,17 @@
       canvas.on('selection:cleared', () => renderSelection(false));
     }
     setInterval(autosaveTick, POLL_MS);
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) optional(() => saveEarly());
+    });
+    window.addEventListener('pagehide', () => optional(() => saveEarly()));
+    // 保存していない変更があるときは、閉じる・再読み込みの前に確かめる（その間に保存を進める）
+    window.addEventListener('beforeunload', (e) => {
+      if (leaving || !state.features.save || !unsavedNow()) return;
+      optional(() => saveEarly());
+      e.preventDefault();
+      e.returnValue = '';
+    });
     if (problems.length) {
       say('対応していない版です。次の機能は使えません: ' + problems.join(' / '), 'error');
     } else if (!complete) {
@@ -1771,6 +1933,7 @@
   }
 
   buildPanel();
+  document.body.appendChild(ui.banner);
 
   window.inkdeusBridge = {
     version: 1,
@@ -1792,7 +1955,10 @@
       fonts: { names: state.fonts.list.map((x) => x.name), loaded: Array.from(state.fonts.loaded),
         failed: Array.from(state.fonts.failed.keys()), supported: state.fonts.supported },
       autosave: { enabled: state.autosave.enabled, seconds: state.autosave.seconds,
-        dirty: !!state.autosave.dirtySince, lastAt: state.autosave.lastAt } }),
+        dirty: !!state.autosave.dirtySince, lastAt: state.autosave.lastAt, failed: state.autosave.failed,
+        retryMs: state.autosave.retryMs },
+      save: saveStatus(), unsaved: state.ready && !!state.features.save && unsavedNow(), build: state.build,
+      notices: Object.fromEntries(Object.entries(state.notices).map(([k, n]) => [k, n.text])) }),
     // 素材
     listSources, listAssets, refresh, selectSource, setFolder, assetUrl,
     placeAsset, placeInPanel, placeFree,
@@ -1801,7 +1967,7 @@
     panels: () => panels().map(describe),
     objects: () => (has('canvas') ? canvas.getObjects().map(describe) : []),
     // 保存と読み込み
-    listSaved, save, open, autosaveNow,
+    listSaved, save, open, autosaveNow, listBackups, openBackup, showBackups, saveEarly,
     setAutosave(opts) {
       const o = opts || {};
       if (typeof o.enabled === 'boolean') { state.autosave.enabled = o.enabled; ui.autosave.checked = o.enabled; }

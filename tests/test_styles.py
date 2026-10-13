@@ -139,7 +139,8 @@ def test_broken_files_do_not_crash(store, tmp_path):
     path.write_text("{broken", encoding="utf-8")
     store.save({"name": "new", "data": tone()})
     assert [r["name"] for r in store.rows()[0]] == ["new"] and store.rows()[1] == []
-    assert path.with_name("styles.json.broken").read_text(encoding="utf-8") == "{broken"
+    kept = list(path.parent.glob("styles.json.broken-*"))                # 壊れた物は <名前>.broken-<時刻> として残る
+    assert len(kept) == 1 and kept[0].read_text(encoding="utf-8") == "{broken"
 
 
 def test_rename_and_delete(store):

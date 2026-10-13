@@ -141,7 +141,8 @@ def test_static_index(client):
 
 def test_config_has_no_owner_mode(client):
     config = client.get("/api/config").get_json()
-    assert config["project"] is None and set(config) == {"project", "features"}     # 所有者まわりの項目は無い
+    assert config["project"] is None and "owner" not in config                     # 所有者まわりの項目は無い
+    assert set(config) == {"project", "features", "build", "backup", "missingFolders"}
 
 
 def test_owner_flag_is_accepted_but_ignored(dirs, capsys):
@@ -158,8 +159,13 @@ def test_owner_flag_is_accepted_but_ignored(dirs, capsys):
 def test_owner_settings_do_not_change_anything(dirs, tmp_path, monkeypatch):
     """INKDEUS_OWNER や inkdeus.local.toml の owner があっても、既定値も応答も変わらない"""
     _, images, _ = dirs
+    def config_of(client):
+        config = client.get("/api/config").get_json()
+        config["build"].pop("boot")                  # 起動 ID は起動のたびに変わる
+        return config
+
     before = create_app(images, watch=False).test_client()
-    expected = (before.get("/api/config").get_json(), no_ids(before.get("/api/params/scene.png?resolve=1").get_json()))
+    expected = (config_of(before), no_ids(before.get("/api/params/scene.png?resolve=1").get_json()))
     assert expected[1]["params"]["watermark"]["enabled"] is False
     cfg = tmp_path / "inkdeus.local.toml"
     cfg.write_text('owner = true\nprojects_root = "somewhere"\n', encoding="utf-8")
@@ -167,7 +173,7 @@ def test_owner_settings_do_not_change_anything(dirs, tmp_path, monkeypatch):
     monkeypatch.setenv("INKDEUS_OWNER", "1")
     monkeypatch.setattr("inkdeus.server.default_local_config", lambda: cfg)
     after = create_app(images, watch=False).test_client()
-    assert (after.get("/api/config").get_json(), no_ids(after.get("/api/params/scene.png?resolve=1").get_json())) == expected
+    assert (config_of(after), no_ids(after.get("/api/params/scene.png?resolve=1").get_json())) == expected
     cfg.write_text("this is not toml = = =", encoding="utf-8")
     assert read_local_config(cfg) == {}
 
@@ -293,6 +299,8 @@ def test_sse_stream_format(dirs):
     assert resp.mimetype == "text/event-stream"
     chunks = resp.response
     assert next(chunks).startswith(b":")
+    hello = json.loads(next(chunks).decode("utf-8")[6:])                 # 接続の直後に、ビルド識別と起動 ID が届く
+    assert hello["type"] == "hello" and hello["build"] == client.get("/api/config").get_json()["build"]
     client.patch("/api/params/scene.png", data=b"{}")
     line = next(chunks).decode("utf-8")
     assert line.startswith("data: ") and line.endswith("\n\n")

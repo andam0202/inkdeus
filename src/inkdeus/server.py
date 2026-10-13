@@ -7,7 +7,9 @@ schema.py（定義は web/schema.json）で行う。
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import logging
 import os
 import queue
 import re
@@ -25,6 +27,7 @@ from flask import Flask, Response, abort, jsonify, redirect, request, send_file,
 from PIL import Image
 
 from . import assets as assets_mod
+from . import backup as backup_mod
 from . import folders as folders_mod
 from . import fonts as fonts_mod
 from . import manga as manga_mod
@@ -55,7 +58,9 @@ PAINT_TARGET_RE = re.compile(r"layer-[a-z0-9]{4,16}|solid-[\w\-]{1,32}|lines|all
 PAINT_ALL = "all-targets"                              # 削除でだけ使える「全部の対象」
 MAX_PAINT_BYTES = 1 << 28
 # 画面が、サーバにある機能を確かめるための名前
-FEATURES = ["layerIds", "paint", "parts", "userStyles", "mangaPdf", "mangaCommand"]
+FEATURES = ["layerIds", "paint", "parts", "userStyles", "mangaPdf", "mangaCommand",
+            "backup", "build", "paintTiles"]
+log = logging.getLogger("inkdeus")
 MANGA_COMMANDS = ("pdf", "pdf-abort", "layout")       # 漫画の構成の画面へ出せる指示
 MANGA_RESULT_KEEP = 32                                 # 覚えておく指示の結果の数
 
@@ -102,7 +107,7 @@ class Library:
     """入力（1ファイルまたはフォルダ）と、マスク・出力先の対応を管理する"""
 
     def __init__(self, input_path: Path, mask_dir: Path | None, out_dir: Path | None,
-                 parts_dir: Path | None = None):
+                 parts_dir: Path | None = None, allow_missing: bool = False):
         input_path = Path(input_path).resolve()
         if input_path.is_dir():
             self.folder, self.single = input_path, None
@@ -110,8 +115,14 @@ class Library:
             if input_path.suffix.lower() not in IMAGE_EXTENSIONS:
                 raise ValueError(f"対応していない画像形式です: {input_path.name}")
             self.folder, self.single = input_path.parent, input_path.name
+        elif allow_missing:
+            # 元画像の場所が見つからないプロジェクト（動かした・消した・別の PC から持ってきた）。
+            # 画像 0 枚として動かし、画面に「見つかりません」と出す（inkdeus relink で付け替える）
+            self.folder, self.single = input_path, None
         else:
             raise FileNotFoundError(f"入力が見つかりません: {input_path}")
+        self.backups: backup_mod.Store | None = None          # 世代バックアップの置き場（create_app が入れる）
+        self.backup_base: Path | None = None                  # バックアップのキーの基準（既定のフォルダの out）
         self.mask_dir = Path(mask_dir).resolve() if mask_dir else None
         # 部分マスク（髪・肌・服など）の置き場。稼働中に登録が変わったら差し替えられる
         self.parts_dir = Path(parts_dir).resolve() if parts_dir else None
@@ -120,12 +131,38 @@ class Library:
             raise ValueError("--out-dir に入力フォルダそのものは指定できません（入力画像を上書きしないため）")
         self._dims: dict[tuple[str, int, int], tuple[int, int]] = {}
 
+    @property
+    def missing(self) -> bool:
+        """元画像の場所が見つからない"""
+        return not self.folder.is_dir()
+
+    def backup_key(self, path: Path) -> str | None:
+        """そのファイルのバックアップのキー（out からの相対パス。out の外なら None）"""
+        try:
+            return Path(path).relative_to(self.backup_base or self.out_dir).as_posix()
+        except ValueError:
+            return None
+
+    def stash(self, path: Path, new_data: bytes | None = None, force: bool = False):
+        """上書き・削除の直前に、いまのファイルを退避する（バックアップが切ってあれば何もしない）"""
+        key = self.backup_key(path) if self.backups is not None else None
+        if key is None:
+            return None
+        try:
+            return self.backups.stash(path, key, new_data=new_data, force=force)
+        except OSError as e:                         # 退避に失敗しても、保存そのものは止めない
+            log.warning("backup: 退避できませんでした（%s）: %s", key, e)
+            return None
+
     def entries(self) -> dict[str, Entry]:
         """現在の一覧（名前 → Entry）。API はここにある名前だけを受け付ける"""
         if self.single is not None:
             files = [self.folder / self.single]
         else:
-            files = sorted(p for p in self.folder.iterdir() if is_image(p))
+            try:
+                files = sorted(p for p in self.folder.iterdir() if is_image(p))
+            except OSError:
+                files = []                           # 元画像の場所が見つからない（稼働中に消えた場合も落ちない）
         files = [p for p in files if p.is_file()]
         stems: dict[str, int] = {}
         for p in files:
@@ -223,37 +260,11 @@ class Library:
 
     def paint_rows(self, entry: Entry, version: str = "") -> list[dict]:
         """保存されている対象の一覧（実際にあるファイルから作る）"""
-        rows = []
-        try:
-            with os.scandir(self.paint_dir(entry, version)) as it:
-                items = sorted(it, key=lambda i: i.name)
-        except OSError:
-            return rows
-        for item in items:
-            target = item.name[:-4] if item.name.endswith(".png") else ""
-            if PAINT_TARGET_RE.fullmatch(target) is None:
-                continue
-            try:
-                if not item.is_file():
-                    continue
-                st = item.stat()
-            except OSError:
-                continue
-            rows.append({"target": target, "file": item.name, "bytes": st.st_size, "mtime": st.st_mtime,
-                         "stamp": st.st_mtime_ns // 1_000_000})
-        return rows
+        return paint_rows_in(self.paint_dir(entry, version))
 
     def write_paint_index(self, entry: Entry, version: str = "") -> list[dict]:
         """目録（index.json）を書き直す。対象が1つも無くなったらフォルダごと片付ける"""
-        folder = self.paint_dir(entry, version)
-        rows = self.paint_rows(entry, version)
-        if not rows:
-            shutil.rmtree(folder, ignore_errors=True)
-            return rows
-        data = {"version": PAINT_FORMAT, "targets": [{k: r[k] for k in ("target", "file", "bytes", "mtime")}
-                                                     for r in rows]}
-        _atomic_write(folder / PAINT_INDEX, (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
-        return rows
+        return write_paint_index_in(self.paint_dir(entry, version))
 
     def paint_stamp(self, entry: Entry, version: str = "") -> int | None:
         """消しゴム・ペンが最後に変わった時刻（ns）。無ければ None。
@@ -375,6 +386,42 @@ class Library:
         return True, done >= max(inputs)
 
 
+def paint_rows_in(folder: Path) -> list[dict]:
+    """消しゴム・ペンの置き場所（<名前>.paint/）に保存されている対象の一覧"""
+    rows = []
+    try:
+        with os.scandir(folder) as it:
+            items = sorted(it, key=lambda i: i.name)
+    except OSError:
+        return rows
+    for item in items:
+        target = item.name[:-4] if item.name.endswith(".png") else ""
+        if PAINT_TARGET_RE.fullmatch(target) is None:
+            continue
+        try:
+            if not item.is_file():
+                continue
+            st = item.stat()
+        except OSError:
+            continue
+        rows.append({"target": target, "file": item.name, "bytes": st.st_size, "mtime": st.st_mtime,
+                     "stamp": st.st_mtime_ns // 1_000_000, **({"broken": True} if st.st_size == 0 else {})})
+    return rows
+
+
+def write_paint_index_in(folder: Path) -> list[dict]:
+    """目録（index.json）を書き直す。対象が1つも無くなったらフォルダごと片付ける"""
+    rows = paint_rows_in(folder)
+    if not rows:
+        if folder.is_dir() and not any(backup_mod.BROKEN_MARK in p.name for p in folder.iterdir()):
+            shutil.rmtree(folder, ignore_errors=True)
+        return rows
+    data = {"version": PAINT_FORMAT, "targets": [{k: r[k] for k in ("target", "file", "bytes", "mtime")}
+                                                 for r in rows]}
+    _atomic_write(folder / PAINT_INDEX, (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+    return rows
+
+
 def _newest(folder: Path) -> int | None:
     """フォルダと、その直下のファイルのうち、いちばん新しい更新時刻（ns）。フォルダが無ければ None"""
     try:
@@ -387,10 +434,92 @@ def _newest(folder: Path) -> int | None:
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    backup_mod.atomic_write(path, data)
+
+
+def params_broken(data: bytes | None) -> bool:
+    """設定ファイルが壊れているか（0 バイト、JSON として読めない、JSON オブジェクトでない）"""
+    if data is None:
+        return False
+    try:
+        return not isinstance(json.loads(data.decode("utf-8")), dict)
+    except (UnicodeDecodeError, ValueError):
+        return True
+
+
+class BrokenFile(Exception):
+    """壊れたファイルを上書きしようとした（利用者に見せる理由つき）"""
+
+
+def _git_commit(repo: Path) -> str:
+    """リポジトリのコミット（git を呼ばずに .git を読む。分からなければ ""）"""
+    try:
+        git = repo / ".git"
+        if git.is_file():                            # worktree: 「gitdir: <場所>」
+            git = Path(git.read_text(encoding="utf-8").split(":", 1)[1].strip())
+            if not git.is_absolute():
+                git = (repo / git).resolve()
+        head = (git / "HEAD").read_text(encoding="utf-8").strip()
+        if not head.startswith("ref:"):
+            return head[:40]
+        ref = head.split(":", 1)[1].strip()
+        common = git
+        if (git / "commondir").is_file():
+            common = (git / (git / "commondir").read_text(encoding="utf-8").strip()).resolve()
+        for base in (git, common):
+            if (base / ref).is_file():
+                return (base / ref).read_text(encoding="utf-8").strip()[:40]
+        for line in (common / "packed-refs").read_text(encoding="utf-8").splitlines():
+            if line.endswith(" " + ref):
+                return line.split(" ", 1)[0][:40]
+    except (OSError, IndexError):
+        pass
+    return ""
+
+
+class Build:
+    """ビルド識別: リポジトリのコミットと、web/ のファイルの要約ハッシュ。起動のたびに変わる起動 ID も持つ。
+    画面は、読み込んだときの識別と違う物を見つけたら「再読み込みしてください」と知らせる"""
+
+    def __init__(self, web: Path, tag: str | None = None):
+        self.web_dir = web
+        self.tag = tag                               # テスト用: 識別子を外から決める
+        self.commit = _git_commit(web.parent)
+        self.boot = hashlib.sha1(os.urandom(16)).hexdigest()[:12]
+        self._sig: tuple | None = None
+        self._hash = ""
+        self.web = self.web_now()                    # 起動時点の web/ の要約
+
+    def web_now(self) -> str:
+        """いまの web/ の要約ハッシュ（ファイルの名前・大きさ・更新時刻が変わっていなければ、前の値を使い回す）"""
+        files = []
+        for cur, dirs, names in os.walk(self.web_dir):
+            dirs.sort()
+            for name in sorted(names):
+                p = Path(cur) / name
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                files.append((p.relative_to(self.web_dir).as_posix(), st.st_size, st.st_mtime_ns, p))
+        sig = tuple(f[:3] for f in files)
+        if sig != self._sig:
+            h = hashlib.sha1()
+            for rel, _size, _mtime, p in files:
+                h.update(rel.encode("utf-8") + b"\0")
+                try:
+                    h.update(hashlib.sha1(p.read_bytes()).digest())
+                except OSError:
+                    pass
+            self._sig, self._hash = sig, h.hexdigest()[:12]
+        return self._hash
+
+    def info(self) -> dict:
+        now = self.web_now()
+        ident = self.tag or f"{self.commit[:12] or 'nogit'}-{now}"
+        return {"id": ident, "commit": self.commit, "web": self.web, "webNow": now, "boot": self.boot,
+                # 起動後に web/ が変わった（画面の方が新しい）。サーバを再起動するまで、新しい機能の一部は動かない
+                "stale": now != self.web}
 
 
 def rev_of(data: bytes) -> str:
@@ -468,6 +597,7 @@ class Session:
         self.batch: dict = {"seq": 0, "running": False}       # 一括書き出しの進み具合（ブラウザが知らせてくる）
         self._stop = threading.Event()
         self._primed = False                                  # 最初の走査（起動時の状態の記録）が済んだか
+        self.paint_seen: dict[tuple[str, str, str], int | None] = {}   # (フォルダ, 画像名, バージョン) → 消しゴム・ペンの時刻
 
     # ---- 設定ファイル ----
 
@@ -484,12 +614,16 @@ class Session:
         data, rev = self.read_params(entry, version)
         raw = None
         problems: list[str] = []
-        if data is not None:
-            try:
-                raw = json.loads(data.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError):
-                problems.append("設定ファイルが JSON として読めないため既定値を使いました")
+        broken = params_broken(data)
+        if broken:
+            problems.append("設定ファイルが壊れています（0 バイト、または JSON として読めません）。既定値を表示しています。"
+                            "ファイルは上書きしていません（inkdeus backup restore で、以前の状態に戻せます）")
+        elif data is not None:
+            raw = json.loads(data.decode("utf-8"))
         params, warns = schema.normalize(raw)
+        if broken:
+            return {"name": entry.name, "version": version, "rev": rev, "exists": True, "broken": True,
+                    "params": params, "warnings": problems + warns}
         if persist and isinstance(raw, dict) and schema.lacks_layer_ids(raw):
             # 層の id が入る前に保存された設定。補った id をその場で保存する（読むたびに違う id にならないように）
             rev = self.write_params(entry, params, None, version, keep_mtime=True)
@@ -522,6 +656,16 @@ class Session:
                 before = path.stat() if keep_mtime else None
             except OSError:
                 before = None
+            try:
+                current = path.read_bytes()
+            except OSError:
+                current = None
+            if params_broken(current):
+                # 壊れたファイルは、上書きせずに <名前>.broken-<時刻> として残す
+                kept = backup_mod.move_broken(path)
+                log.warning("壊れた設定ファイルを残しました: %s", kept)
+            elif not keep_mtime:
+                self.lib.stash(path, data)            # 上書きの直前に、いまの設定を退避する
             _atomic_write(path, data)
             if before is not None:
                 os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
@@ -541,6 +685,7 @@ class Session:
         gone = [r for r in self.lib.paint_rows(entry, version)
                 if r["target"].startswith("layer-") and r["target"] not in keep]
         for row in gone:
+            self.lib.stash(self.lib.paint_dir(entry, version) / row["file"])
             (self.lib.paint_dir(entry, version) / row["file"]).unlink(missing_ok=True)
         if gone:
             self.lib.write_paint_index(entry, version)
@@ -610,8 +755,39 @@ class Session:
                         s.scan()
                     except Exception:  # noqa: BLE001 — 監視は止めない
                         pass
+                try:
+                    self.scan_paint(sessions())
+                except Exception:  # noqa: BLE001
+                    pass
 
         threading.Thread(target=loop, name="inkdeus-watch", daemon=True).start()
+
+    def note_paint(self, folder: str, lib: Library, entry: Entry, version: str) -> None:
+        """サーバ自身が消しゴム・ペンを書いた（消した）ことを覚える（監視が「外部からの変更」と取り違えないように）"""
+        self.paint_seen[(folder, entry.name, version)] = lib.paint_stamp(entry, version)
+
+    def scan_paint(self, sessions: list) -> dict | None:
+        """いまブラウザで開いている画像・バージョンの消しゴム・ペンが、サーバ以外の手で変わっていたら知らせる
+        （inkdeus backup restore で戻したときに、開いている画面へ反映するため）"""
+        name, folder, version = self.current, self.current_folder, self.current_version
+        target = next((s for s in sessions if s.folder == folder), None)
+        if name is None or target is None:
+            return None
+        entry = target.lib.entries().get(name)
+        if entry is None:
+            return None
+        key = (folder, name, version)
+        stamp = target.lib.paint_stamp(entry, version)
+        if key not in self.paint_seen:
+            self.paint_seen[key] = stamp
+            return None
+        if self.paint_seen[key] == stamp:
+            return None
+        self.paint_seen[key] = stamp
+        event = {"type": "paint", "action": "external", "folder": folder, "name": name, "version": version,
+                 "targets": [r["target"] for r in target.lib.paint_rows(entry, version)], "source": None}
+        self.hub.publish(event)
+        return event
 
     def stop(self) -> None:
         self._stop.set()
@@ -651,6 +827,7 @@ class Registry:
                 if built is None or built[0] != key or built[1] is None:
                     try:
                         lib = Library(d.images, d.masks, folders_mod.out_dir(self.lib.out_dir, d.name), d.parts)
+                        lib.backups, lib.backup_base = self.lib.backups, self.lib.backup_base or self.lib.out_dir
                         built = (key, lib, Session(lib, self.session.hub, d.name), d.note)
                     except (OSError, ValueError):
                         built = (key, None, None, d.note)
@@ -665,6 +842,17 @@ class Registry:
             if folder == name and lib is not None:
                 return lib, sess
         return None
+
+    def missing(self) -> list[dict]:
+        """元画像の場所が見つからない画像フォルダ（既定のフォルダも含む）"""
+        out = []
+        if self.lib.missing:
+            out.append({"name": folders_mod.DEFAULT, "label": "既定", "images": str(self.lib.folder)})
+        defs = {d.name: d for d in self.defs()}
+        for name, lib, _s, _n in self.rows():
+            if name != folders_mod.DEFAULT and (lib is None or lib.missing):
+                out.append({"name": name, "label": name, "images": str(defs[name].images) if name in defs else ""})
+        return out
 
     def libraries(self) -> list[tuple[str, Library]]:
         return [(name, lib) for name, lib, _s, _n in self.rows() if lib is not None]
@@ -694,16 +882,27 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
                cache_root: Path | str | None = None,
                folders: list | None = None,
                parts_dir: Path | str | None = None,
-               config_dir: Path | str | None = None) -> Flask:
+               config_dir: Path | str | None = None,
+               allow_missing: bool = False,
+               build_tag: str | None = None) -> Flask:
     """アプリを作る。project はプロジェクトの情報（任意）。
     folders は追加の画像フォルダ（folders.FolderDef の並び。プロジェクトの設定ファイルの [[folders]] とは別に足す分）。
     local_config は共通設定ファイル（省略時はリポジトリ直下の inkdeus.local.toml）、
     cache_root は漫画エディタのキャッシュ置き場（省略時は INKDEUS_CACHE か既定の場所）、
     parts_dir は既定のフォルダの部分マスクの置き場、
-    config_dir は利用者の設定フォルダ（自分用スタイルの置き場。省略時は INKDEUS_CONFIG か ~/.config/inkdeus）"""
+    config_dir は利用者の設定フォルダ（自分用スタイルの置き場。省略時は INKDEUS_CONFIG か ~/.config/inkdeus）、
+    allow_missing は「元画像の場所が見つからなくても起動する」（画面に、付け替え方の案内を出す）、
+    build_tag はビルド識別を外から決める（テスト用）"""
     lib = Library(Path(input_path), Path(mask_dir) if mask_dir else None,
-                  Path(out_dir) if out_dir else None, Path(parts_dir) if parts_dir else None)
+                  Path(out_dir) if out_dir else None, Path(parts_dir) if parts_dir else None,
+                  allow_missing=allow_missing)
     web = find_web_dir()
+    build = Build(web, build_tag)
+    local_settings = read_local_config(Path(local_config) if local_config else None)
+    backup_config = backup_mod.read_config(local_settings)
+    # 世代バックアップの置き場（プロジェクト単位。追加の画像フォルダの分も、ここへフォルダの構成のまま入る）
+    backups = backup_mod.Store(lib.out_dir / backup_mod.DIR, backup_config)
+    lib.backups, lib.backup_base = backups, lib.out_dir
     session = Session(lib)
     project_dir = Path(project["path"]) if project and project.get("path") else None
     registry = Registry(lib, session, folders, project_dir / "inkdeus.project.toml" if project_dir else None)
@@ -719,6 +918,11 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
     manga_site = manga_mod.MangaSite(Path(cache_root) if cache_root else None)
     # 自分用スタイル（利用者共通は設定フォルダ、プロジェクト専用はプロジェクトのフォルダ直下の styles.json）
     style_store = styles_mod.Store(Path(config_dir) if config_dir else None, project_dir)
+    # 自分用スタイルの退避: このプロジェクトの分はプロジェクトの置き場、全プロジェクト共通の分は設定フォルダの .backup
+    user_backups = backup_mod.Store(style_store.files["user"].parent / backup_mod.DIR, backup_config)
+    style_store.before_write = lambda scope, path, data: (
+        backups.stash(path, f"{backup_mod.PROJECT_PREFIX}/{path.name}", new_data=data) if scope == "project"
+        else user_backups.stash(path, path.name, new_data=data))
     app = Flask(__name__, static_folder=str(web), static_url_path="")
     app.config["MAX_CONTENT_LENGTH"] = MAX_EXPORT_BYTES
     app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
@@ -728,6 +932,11 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
     app.config["INKDEUS_ASSETS"] = catalog
     app.config["INKDEUS_MANGA_DIR"] = manga_dir
     app.config["INKDEUS_STYLES"] = style_store
+    app.config["INKDEUS_BACKUPS"] = backups
+    app.config["INKDEUS_BUILD"] = build
+    for gone in registry.missing():
+        log.warning("元画像の場所が見つかりません（フォルダ「%s」: %s）。inkdeus relink で付け替えられます",
+                    gone["label"], gone["images"])
     if watch:
         session.start_watching(registry.sessions)
     notice = manga_mod.pending_notice(manga_mod.status(manga_site.root))
@@ -810,7 +1019,10 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
 
     @app.get("/api/config")
     def api_config():
-        return jsonify({"project": project, "features": FEATURES})
+        return jsonify({"project": project, "features": FEATURES, "build": build.info(),
+                        "missingFolders": registry.missing(),
+                        "backup": {"enabled": backup_config.enabled, "keepRecent": backup_config.keep_recent,
+                                   "maxTotalMb": backup_config.max_total_mb}})
 
     @app.get("/api/manga/status")
     def api_manga_status():
@@ -953,6 +1165,8 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
 
     # ---- 漫画の構成: 漫画データ（漫画エディタの保存形式のまま）と書き出したページ ----
 
+    manga_lock = threading.Lock()
+
     def manga_name(name: str) -> str:
         if MANGA_NAME_RE.fullmatch(name) is None:
             abort(400, description="名前に使えるのは英数字・かな漢字・_ - だけです（64 文字まで）")
@@ -965,22 +1179,52 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
             for p in sorted(manga_dir.iterdir()):
                 if p.suffix == MANGA_SUFFIX and p.is_file() and MANGA_NAME_RE.fullmatch(p.stem):
                     st = p.stat()
+                    key = f"{backup_mod.MANGA_PREFIX}/{p.name}"
                     rows.append({"name": p.stem, "bytes": st.st_size, "mtime": st.st_mtime,
-                                 "autosave": p.stem == MANGA_AUTOSAVE})
+                                 "autosave": p.stem == MANGA_AUTOSAVE,
+                                 "backups": len([e for e in backups.entries(key) if not e.absent])})
         return jsonify({"dir": str(manga_dir), "autosaveName": MANGA_AUTOSAVE, "projects": rows})
 
     @app.route("/api/manga/project/<name>", methods=["GET", "PUT"])
     def api_manga_project(name: str):
         path = manga_dir / (manga_name(name) + MANGA_SUFFIX)
+        key = f"{backup_mod.MANGA_PREFIX}/{path.name}"
         if request.method == "GET":
             if not path.is_file():
                 abort(404)
+            if not looks_like_manga_data(path.read_bytes()):
+                # 壊れた漫画データ（0 バイトなど）。そのまま渡さず、以前の版から戻せることを伝える
+                log.warning("漫画データが壊れています: %s", path)
+                return jsonify({"error": "この漫画データは壊れています（0 バイト、または形式が違います）。"
+                                         "「以前の版」から開き直せます", "broken": True,
+                                "backups": len([e for e in backups.entries(key) if not e.absent])}), 422
             return send_file(path, mimetype="application/octet-stream")
         data = request.get_data(cache=False)
         if not looks_like_manga_data(data):
             abort(400, description="漫画データとして読めません")
-        _atomic_write(path, data)
+        with manga_lock:
+            if path.is_file() and not looks_like_manga_data(path.read_bytes()):
+                kept = backup_mod.move_broken(path)   # 壊れた物は上書きせずに残す
+                log.warning("壊れた漫画データを残しました: %s", kept)
+            else:
+                backups.stash(path, key, new_data=data)
+            _atomic_write(path, data)
         return jsonify({"name": name, "path": str(path), "bytes": len(data), "mtime": path.stat().st_mtime})
+
+    @app.get("/api/manga/backups/<name>")
+    def api_manga_backups(name: str):
+        """その漫画データの以前の版（新しい順）"""
+        key = f"{backup_mod.MANGA_PREFIX}/{manga_name(name)}{MANGA_SUFFIX}"
+        return jsonify({"name": name, "backups": [e.info() for e in backups.entries(key) if not e.absent]})
+
+    @app.get("/api/manga/backup/<name>/<at>")
+    def api_manga_backup(name: str, at: str):
+        """以前の版の中身（漫画エディタの保存形式のまま。開くだけで、いまの保存データは変えない）"""
+        key = f"{backup_mod.MANGA_PREFIX}/{manga_name(name)}{MANGA_SUFFIX}"
+        entry = next((e for e in backups.entries(key) if e.stamp == at and not e.absent), None)
+        if entry is None:
+            abort(404)
+        return send_file(entry.path, mimetype="application/octet-stream")
 
     @app.get("/api/manga/pages/<name>")
     def api_manga_pages(name: str):
@@ -1160,7 +1404,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         rows = []
         for name, flib, _sess, note in registry.rows():
             row = {"name": name, "label": "既定" if name == folders_mod.DEFAULT else name, "note": note,
-                   "missing": flib is None, "images": None, "masks": None, "out": None,
+                   "missing": flib is None or flib.missing, "images": None, "masks": None, "out": None,
                    "parts": None, "partNames": [],
                    "counts": {"images": 0, "masks": 0, "configured": 0, "exported": 0}}
             if flib is not None:
@@ -1175,7 +1419,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
                     "configured": sum(1 for e in entries if "params" in index[e].get("", {})),
                     "exported": sum(1 for e in entries if "export" in index[e].get("", {}))}
             rows.append(row)
-        return jsonify({"folders": rows, "current": session.current_folder})
+        return jsonify({"folders": rows, "current": session.current_folder, "missingFolders": registry.missing()})
 
     @app.get("/api/images")
     def api_images():
@@ -1201,6 +1445,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
                 "versions": versions,
             })
         return jsonify({"folder": folder, "images": items, "outDir": str(lib.out_dir),
+                        "missing": lib.missing, "missingFolders": registry.missing(),
                         "maskDir": str(lib.mask_dir) if lib.mask_dir else None,
                         "partsDir": str(lib.parts_dir) if lib.parts_dir else None,
                         "parts": part_names, "partWarnings": part_warnings})
@@ -1234,6 +1479,112 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         """設定に書ける部分名: 部分マスクの置き場にある部分と、既に設定に入っている部分"""
         return {*lib.part_names(), *schema.part_keys(base)}
 
+    def announce_params(fs: Session, lib: Library, entry: Entry, version: str) -> None:
+        """サーバが設定ファイルを戻した（消した）ことを、開いている画面へ「外部からの変更」として知らせる"""
+        path = lib.params_path(entry, version)
+        _data, rev = fs.read_params(entry, version)
+        fs.remember(path, entry, version, rev)
+        session.hub.publish({"type": "params", "folder": fs.folder, "name": entry.name, "version": version,
+                             "rev": rev, "source": None})
+
+    def broken_params(lib: Library, entry: Entry, version: str):
+        """壊れた設定ファイル（0 バイト、JSON として読めない）への応答。上書きはしない"""
+        path = lib.params_path(entry, version)
+        key = lib.backup_key(path)
+        usable = [e for e in (backups.entries(key) if key else []) if not e.absent and e.bytes > 0]
+        log.warning("設定ファイルが壊れています: %s（バックアップ %d 件）", path, len(usable))
+        return jsonify({"error": "設定ファイルが壊れています（0 バイト、または JSON として読めません）。"
+                                 "ファイルは上書きしていません", "broken": True, "name": entry.name,
+                        "version": version, "path": str(path), "backups": [e.info() for e in usable[:20]]}), 422
+
+    @app.post("/api/repair/<path:name>")
+    def api_repair(name: str):
+        """壊れた設定ファイルの扱いを、利用者が選んだとおりにする。
+        action = "restore": 最新のバックアップから戻す / "reset": 既定値で始める。
+        どちらも、壊れたファイルは <名前>.broken-<時刻> として残す"""
+        folder, lib, fs = pick()
+        entry = lib.get(name)
+        version = ver_arg(lib, entry)
+        action = json_body().get("action")
+        if action not in ("restore", "reset"):
+            abort(400, description="action は restore / reset のどちらかです")
+        path = lib.params_path(entry, version)
+        with fs.lock:
+            data, _rev = fs.read_params(entry, version)
+            if not params_broken(data):
+                return jsonify({"repaired": False, "reason": "設定ファイルは壊れていません"})
+            key = lib.backup_key(path)
+            usable = [e for e in (backups.entries(key) if key else [])
+                      if not e.absent and not params_broken(e.path.read_bytes())]
+            if action == "restore" and not usable:
+                abort(409, description="戻せるバックアップがありません")
+            kept = backup_mod.move_broken(path)
+            if action == "restore":
+                backup_mod.atomic_copy(usable[0].path, path)
+            log.warning("壊れた設定ファイルを残しました: %s（%s）", kept, action)
+            announce_params(fs, lib, entry, version)
+        return jsonify({"repaired": True, "action": action, "kept": str(kept) if kept else None,
+                        "restored": usable[0].info() if action == "restore" else None})
+
+    # ---- 以前の状態に戻す（画像・バージョンごとの、設定と消しゴム・ペンの世代バックアップ）----
+
+    def unit_keys(lib: Library, entry: Entry, version: str) -> dict[str, tuple[str, Path]]:
+        """その画像・バージョンの退避のキー → (種類の表示名, 戻す先)"""
+        out: dict[str, tuple[str, Path]] = {}
+        params = lib.params_path(entry, version)
+        key = lib.backup_key(params)
+        if key:
+            out[key] = ("設定", params)
+        folder = lib.paint_dir(entry, version)
+        prefix = lib.backup_key(folder)
+        if prefix:
+            for k in backups.keys(prefix + "/"):
+                target = k[len(prefix) + 1:]
+                if target.endswith(".png") and PAINT_TARGET_RE.fullmatch(target[:-4]):
+                    out[k] = (f"消しゴム・ペン（{target[:-4]}）", folder / target)
+        return out
+
+    def unit_points(lib: Library, entry: Entry, version: str) -> list[dict]:
+        """戻せる時点の一覧（新しい順）"""
+        return backup_mod.points(backups, {k: v[0] for k, v in unit_keys(lib, entry, version).items()})
+
+    def restore_unit(folder: str, lib: Library, fs: Session, entry: Entry, version: str, t: float) -> dict:
+        """設定と消しゴム・ペンを、時刻 t の変更の直前の状態へ戻す。戻す前のいまの状態も退避する"""
+        # 戻す前の状態を退避する時刻（退避の名前はミリ秒までなので、そろえておく。取り消しはこの時刻を指す）
+        began = backup_mod.parse_stamp(backup_mod.stamp_name(time.time()))
+        with fs.lock:
+            changed = backup_mod.restore_at(backups, unit_keys(lib, entry, version), t, now=began)
+            painted = any(label != "設定" for label in changed)
+            if painted:
+                lib.write_paint_index(entry, version)
+                session.note_paint(folder, lib, entry, version)
+            if "設定" in changed:
+                announce_params(fs, lib, entry, version)
+        if painted:
+            paint_changed(folder, entry, version, "restore", [r["target"] for r in lib.paint_rows(entry, version)],
+                          external=True)
+        return {"folder": folder, "name": entry.name, "version": version, "restored": changed,
+                "undo": began, "points": unit_points(lib, entry, version)}
+
+    @app.route("/api/backups/<path:name>", methods=["GET", "POST"])
+    def api_backups(name: str):
+        folder, lib, fs = pick()
+        entry = lib.get(name)
+        version = ver_arg(lib, entry, must_exist=False)
+        if request.method == "GET":
+            return jsonify({"folder": folder, "name": entry.name, "version": version,
+                            "enabled": backup_config.enabled, "points": unit_points(lib, entry, version)})
+        at = json_body().get("at")
+        points = unit_points(lib, entry, version)
+        try:
+            if isinstance(at, (int, float)) and not isinstance(at, bool):
+                t = float(at)                        # 時刻そのもの（復元の取り消しで使う）
+            else:
+                t = backup_mod.pick_point(points, str(at))
+        except backup_mod.BackupError as e:
+            abort(400, description=str(e))
+        return jsonify(restore_unit(folder, lib, fs, entry, version, t))
+
     @app.route("/api/params/<path:name>", methods=["GET", "PUT", "PATCH"])
     def api_params(name: str):
         folder, lib, fs = pick()
@@ -1245,6 +1596,8 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
             data, rev = fs.read_params(entry, version)
             if data is None:
                 abort(404)
+            if params_broken(data):
+                return broken_params(lib, entry, version)
             resp = Response(data, mimetype="application/json")
             resp.headers["X-Inkdeus-Rev"] = rev
             return resp
@@ -1255,6 +1608,8 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
                                   keep_mtime=request.headers.get("X-Inkdeus-Ids-Only") == "1")
             return jsonify({"path": str(lib.params_path(entry, version)), "rev": rev, "version": version})
         # PATCH: 外部からの部分更新（JSON Merge Patch）。検証に通らなければ何も書かない
+        if params_broken(fs.read_params(entry, version)[0]):
+            return broken_params(lib, entry, version)
         base = fs.resolved(entry, version, persist=False)["params"]
         try:
             merged = schema.seed_parts(schema.merge_patch(base, body), base)
@@ -1273,6 +1628,8 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         body = json_body()
         if not isinstance(body.get("key"), str) or "value" not in body:
             return fail(["key と value が必要です"])
+        if params_broken(fs.read_params(entry, version)[0]):
+            return broken_params(lib, entry, version)
         base = fs.resolved(entry, version, persist=False)["params"]
         try:
             params, _ = schema.normalize(schema.set_path(base, body["key"], body["value"]),
@@ -1288,6 +1645,8 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         entry = lib.get(name)
         version = ver_arg(lib, entry)
         body = json_body()
+        if params_broken(fs.read_params(entry, version)[0]):
+            return broken_params(lib, entry, version)
         base = fs.resolved(entry, version, persist=False)["params"]
         region = str(body.get("region", "person"))
         try:
@@ -1402,10 +1761,82 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         return {"folder": folder, "name": entry.name, "version": version, "format": PAINT_FORMAT,
                 "dir": str(lib.paint_dir(entry, version)), "targets": lib.paint_rows(entry, version)}
 
-    def paint_changed(folder: str, entry: Entry, version: str, action: str, targets: list[str]) -> None:
+    def paint_changed(folder: str, entry: Entry, version: str, action: str, targets: list[str],
+                      external: bool = False) -> None:
         session.hub.publish({"type": "paint", "action": action, "folder": folder, "name": entry.name,
                              "version": version, "targets": targets,
-                             "source": request.headers.get("X-Inkdeus-Client")})
+                             "source": None if external else request.headers.get("X-Inkdeus-Client")})
+
+    def png_broken(path: Path) -> bool:
+        try:
+            with open(path, "rb") as f:
+                return f.read(len(PNG_SIGNATURE)) != PNG_SIGNATURE
+        except OSError:
+            return False
+
+    def keep_or_stash(lib: Library, path: Path, data: bytes | None) -> None:
+        """上書き・削除の直前に: 壊れた PNG は <名前>.broken-<時刻> として残し、そうでなければ退避する"""
+        if path.is_file() and png_broken(path):
+            kept = backup_mod.move_broken(path)
+            log.warning("壊れたファイルを残しました: %s", kept)
+        else:
+            lib.stash(path, data)
+
+    def apply_tiles(path: Path, raw: bytes) -> bytes | None:
+        """保存してある PNG に、変わったタイルだけを書き込んだ結果（PNG）。全部 0 になったら None。
+        本体: 先頭 4 バイト = 見出しの長さ、続いて JSON の見出し {width, height, channels, encoding?, tiles: [{x, y, w, h, n?}]}、
+        残りがタイルの画素（channels = 1 は 1 バイト/画素、2 は R・G の 2 バイト/画素）を並べた物。
+        encoding = "rle" のときは、各タイルが n バイトの連長圧縮（[個数 1〜255, 画素の値 × channels] の繰り返し）"""
+        if len(raw) < 4:
+            abort(400, description="タイルの本体が短すぎます")
+        (size,) = struct.unpack("<I", raw[:4])
+        try:
+            head = json.loads(raw[4:4 + size].decode("utf-8"))
+            width, height, channels = int(head["width"]), int(head["height"]), int(head["channels"])
+            rle = head.get("encoding") == "rle"
+            tiles = [(int(t["x"]), int(t["y"]), int(t["w"]), int(t["h"]), int(t["n"]) if rle else 0)
+                     for t in head["tiles"]]
+        except (UnicodeDecodeError, ValueError, KeyError, TypeError):
+            abort(400, description="タイルの見出しを読めません")
+        if channels not in (1, 2) or not (0 < width <= 32768 and 0 < height <= 32768):
+            abort(400, description="タイルの見出しの値が使えません")
+        mode = "L" if channels == 1 else "RGB"
+        if path.is_file() and not png_broken(path):
+            with Image.open(path) as im:
+                if im.size != (width, height):
+                    abort(409, description="保存してある絵と大きさが違います（全体を保存し直してください）")
+                base = im.convert(mode)
+        else:
+            base = Image.new(mode, (width, height), 0)
+        at = 4 + size
+        for x, y, w, h, packed in tiles:
+            if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > width or y + h > height:
+                abort(400, description="タイルが絵の外にはみ出しています")
+            if rle:
+                source = raw[at:at + packed]
+                at += packed
+                parts = []
+                if packed < 0 or len(source) != packed or packed % (channels + 1):
+                    abort(400, description="タイルの画素が足りません")
+                for i in range(0, packed, channels + 1):
+                    parts.append(source[i + 1:i + 1 + channels] * source[i])
+                chunk = b"".join(parts)
+            else:
+                chunk = raw[at:at + w * h * channels]
+                at += len(chunk)
+            if len(chunk) != w * h * channels:
+                abort(400, description="タイルの画素が足りません")
+            if channels == 1:
+                tile = Image.frombytes("L", (w, h), chunk)
+            else:
+                tile = Image.merge("RGB", (Image.frombytes("L", (w, h), chunk[0::2]),
+                                           Image.frombytes("L", (w, h), chunk[1::2]), Image.new("L", (w, h), 0)))
+            base.paste(tile, (x, y))
+        if base.getbbox() is None:
+            return None
+        out = io.BytesIO()
+        base.save(out, "PNG", compress_level=3)
+        return out.getvalue()
 
     @app.get("/api/paint/<path:name>")
     def api_paint_index(name: str):
@@ -1413,7 +1844,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         entry = lib.get(name)
         return jsonify(paint_listing(folder, lib, entry, ver_arg(lib, entry)))
 
-    @app.route("/api/paint/<path:name>/<target>", methods=["GET", "PUT", "DELETE"])
+    @app.route("/api/paint/<path:name>/<target>", methods=["GET", "PUT", "PATCH", "DELETE"])
     def api_paint(name: str, target: str):
         folder, lib, fs = pick()
         entry = lib.get(name)
@@ -1429,7 +1860,31 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         if request.method == "GET":
             if not path.is_file():
                 abort(404)
+            if png_broken(path):
+                log.warning("消しゴム・ペンのファイルが壊れています: %s", path)
+                return jsonify({"error": "保存してある絵が壊れています（0 バイト、または PNG ではありません）。"
+                                         "「以前の状態に戻す…」で戻せます", "broken": True}), 422
             return send_file(path, mimetype="image/png")
+        if request.method == "PATCH":
+            # 1 筆で変わったタイルだけを書き込む（ポインタを離した直後に送られてくる。全体の PNG を作り直すより早く保存が済む）
+            raw = request.get_data(cache=False)
+            if len(raw) > MAX_PAINT_BYTES:
+                abort(413)
+            with fs.lock:
+                data = apply_tiles(path, raw)
+                keep_or_stash(lib, path, data)
+                if data is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    _atomic_write(path, data)
+                lib.write_paint_index(entry, version)
+                session.note_paint(folder, lib, entry, version)
+            paint_changed(folder, entry, version, "patch", [target])
+            if data is None:
+                return jsonify({"target": target, "deleted": True})
+            st = path.stat()
+            return jsonify({"target": target, "path": str(path), "bytes": len(data), "mtime": st.st_mtime,
+                            "stamp": st.st_mtime_ns // 1_000_000, "deleted": False})
         if request.method == "PUT":
             data = request.get_data(cache=False)
             if len(data) > MAX_PAINT_BYTES:
@@ -1437,8 +1892,10 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
             if not data.startswith(PNG_SIGNATURE):
                 abort(400, description="PNG ではありません")
             with fs.lock:
+                keep_or_stash(lib, path, data)
                 _atomic_write(path, data)
                 lib.write_paint_index(entry, version)
+                session.note_paint(folder, lib, entry, version)
             paint_changed(folder, entry, version, "put", [target])
             st = path.stat()
             return jsonify({"target": target, "path": str(path), "bytes": len(data), "mtime": st.st_mtime,
@@ -1446,9 +1903,11 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         with fs.lock:
             gone = [r for r in lib.paint_rows(entry, version) if everything or r["target"] == target]
             for row in gone:
+                keep_or_stash(lib, lib.paint_dir(entry, version) / row["file"], None)
                 (lib.paint_dir(entry, version) / row["file"]).unlink(missing_ok=True)
             if gone:
                 lib.write_paint_index(entry, version)
+            session.note_paint(folder, lib, entry, version)
         if gone:
             paint_changed(folder, entry, version, "delete", [r["target"] for r in gone])
         return jsonify({**paint_listing(folder, lib, entry, version), "deleted": [r["target"] for r in gone]})
@@ -1542,6 +2001,9 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         if not lib.has_version(entry, version):
             abort(404)
         with fs.lock:
+            lib.stash(lib.params_path(entry, version))            # 消す前に、設定と消しゴム・ペンを退避する
+            for row in lib.paint_rows(entry, version):
+                lib.stash(lib.paint_dir(entry, version) / row["file"])
             for path in (lib.params_path(entry, version), lib.export_path(entry, version)):
                 path.unlink(missing_ok=True)
             shutil.rmtree(lib.paint_dir(entry, version), ignore_errors=True)
@@ -1586,6 +2048,8 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         def stream():
             try:
                 yield ": connected\n\n"
+                # 接続のたびに、ビルド識別と起動 ID を送る（画面が、サーバの更新・再起動に気づけるように）
+                yield f"data: {json.dumps({'type': 'hello', 'build': build.info()}, ensure_ascii=False)}\n\n"
                 while True:
                     try:
                         event = q.get(timeout=HEARTBEAT_SECONDS)

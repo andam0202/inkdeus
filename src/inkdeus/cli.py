@@ -9,6 +9,10 @@
     inkdeus assets add | list | remove <プロジェクト>   漫画の構成で使う素材ソース（画像フォルダ）を登録する
     inkdeus folders add | list | remove <プロジェクト>  プロジェクトの画像フォルダ（画像セット）を足す・外す
     inkdeus parts set | list | unset <プロジェクト>     部分マスク（髪・肌・服など）の置き場を登録する
+    inkdeus backup list | restore | prune <プロジェクト> 保存のたびに残している前の版（世代バックアップ）を見る・戻す・間引く
+    inkdeus export-project <プロジェクト> -o <zip>      プロジェクトの設定・手描き・漫画データを 1 つの zip に書き出す
+    inkdeus import-project <zip> --name <名前>          zip からプロジェクトを作る
+    inkdeus relink <プロジェクト> --images <dir>        元画像の場所を付け替える
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ import logging
 import sys
 from pathlib import Path
 
-from . import ctl, manga
+from . import ctl, maintenance, manga
 from . import folders as folders_mod
 from . import fonts as fonts_mod
 from .assets import BUILTIN as BUILTIN_ASSETS
@@ -30,7 +34,8 @@ from .projects import (ProjectError, add_asset_source, add_folder, create_projec
                        load_project, parts_summary, projects_root, remove_asset_source, remove_folder, set_parts)
 from .server import create_app, default_local_config
 
-COMMANDS = ("run", "new", "open", "projects", "ctl", "manga", "assets", "fonts", "folders", "parts")
+COMMANDS = ("run", "new", "open", "projects", "ctl", "manga", "assets", "fonts", "folders", "parts",
+            "backup", "export-project", "import-project", "relink")
 PARTS_HELP = "部分マスク（髪・肌・服など）の置き場（<dir>/<部分名>/<画像と同名>.png。inkdeus の外で作った物）"
 
 
@@ -126,6 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
     a = asub.add_parser("remove", help="素材ソースの登録を外す（フォルダの中身には触らない）")
     a.add_argument("project", help="プロジェクト名、またはプロジェクトのフォルダ")
     a.add_argument("--name", required=True, help="ソース名")
+    maintenance.add_parsers(sub)
     return ap
 
 
@@ -197,10 +203,19 @@ def cmd_new(args) -> int:
 
 
 def cmd_open(args) -> int:
-    project = load_project(args.project)
+    project = load_project(args.project, check=False)
+    masks = project.masks
+    if project.unset or not project.source.is_dir():
+        # 元画像の場所が見つからなくても起動する（漫画データなどは開ける。画面にも案内が出る）
+        what = "元画像の場所が未設定です" if project.unset else f"元画像の場所が見つかりません: {project.source}"
+        print(f"注意: {what}\n  inkdeus relink {project.name} --images <dir> で付け替えてください", file=sys.stderr)
+    else:
+        project = load_project(args.project)             # 画像が 1 枚も無い・マスクのフォルダが無い、はこれまでどおりエラー
+    if masks is not None and not masks.is_dir():
+        masks = None
     try:
-        app = create_app(project.source, project.masks, project.out, project=project.info(),
-                         parts_dir=project.parts)
+        app = create_app(project.source, masks, project.out, project=project.info(),
+                         parts_dir=project.parts, allow_missing=True)
     except (FileNotFoundError, ValueError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
@@ -219,6 +234,8 @@ def cmd_projects(args) -> int:
     for r in rows:
         if "error" in r:
             print(f"  {r['name']}: 読めません（{r['error']}）")
+        elif r.get("unset"):
+            print(f"  {r['name']}: 元画像の場所が未設定（inkdeus relink {r['name']} --images <dir>）")
         elif r["missing"]:
             print(f"  {r['name']}: 元画像フォルダが見つかりません（{r['source']}）")
         else:
@@ -370,8 +387,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return {"run": cmd_run, "new": cmd_new, "open": cmd_open, "projects": cmd_projects,
                 "assets": cmd_assets, "fonts": cmd_fonts, "folders": cmd_folders,
-                "parts": cmd_parts}[args.command](args)
-    except (ProjectError, parts_mod.PartsError) as e:
+                "parts": cmd_parts, **maintenance.COMMANDS}[args.command](args)
+    except (ProjectError, parts_mod.PartsError, maintenance.BackupError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
 
