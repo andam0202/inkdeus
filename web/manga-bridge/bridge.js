@@ -615,6 +615,7 @@
     ui.dir.title = state.mangaDir;
     const row = state.saved.find((p) => p.name === ui.saved.value);
     ui.btnVersions.hidden = !(f.open && hasServer('backup') && row && row.backups > 0);
+    ui.btnVersions.disabled = !f.open;
     const status = saveStatus();
     ui.saveState.textContent = status.label;
     ui.saveState.dataset.state = status.state;

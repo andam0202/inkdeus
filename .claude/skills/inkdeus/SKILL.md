@@ -231,6 +231,33 @@ uv run inkdeus ctl paint clear all-targets         # 全部消す
   `ctl patch` で層を丸ごと書き直すときは、`id` を省けば同じ位置の層の id（と消しゴム）を引き継ぐ。
 - 置き場所は `<out>/<名前>[@<バージョン>].paint/`（対象ごとの PNG と `index.json`）。バージョンの複製で写り、削除で消える。
 
+### データを守る（バックアップ・書き出しと取り込み・付け替え・更新）
+
+設定・消しゴムとペン・漫画データ・プロジェクトの設定・スタイルは、**上書きの直前に前の版が `<out>/.backup/` へ残る**。
+`ctl set` / `patch` / `preset` での変更も同じ（だから、調整をやり直したいときは戻せる）。
+
+```bash
+uv run inkdeus backup list <プロジェクト> --name <画像名> [--version V] [--folder F]   # 戻せる時点（番号つき・新しい順）
+uv run inkdeus backup restore <プロジェクト> --name <画像名> --at <番号 or 時刻>       # 設定と消しゴム・ペンをまとめて戻す
+uv run inkdeus backup restore <プロジェクト> --kind params --name <画像名> --at 1     # 設定だけ（paint / manga / project / styles も可）
+uv run inkdeus export-project <プロジェクト> -o <zip> [--with-sources] [--with-exports] [--with-backups]
+uv run inkdeus import-project <zip> --name <新しい名前> [--images <dir>] [--masks <dir>]
+uv run inkdeus relink <プロジェクト> [--folder F] --images <新しいdir> [--masks <dir>] [--parts <dir>] [--force]
+```
+
+- 「ある時点へ戻す」= その時点の変更が行われる**直前**の状態にする。戻す前のいまの状態も残り、取り消し方（`--at <時刻>`）が表示される。
+  稼働中のサーバがあれば、戻した中身は開いている画面へ反映される。
+- `ctl get` の応答に `"broken": true` があるとき（設定ファイルが 0 バイト・読めない JSON）は、**`set` / `patch` / `preset` は 422 で断られる**
+  （壊れたファイルを既定値で上書きしないため）。`inkdeus backup restore … --kind params --at 1` で戻すか、画面で利用者に選んでもらう。
+- 元画像のフォルダを動かした・別の PC から持ってきたときは `relink`。付け替え先の「一致 / 不足 / 余分」が出て、不足があれば
+  `--force` 無しでは中止する。`inkdeus projects` に「元画像の場所が未設定」「元画像フォルダが見つかりません」と出るプロジェクトが対象。
+  付け替えたら、サーバを起動し直す。
+- 画面のヘッダの保存の状態は `保存済み / 保存中… / 未保存の変更あり / 保存に失敗（再試行中）`。「保存に失敗」の間は、
+  サーバを起動し直せば、画面が持っている変更がそのまま保存される（**その画面を閉じさせない**）。
+- サーバを別の版で起動し直すと、開いている画面に「inkdeus が更新されました。再読み込みしてください」の帯が出る。
+  コードだけ更新してサーバを起動し直していないと「サーバを再起動してください」の帯が出て、新しい機能の一部が使えない
+  （`/api/config` の `build.stale` が `true`）。**コードを更新したら、サーバを起動し直す。**
+
 ### 画像フォルダが複数あるプロジェクト
 
 プロジェクトは画像フォルダ（画像セット）をいくつも持てる。保存先は、既定のフォルダが `out/` 直下、足したフォルダが `out/@<名前>/`。
