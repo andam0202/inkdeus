@@ -31,6 +31,7 @@ from . import backup as backup_mod
 from . import folders as folders_mod
 from . import fonts as fonts_mod
 from . import manga as manga_mod
+from . import maskedit as maskedit_mod
 from . import parts as parts_mod
 from . import pdf as pdf_mod
 from . import schema
@@ -266,6 +267,26 @@ class Library:
         """目録（index.json）を書き直す。対象が1つも無くなったらフォルダごと片付ける"""
         return write_paint_index_in(self.paint_dir(entry, version))
 
+    # ---- 部分マスク・人物マスクの手直し（元のマスクへの上書き。バージョンには依存しない）----
+
+    def maskedit_dir(self, entry: Entry) -> Path:
+        return self.out_dir / f"{entry.stem}{maskedit_mod.SUFFIX}"
+
+    def maskedit_rows(self, entry: Entry) -> list[dict]:
+        """保存されている手直しの対象（person と、この画像フォルダの部分名）"""
+        return maskedit_mod.rows_in(self.maskedit_dir(entry), self.part_names())
+
+    def maskedit_stamp(self, entry: Entry) -> int | None:
+        """手直しが最後に変わった時刻（ns）。無ければ None"""
+        return _newest(self.maskedit_dir(entry))
+
+    def composed_masks(self, entry: Entry) -> dict:
+        """元のマスクに手直しを合成した結果（maskedit.compose）"""
+        size = self.size(entry)
+        names = self.part_names()
+        return maskedit_mod.compose(size, self.mask_path(entry), {n: self.part_path(entry, n) for n in names},
+                                    self.maskedit_dir(entry))
+
     def paint_stamp(self, entry: Entry, version: str = "") -> int | None:
         """消しゴム・ペンが最後に変わった時刻（ns）。無ければ None。
         対象を消したときも分かるよう、フォルダ自身の時刻も見る（消すと目録が書き直される）"""
@@ -311,13 +332,17 @@ class Library:
                 kind, stem = "export", fname[:-4]
             elif fname.endswith(PAINT_SUFFIX):
                 kind, stem = "paint", fname[: -len(PAINT_SUFFIX)]
+            elif fname.endswith(maskedit_mod.SUFFIX):
+                kind, stem = "maskedit", fname[: -len(maskedit_mod.SUFFIX)]
             else:
                 continue
             found = self.resolve_stem(stem, entries)
             if found is None:
                 continue
+            if kind == "maskedit" and found[1] != "":
+                continue                                    # 手直しは画像ごと（バージョンの名前は付かない）
             try:
-                if kind == "paint":
+                if kind in ("paint", "maskedit"):
                     st = _newest(Path(item.path)) if item.is_dir() else None
                     if st is None:
                         continue
@@ -343,6 +368,10 @@ class Library:
             inputs.append(mask.stat().st_mtime_ns)
         if inputs:
             inputs += self._part_stamps(entry) if part_stamps is None else part_stamps
+            # マスクの手直しは全バージョンで共通。変わったら、どのバージョンの白黒版も「古い」
+            edited = found.get("", {}).get("maskedit")
+            if edited:
+                inputs.append(edited)
         rows = []
         for name in ["", *sorted(v for v in found if v)]:
             rec = found.get(name, {})
@@ -380,6 +409,9 @@ class Library:
         if mask is not None:
             inputs.append(mask.stat().st_mtime_ns)
         inputs += self._part_stamps(entry)
+        edited = self.maskedit_stamp(entry)
+        if edited is not None:
+            inputs.append(edited)
         paint = self.paint_stamp(entry, version)
         if paint is not None:
             inputs.append(paint)
@@ -1440,6 +1472,8 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
                 "name": e.name, "width": w, "height": h,
                 "hasMask": lib.mask_path(e) is not None,
                 "parts": mine,                              # その画像にマスクのある部分（髪・肌・服など）
+                # マスクの手直しのある対象（person / 部分名）
+                "maskEdits": [r["target"] for r in lib.maskedit_rows(e)] if "maskedit" in index[e.name].get("", {}) else [],
                 "hasParams": default["hasParams"],
                 "hasExport": default["hasExport"], "exportFresh": default["exportFresh"],
                 "versions": versions,
@@ -1542,6 +1576,14 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
                 target = k[len(prefix) + 1:]
                 if target.endswith(".png") and PAINT_TARGET_RE.fullmatch(target[:-4]):
                     out[k] = (f"消しゴム・ペン（{target[:-4]}）", folder / target)
+        # マスクの手直しは画像ごと（全バージョンで共通）。同じ時点へ一緒に戻す
+        edits = lib.maskedit_dir(entry)
+        prefix = lib.backup_key(edits)
+        if prefix:
+            for k in backups.keys(prefix + "/"):
+                target = k[len(prefix) + 1:]
+                if target.endswith(".png") and maskedit_mod.TARGET_RE.fullmatch(target[:-4]):
+                    out[k] = (f"マスクの手直し（{target[:-4]}）", edits / target)
         return out
 
     def unit_points(lib: Library, entry: Entry, version: str) -> list[dict]:
@@ -1554,12 +1596,16 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         began = backup_mod.parse_stamp(backup_mod.stamp_name(time.time()))
         with fs.lock:
             changed = backup_mod.restore_at(backups, unit_keys(lib, entry, version), t, now=began)
-            painted = any(label != "設定" for label in changed)
+            painted = any(label.startswith("消しゴム・ペン") for label in changed)
+            masked = [label[label.index("（") + 1:-1] for label in changed if label.startswith("マスクの手直し")]
             if painted:
                 lib.write_paint_index(entry, version)
                 session.note_paint(folder, lib, entry, version)
             if "設定" in changed:
                 announce_params(fs, lib, entry, version)
+        if masked:
+            session.hub.publish({"type": "maskedit", "action": "restore", "folder": folder, "name": entry.name,
+                                 "targets": masked, "source": None})
         if painted:
             paint_changed(folder, entry, version, "restore", [r["target"] for r in lib.paint_rows(entry, version)],
                           external=True)
@@ -1782,7 +1828,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         else:
             lib.stash(path, data)
 
-    def apply_tiles(path: Path, raw: bytes) -> bytes | None:
+    def apply_tiles(path: Path, raw: bytes, neutral: int = 0) -> bytes | None:
         """保存してある PNG に、変わったタイルだけを書き込んだ結果（PNG）。全部 0 になったら None。
         本体: 先頭 4 バイト = 見出しの長さ、続いて JSON の見出し {width, height, channels, encoding?, tiles: [{x, y, w, h, n?}]}、
         残りがタイルの画素（channels = 1 は 1 バイト/画素、2 は R・G の 2 バイト/画素）を並べた物。
@@ -1807,7 +1853,7 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
                     abort(409, description="保存してある絵と大きさが違います（全体を保存し直してください）")
                 base = im.convert(mode)
         else:
-            base = Image.new(mode, (width, height), 0)
+            base = Image.new(mode, (width, height), neutral)
         at = 4 + size
         for x, y, w, h, packed in tiles:
             if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > width or y + h > height:
@@ -1832,8 +1878,8 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
                 tile = Image.merge("RGB", (Image.frombytes("L", (w, h), chunk[0::2]),
                                            Image.frombytes("L", (w, h), chunk[1::2]), Image.new("L", (w, h), 0)))
             base.paste(tile, (x, y))
-        if base.getbbox() is None:
-            return None
+        if base.getextrema() in ((neutral, neutral), ((neutral, neutral),) * 3):
+            return None                                     # 全部が「触っていない」値に戻った
         out = io.BytesIO()
         base.save(out, "PNG", compress_level=3)
         return out.getvalue()
@@ -1911,6 +1957,86 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         if gone:
             paint_changed(folder, entry, version, "delete", [r["target"] for r in gone])
         return jsonify({**paint_listing(folder, lib, entry, version), "deleted": [r["target"] for r in gone]})
+
+    # ---- 部分マスク・人物マスクの手直し（元のマスクへの上書き。3 値の PNG をそのまま預かる）----
+
+    def maskedit_listing(folder: str, lib: Library, entry: Entry) -> dict:
+        return {"folder": folder, "name": entry.name, "dir": str(lib.maskedit_dir(entry)),
+                "targets": lib.maskedit_rows(entry), "partNames": lib.part_names(),
+                "values": {"add": 255, "remove": 0, "untouched": maskedit_mod.NEUTRAL,
+                           "addMin": maskedit_mod.ADD_MIN, "removeMax": maskedit_mod.REMOVE_MAX}}
+
+    def maskedit_changed(folder: str, entry: Entry, action: str, targets: list[str]) -> None:
+        session.hub.publish({"type": "maskedit", "action": action, "folder": folder, "name": entry.name,
+                             "targets": targets, "source": request.headers.get("X-Inkdeus-Client")})
+
+    @app.get("/api/maskedit/<path:name>")
+    def api_maskedit_index(name: str):
+        folder, lib, _fs = pick()
+        return jsonify(maskedit_listing(folder, lib, lib.get(name)))
+
+    @app.route("/api/maskedit/<path:name>/<target>", methods=["GET", "PUT", "PATCH", "DELETE"])
+    def api_maskedit(name: str, target: str):
+        folder, lib, fs = pick()
+        entry = lib.get(name)
+        everything = request.method == "DELETE" and target == maskedit_mod.ALL
+        if not everything and target != maskedit_mod.PERSON and target not in lib.part_names():
+            abort(400, description="対象は person か、部分マスクの置き場にある部分名です")
+        path = lib.maskedit_dir(entry) / f"{target}.png"
+        if request.method == "GET":
+            if not path.is_file():
+                abort(404)
+            if png_broken(path):
+                return jsonify({"error": "保存してある手直しが壊れています（0 バイト、または PNG ではありません）",
+                                "broken": True}), 422
+            return send_file(path, mimetype="image/png")
+        if request.method in ("PUT", "PATCH"):
+            raw = request.get_data(cache=False)
+            if len(raw) > MAX_PAINT_BYTES:
+                abort(413)
+            if request.method == "PUT" and not raw.startswith(PNG_SIGNATURE):
+                abort(400, description="PNG ではありません")
+            with fs.lock:
+                # PATCH は、1 筆で変わったタイルだけの書き込み（触っていない所は 128）
+                data = raw if request.method == "PUT" else apply_tiles(path, raw, maskedit_mod.NEUTRAL)
+                keep_or_stash(lib, path, data)
+                if data is None:
+                    path.unlink(missing_ok=True)
+                    if not lib.maskedit_rows(entry):
+                        shutil.rmtree(lib.maskedit_dir(entry), ignore_errors=True)
+                else:
+                    _atomic_write(path, data)
+            maskedit_changed(folder, entry, request.method.lower(), [target])
+            if data is None:
+                return jsonify({"target": target, "deleted": True})
+            st = path.stat()
+            return jsonify({"target": target, "path": str(path), "bytes": len(data), "mtime": st.st_mtime,
+                            "stamp": st.st_mtime_ns // 1_000_000, "deleted": False})
+        with fs.lock:
+            gone = [r for r in maskedit_mod.rows_in(lib.maskedit_dir(entry)) if everything or r["target"] == target]
+            for row in gone:
+                keep_or_stash(lib, lib.maskedit_dir(entry) / row["file"], None)
+                (lib.maskedit_dir(entry) / row["file"]).unlink(missing_ok=True)
+            if gone and not maskedit_mod.rows_in(lib.maskedit_dir(entry)):
+                shutil.rmtree(lib.maskedit_dir(entry), ignore_errors=True)
+        if gone:
+            maskedit_changed(folder, entry, "delete", [r["target"] for r in gone])
+        return jsonify({**maskedit_listing(folder, lib, entry), "deleted": [r["target"] for r in gone]})
+
+    @app.get("/api/maskedit-composed/<path:name>/<target>")
+    def api_maskedit_composed(name: str, target: str):
+        """元のマスクに手直しを合成した結果（画像と同じ大きさの 0 / 255 の PNG）。確認と、外のツール向け"""
+        _folder, lib, _fs = pick()
+        entry = lib.get(name)
+        if target != maskedit_mod.PERSON and target not in lib.part_names():
+            abort(404)
+        composed = lib.composed_masks(entry)
+        image = composed["person"] if target == maskedit_mod.PERSON else composed["parts"].get(target)
+        if image is None:
+            abort(404)
+        out = io.BytesIO()
+        image.save(out, "PNG", compress_level=3)
+        return Response(out.getvalue(), mimetype="image/png")
 
     # ---- バージョン（同じ元画像から作る、設定の違う白黒版）----
 

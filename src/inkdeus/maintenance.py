@@ -6,6 +6,7 @@
     inkdeus export-project <プロジェクト> -o <ファイル.zip> [--with-exports] [--with-backups] [--with-sources]
     inkdeus import-project <ファイル.zip> --name <新しい名前> [--images <dir>] [--masks <dir>]
     inkdeus relink <プロジェクト> [--folder F] --images <新しいdir> [--masks <dir>] [--parts <dir>] [--force]
+    inkdeus maskedit list | export <プロジェクト> [--folder F] [-o <dir>]   マスクの手直しの一覧・合成した結果の書き出し
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from . import folders as folders_mod
 from . import portable
 from .backup import BackupError
 from .projects import PROJECT_FILE, Project, ProjectError, folder_def, list_images, load_project, relink
-from .server import (MANGA_NAME_RE, MANGA_SUFFIX, PAINT_SUFFIX, PARAMS_SUFFIX, VERSION_RE, VERSION_SEP,
+from .server import (MANGA_NAME_RE, MANGA_SUFFIX, PAINT_SUFFIX, PARAMS_SUFFIX, VERSION_RE, VERSION_SEP, Library,
                      read_local_config, write_paint_index_in)
 from .styles import FILE as STYLES_FILE
 
@@ -228,6 +229,54 @@ def cmd_relink(args) -> int:
     return 0
 
 
+def cmd_maskedit(args) -> int:
+    """マスクの手直し: 一覧と、元のマスクに手直しを合成した結果の書き出し（外のツールへ戻せるように）"""
+    project = load_project(args.project, check=False)
+    d = folder_def(project, args.folder)
+    if not d.images.is_dir():
+        raise ProjectError(f"元画像の場所が見つかりません: {d.images}（inkdeus relink {project.name} --images <dir>）")
+    lib = Library(d.images, d.masks, folders_mod.out_dir(project.out, d.name), d.parts)
+    entries = lib.entries()
+    edited = {name: [r["target"] for r in lib.maskedit_rows(e)] for name, e in entries.items()}
+    if args.maskedit_command == "list":
+        rows = [{"name": name, "targets": targets} for name, targets in edited.items() if targets]
+        if args.json:
+            print(json.dumps({"project": project.name, "folder": d.name, "images": rows}, ensure_ascii=False, indent=2))
+            return 0
+        print(f"マスクの手直し（{project.name} / {'既定のフォルダ' if d.name == folders_mod.DEFAULT else d.name}）:")
+        if not rows:
+            print("  手直しのある画像はありません")
+        for r in rows:
+            print(f"  {r['name']}: {', '.join(r['targets'])}")
+        return 0
+    dest = Path(args.output).expanduser().resolve()
+    for src in (d.masks, d.parts, d.images):
+        if src is not None and dest == Path(src).resolve():
+            raise ProjectError(f"書き出し先に、元のマスク・元画像の場所そのものは指定できません（上書きしないため）: {dest}")
+    written = {"images": 0, "files": 0, "edited": 0}
+    for name, entry in entries.items():
+        composed = lib.composed_masks(entry)
+        targets = {**({"person": composed["person"]} if composed["person"] is not None else {}), **composed["parts"]}
+        # 部分は、元のマスクか手直しのある物だけを書き出す（何も無い部分の、全部 0 のファイルは作らない）
+        for target, image in targets.items():
+            if target != "person" and lib.part_path(entry, target) is None and target not in composed["edited"]:
+                continue
+            path = dest / target / f"{entry.path.stem}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            image.save(path, "PNG", compress_level=3)
+            written["files"] += 1
+        written["images"] += 1
+        written["edited"] += 1 if composed["edited"] else 0
+    if args.json:
+        print(json.dumps({"project": project.name, "folder": d.name, "dir": str(dest), **written},
+                         ensure_ascii=False, indent=2))
+        return 0
+    print(f"手直し済みのマスクを書き出しました: {dest}")
+    print(f"  画像 {written['images']} 枚（うち手直しあり {written['edited']} 枚）/ {written['files']} ファイル")
+    print("  person/ が人物マスク、ほかのフォルダが部分マスク（画像と同じ大きさ・255 = その領域）。元のマスクは変えていません")
+    return 0
+
+
 def add_parsers(sub) -> None:
     project_help = "プロジェクト名、またはプロジェクトのフォルダ"
     p = sub.add_parser("backup", help="保存のたびに残している前の版（世代バックアップ）を見る・戻す・間引く")
@@ -270,5 +319,19 @@ def add_parsers(sub) -> None:
     p.add_argument("--json", action="store_true", help="JSON で出力")
 
 
+    p = sub.add_parser("maskedit", help="部分マスク・人物マスクの手直しの一覧と、合成した結果の書き出し")
+    msub = p.add_subparsers(dest="maskedit_command", required=True, metavar="<list|export>")
+    a = msub.add_parser("list", help="手直しのある画像と対象")
+    a.add_argument("project", help=project_help)
+    a.add_argument("--folder", help="画像フォルダ名（省略時は既定のフォルダ）")
+    a.add_argument("--json", action="store_true", help="JSON で出力")
+    a = msub.add_parser("export", help="元のマスクに手直しを合成した結果を、画像と同じ大きさの PNG で書き出す"
+                                       "（<dir>/person/ と <dir>/<部分名>/）")
+    a.add_argument("project", help=project_help)
+    a.add_argument("--folder", help="画像フォルダ名（省略時は既定のフォルダ）")
+    a.add_argument("-o", "--output", required=True, help="書き出し先のフォルダ")
+    a.add_argument("--json", action="store_true", help="JSON で出力")
+
+
 COMMANDS = {"backup": cmd_backup, "export-project": cmd_export_project, "import-project": cmd_import_project,
-            "relink": cmd_relink}
+            "relink": cmd_relink, "maskedit": cmd_maskedit}

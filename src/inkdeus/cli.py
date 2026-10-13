@@ -13,6 +13,7 @@
     inkdeus export-project <プロジェクト> -o <zip>      プロジェクトの設定・手描き・漫画データを 1 つの zip に書き出す
     inkdeus import-project <zip> --name <名前>          zip からプロジェクトを作る
     inkdeus relink <プロジェクト> --images <dir>        元画像の場所を付け替える
+    inkdeus maskedit list | export <プロジェクト>       マスクの手直しの一覧・合成した結果の書き出し
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ from .projects import (ProjectError, add_asset_source, add_folder, create_projec
 from .server import create_app, default_local_config
 
 COMMANDS = ("run", "new", "open", "projects", "ctl", "manga", "assets", "fonts", "folders", "parts",
-            "backup", "export-project", "import-project", "relink")
+            "backup", "export-project", "import-project", "relink", "maskedit")
 PARTS_HELP = "部分マスク（髪・肌・服など）の置き場（<dir>/<部分名>/<画像と同名>.png。inkdeus の外で作った物）"
 
 
