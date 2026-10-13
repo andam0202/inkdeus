@@ -722,8 +722,8 @@ uv run pytest                          # 全件（並列）
 | ブラウザを使わない物だけ | `uv run pytest -m server` | 約 20 秒 |
 | 漫画エディタの結合テストを除く | `uv run pytest -m "not manga"` | 約 4 分 |
 | 重い物（5120×3840 の画像など）を除く | `uv run pytest -m "not slow"` | 全件より 1 分ほど短い |
-| **全件（push の前）** | `INKDEUS_MANGA_SRC=<クローン> uv run pytest` | 約 6 分 |
-| 直列（不具合を追うとき） | `uv run pytest -n 0` | 約 17 分 |
+| **全件（push の前）** | `INKDEUS_MANGA_SRC=<クローン> uv run pytest` | 約 7 分 |
+| 直列（不具合を追うとき） | `uv run pytest -n 0` | 約 20 分 |
 
 - 既定で**並列**（pytest-xdist）です。ワーカー数は CPU のコア数の 1/4（2〜6。ソフトウェア描画の WebGL が 1 ページで CPU を 2〜3 個使うため、
   コア数ぶんは立てません）。`-n 6` か環境変数 `INKDEUS_TEST_WORKERS=6` で変えられ、`-n 0` で直列になります。
