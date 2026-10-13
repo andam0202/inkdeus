@@ -49,6 +49,8 @@ function badgesOf(item) {
  * @param {HTMLElement} root  <aside id="gallery">
  * @param {{images: () => object[], current: () => string|null, open: (name: string) => void,
  *          locked: () => boolean}} host
+ *   host.canSelect() が真のとき、複数選択（Ctrl/⌘+クリックで個別、Shift+クリックで範囲）と、
+ *   選択した画像への「設定の一括適用」（host.applyTo(names)）の操作を出す
  */
 export function createGallery(root, host) {
   const view = {
@@ -59,6 +61,9 @@ export function createGallery(root, host) {
     filter: 'all',
   };
   const cells = new Map();                      // 画像名 → サムネイルの要素
+  const selected = new Set();                   // 複数選択している画像名
+  let anchor = null;                            // 範囲選択の起点（最後に個別に選んだ画像）
+  let selectedIn = host.folder ? host.folder() : '';   // その選択が、どの画像フォルダでの物か
 
   const search = el('input', { type: 'search', class: 'gal-search', placeholder: '名前で絞り込み', 'aria-label': '名前で絞り込み' });
   const kind = el('select', { class: 'gal-kind', title: 'サムネイルの種類', 'aria-label': 'サムネイルの種類' },
@@ -66,12 +71,20 @@ export function createGallery(root, host) {
   kind.value = view.kind;
   const chips = el('div', { class: 'gal-chips', role: 'group', 'aria-label': '状態で絞り込み' });
   const count = el('div', { class: 'gal-count' });
+  // 複数選択の操作（設定の一括適用に使う）。サーバが対応しているときだけ出す
+  const selAll = el('button', { type: 'button', class: 'gal-sel-all', title: 'いまの絞り込みの結果を、すべて選択する' }, 'すべて選択');
+  const selNone = el('button', { type: 'button', class: 'gal-sel-none', title: '選択を解除する' }, '選択を解除');
+  const selCount = el('span', { class: 'gal-sel-count' });
+  const selApply = el('button', { type: 'button', class: 'gal-apply', hidden: true });
+  const selRow = el('div', { class: 'gal-select', hidden: true,
+    title: 'サムネイルを Ctrl（⌘）+クリックで個別に、Shift+クリックで範囲を選択します' },
+  el('div', { class: 'gal-row' }, selAll, selNone, selCount), selApply);
   const grid = el('div', { class: 'gal-grid' });
   // 画像フォルダの切り替え（フォルダが1つだけなら出さない）
   const folderSel = el('select', { class: 'gal-folder', title: '画像フォルダ（画像セット）を切り替える', 'aria-label': '画像フォルダ' });
   const folderRow = el('div', { class: 'gal-row gal-folder-row', hidden: true }, el('span', { class: 'gal-folder-label' }, 'フォルダ'), folderSel);
   const body = el('div', { class: 'gal-body' },
-    folderRow, el('div', { class: 'gal-row' }, search, kind), chips, count, grid);
+    folderRow, el('div', { class: 'gal-row' }, search, kind), chips, selRow, count, grid);
   const resize = el('div', { class: 'gal-resize', role: 'separator', 'aria-orientation': 'vertical',
     title: 'ドラッグで幅を変える（ダブルクリックで既定の幅）' });
   const toggle = el('button', { type: 'button', class: 'gal-toggle', title: '画像の一覧を開く／閉じる' }, el('span', {}, '画像'));
@@ -177,9 +190,17 @@ export function createGallery(root, host) {
       el('div', { class: 'gal-thumb' }, img, el('div', { class: 'gal-badges' })),
       el('span', { class: 'gal-name' }, item.name));
     const open = () => { if (!host.locked()) host.open(item.name); };
-    cell.addEventListener('click', open);
+    // Ctrl（⌘）+クリック = 個別に選択、Shift+クリック = 範囲を選択。ふつうのクリックは、従来どおり開く
+    const pick = (e) => {
+      if (!canSelect() || !(e.ctrlKey || e.metaKey || e.shiftKey)) return false;
+      e.preventDefault();
+      if (e.shiftKey) selectRange(item.name); else toggleSelect(item.name);
+      return true;
+    };
+    cell.addEventListener('click', (e) => { if (!pick(e)) open(); });
+    cell.addEventListener('mousedown', (e) => { if (e.shiftKey && canSelect()) e.preventDefault(); });   // 文字の範囲選択にしない
     cell.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); if (!pick(e)) open(); }
     });
     paint(cell, item);
     loader.observe(img);
@@ -191,6 +212,61 @@ export function createGallery(root, host) {
     if (needle && !item.name.toLowerCase().includes(needle)) return false;
     return FILTERS.find(([key]) => key === view.filter)[2](item);
   }
+
+  // ---- 複数選択 ----
+
+  const canSelect = () => !!(host.canSelect && host.canSelect());
+
+  function showSelection() {
+    const on = canSelect();
+    selRow.hidden = !on;
+    if (!on) selected.clear();
+    for (const [name, cell] of cells) {
+      const picked = selected.has(name);
+      cell.classList.toggle('selected', picked);
+      if (picked) cell.setAttribute('aria-selected', 'true'); else cell.removeAttribute('aria-selected');
+    }
+    selCount.textContent = selected.size ? `選択 ${selected.size} 枚` : '';
+    selNone.disabled = selected.size === 0;
+    selApply.hidden = selected.size === 0;
+    selApply.textContent = `いまの画像の設定を、選択した ${selected.size} 枚へ適用…`;
+    selApply.disabled = host.locked() || !host.current();
+    selApply.title = host.current() ? '' : '適用元になる画像を、先に開いてください';
+  }
+  /** 選択中の画像名（一覧の順） */
+  function selection() {
+    return host.images().map((i) => i.name).filter((n) => selected.has(n));
+  }
+  function setSelection(names) {
+    const known = new Set(host.images().map((i) => i.name));
+    selected.clear();
+    for (const n of names || []) if (known.has(n)) selected.add(n);
+    selectedIn = host.folder ? host.folder() : '';
+    showSelection();
+  }
+  function toggleSelect(name) {
+    if (selected.has(name)) selected.delete(name); else selected.add(name);
+    anchor = name;
+    selectedIn = host.folder ? host.folder() : '';
+    showSelection();
+  }
+  /** 起点（最後に個別に選んだ画像。無ければ、いま開いている画像）から name までを、絞り込みの結果の中で選択に足す */
+  function selectRange(name) {
+    const names = visibleNames();
+    const from = names.includes(anchor) ? anchor : names.includes(host.current()) ? host.current() : name;
+    const a = names.indexOf(from);
+    const b = names.indexOf(name);
+    if (a < 0 || b < 0) return;
+    for (let i = Math.min(a, b); i <= Math.max(a, b); i++) selected.add(names[i]);
+    if (!names.includes(anchor)) anchor = from;
+    selectedIn = host.folder ? host.folder() : '';
+    showSelection();
+  }
+  selAll.addEventListener('click', () => { setSelection([...selected, ...visibleNames()]); });
+  selNone.addEventListener('click', () => { anchor = null; setSelection([]); });
+  selApply.addEventListener('click', () => {
+    if (!host.locked() && host.applyTo && selected.size) host.applyTo(selection());
+  });
 
   /** 絞り込みに合う画像名（一覧の順）。前後の移動に使う */
   function visibleNames() {
@@ -220,6 +296,7 @@ export function createGallery(root, host) {
     for (const [key, cell] of cells) cell.classList.toggle('current', key === name);
     const cell = name ? cells.get(name) : null;
     if (cell && !cell.hidden && view.open) cell.scrollIntoView({ block: 'nearest' });
+    showSelection();                             // 「適用…」は、適用元（いまの画像）が開いているときだけ押せる
   }
 
   /** 一覧を作り直す（画像の増減があったとき） */
@@ -228,6 +305,10 @@ export function createGallery(root, host) {
     cells.clear();
     for (const item of host.images()) cells.set(item.name, makeCell(item));
     grid.replaceChildren(...cells.values());
+    // 選択は、一覧に残っている画像の分だけ引き継ぐ。画像フォルダが変わったら、選択は解く（同じ名前でも別の画像）
+    const folderNow = host.folder ? host.folder() : '';
+    if (folderNow !== selectedIn) { selected.clear(); anchor = null; selectedIn = folderNow; }
+    for (const name of [...selected]) if (!cells.has(name)) selected.delete(name);
     applyFilter();
     showCurrent();
   }
@@ -259,6 +340,7 @@ export function createGallery(root, host) {
   setFolders();
   refresh();
   return { refresh, update, setCurrent: showCurrent, visibleNames, setOpen, setWidth, setFolders,
+    selection, setSelection,
     state: () => ({ open: view.open, width: view.width === null ? WIDTH.def : view.width, kind: view.kind,
-      filter: view.filter, q: view.q }) };
+      filter: view.filter, q: view.q, selected: selection() }) };
 }

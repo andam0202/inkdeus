@@ -299,8 +299,13 @@ def cmd_export_all(c: Client, args) -> dict:
     before = c.call("GET", "/api/batch")
     if before.get("running"):
         raise CtlError("一括書き出しは既に進行中です（進み具合は export-all --status、中止は --abort）", before, code=2)
-    r = c.call("POST", "/api/command", {"type": "export-all", "force": args.force,
-                                        "defaultOnly": args.default_only, "allFolders": args.all_folders})
+    return _export_all(c, before, {"force": args.force, "defaultOnly": args.default_only,
+                                   "allFolders": args.all_folders}, args.wait, args.timeout)
+
+
+def _export_all(c: Client, before: dict, options: dict, wait: bool, timeout: float) -> dict:
+    """ブラウザに一括書き出しを始めさせる（wait なら、終わるまで待って件数を返す）"""
+    r = c.call("POST", "/api/command", {"type": "export-all", **options})
     if r["clients"] == 0:
         raise CtlError("ブラウザが開いていないため書き出せません（書き出しはブラウザが行います）", r, code=2)
 
@@ -308,23 +313,57 @@ def cmd_export_all(c: Client, args) -> dict:
         b = c.call("GET", "/api/batch")
         return b if b.get("seq", 0) > before.get("seq", 0) else None
 
-    batch = _wait(started, min(args.timeout, 30.0))
+    batch = _wait(started, min(timeout, 30.0))
     if batch is None:
         raise CtlError("ブラウザが一括書き出しを始めません（白黒化の画面を開いていますか？）", code=3)
-    if not args.wait:
+    if not wait:
         return batch
 
     def finished():
         b = c.call("GET", "/api/batch")
         return b if not b.get("running") else None
 
-    batch = _wait(finished, args.timeout, interval=1.0)
+    batch = _wait(finished, timeout, interval=1.0)
     if batch is None:
-        raise CtlError(f"{args.timeout:g} 秒待ちましたが、一括書き出しが終わりません",
+        raise CtlError(f"{timeout:g} 秒待ちましたが、一括書き出しが終わりません",
                        c.call("GET", "/api/batch"), code=3)
     if batch.get("failed"):
         raise CtlError(f"{batch['failed']} 枚の書き出しに失敗しました", batch, code=1)
     return batch
+
+
+def cmd_apply(c: Client, args) -> dict:
+    """ある画像の設定を、ほかの画像へまとめて適用する（--undo で、直前の適用を取り消す）"""
+    if args.undo is not None:
+        return c.call("POST", "/api/apply-params/undo", {"id": args.undo or None})
+    if args.list:
+        return c.call("GET", "/api/apply-params")
+    if not args.source or not args.to:
+        raise CtlError("--from <適用元の画像名> と --to <適用先…> が必要です（取り消しは --undo）")
+    state = c.call("GET", "/api/state")
+    shown = state.get("currentFolder") or DEFAULT_FOLDER
+    folder = args.from_folder or shown
+    version = args.from_version
+    if version is None:
+        # 省略時: 適用元がいまブラウザで開いている画像なら、開いているバージョン。そうでなければ既定
+        opened = folder == shown and state.get("current") == args.source
+        version = (state.get("currentVersion") or "") if opened else ""
+    result = c.call("POST", "/api/apply-params", {
+        "from": {"name": args.source, "version": version, "folder": folder},
+        "to": args.to, "toFolder": args.to_folder or folder, "scope": args.scope,
+        "toVersion": args.to_version, "force": args.force})
+    if result["failed"]:
+        raise CtlError(f"{len(result['failed'])} 枚に適用できませんでした", result, code=1)
+    if args.export and result["applied"]:
+        before = c.call("GET", "/api/batch")
+        if before.get("running"):
+            raise CtlError("適用は済みましたが、一括書き出しが既に進行中のため書き出していません", result, code=2)
+        only = [{k: r[k] for k in ("folder", "name", "version")} for r in result["applied"]]
+        try:
+            result["export"] = _export_all(c, before, {"only": only}, True, args.timeout)
+        except CtlError as e:
+            raise CtlError(f"適用は済みましたが、書き出せませんでした: {e}", {**result, "export": e.detail}, e.code) from e
+    return result
 
 
 def _manga_command(c: Client, command: str, args: dict, wait: bool, timeout: float) -> dict:
@@ -497,6 +536,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--status", action="store_true", help="進み具合だけを表示する（何も始めない）")
     p.add_argument("--abort", action="store_true", help="進行中の一括書き出しを中止する")
     p.add_argument("--timeout", type=float, default=7200.0)
+    p = add("apply", cmd_apply,
+            "ある画像の設定を、ほかの画像へまとめて適用する。適用先ごとに、前の設定を世代バックアップへ退避してから書く。"
+            "消しゴム・ペン・部分マスクの手直しは写さない。--undo で、直前の適用をまとめて取り消す")
+    p.add_argument("--from", dest="source", metavar="<画像名>", help="適用元の画像")
+    p.add_argument("--from-folder", default=None, metavar="F", help="適用元の画像フォルダ（省略時は、いまブラウザで開いているフォルダ）")
+    p.add_argument("--from-version", default=None, metavar="V",
+                   help='適用元のバージョン（省略時は、適用元をブラウザで開いていればそのバージョン。そうでなければ既定の ""）')
+    p.add_argument("--to", nargs="+", metavar="<画像名|all|unconfigured|glob>",
+                   help="適用先。画像名（複数可）/ all = フォルダの全画像 / unconfigured = 設定のまだ無い画像 / '*.png' のような glob")
+    p.add_argument("--to-folder", default=None, metavar="F", help="適用先の画像フォルダ（省略時は、適用元と同じフォルダ）")
+    p.add_argument("--scope", default=None, metavar="input,lines,person,background,parts:hair,…",
+                   help="適用する範囲（カンマ区切り）: input / lines / person / background / parts（適用元にある部分の全部）/ "
+                        "parts:<部分名> / watermark / output / unit。省略時は unit 以外の全部")
+    p.add_argument("--to-version", default="default", metavar="<default|same|new:名前>",
+                   help="適用先のバージョン: default = 既定 / same = 適用元と同じ名前（無ければ作る）/ new:<名前> = その名前（無ければ作る）")
+    p.add_argument("--export", action="store_true", help="適用した画像を、続けて書き出す（白黒化の画面を開いているブラウザが要る）")
+    p.add_argument("--force", action="store_true",
+                   help="層の消しゴムを対応づけられない画像にも適用する（その層の消しゴムは捨てる。バックアップには残る）")
+    p.add_argument("--undo", nargs="?", const="", default=None, metavar="ID",
+                   help="直前の適用を取り消す（ID か、--list の番号で選ぶこともできる）")
+    p.add_argument("--list", action="store_true", help="これまでの適用の記録（新しい順）")
+    p.add_argument("--timeout", type=float, default=7200.0, help="--export の待ち時間（秒）")
     p = add("manga", None, "漫画の構成の画面（/manga/ を開いているブラウザ）への指示")
     msub = p.add_subparsers(dest="action", required=True, metavar="<pdf|layout>")
     q = msub.add_parser("pdf", parents=[target],

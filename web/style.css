@@ -129,6 +129,15 @@ body.gal-resizing, body.gal-resizing * { cursor: ew-resize !important; user-sele
 .gal-chip { padding: 1px 7px; border-radius: 11px; font-size: 11px; }
 .gal-chip.on { border-color: var(--accent); color: #fff; }
 .gal-count { flex: none; color: var(--dim); font-size: 11px; text-align: right; }
+/* 複数選択（設定の一括適用）。Ctrl（⌘）+クリックで個別、Shift+クリックで範囲 */
+.gal-select { display: flex; flex-direction: column; gap: 4px; flex: none; }
+.gal-select[hidden], .gal-apply[hidden] { display: none; }
+.gal-select .gal-row { align-items: center; flex-wrap: wrap; }
+.gal-select button { padding: 1px 7px; font-size: 11px; }
+.gal-sel-count { color: var(--dim); font-size: 11px; margin-left: auto; }
+.gal-apply { white-space: normal; text-align: left; border-color: var(--accent); }
+.gal-item.selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent) inset; }
+.gal-item.selected .gal-name::before { content: "✓ "; color: var(--accent); }
 .gal-grid { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; display: grid; gap: 6px; align-content: start;
   grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); padding-right: 2px; }
 .gal-item { display: flex; flex-direction: column; gap: 2px; padding: 3px; min-width: 0; cursor: pointer;
@@ -238,6 +247,27 @@ dialog.chooser h3 { margin: 0; font-size: 15px; }
 .chooser-label { flex: none; font-variant-numeric: tabular-nums; }
 .chooser-note { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chooser-buttons { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; margin-top: 4px; }
+/* 設定の一括適用のダイアログ */
+dialog.apply-dialog { overflow: auto; }
+.apply-form { display: flex; flex-direction: column; gap: 8px; }
+.apply-form[hidden], .apply-result[hidden], .apply-error[hidden], .apply-undo[hidden], .apply-run[hidden] { display: none; }
+.apply-form fieldset { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 6px 10px 8px;
+  border: 1px solid var(--line); border-radius: 5px; }
+.apply-form legend { color: var(--dim); padding: 0 4px; }
+.apply-check { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.apply-check input[type="checkbox"], .apply-check input[type="radio"] { flex: none; margin: 0; }
+.apply-new-name { flex: none; width: 10em; height: 24px; padding: 2px 6px; background: var(--bg); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 4px; }
+.apply-parts { display: flex; flex-direction: column; gap: 3px; padding-left: 4px; }
+.apply-part-list { display: flex; flex-wrap: wrap; gap: 4px 14px; padding-left: 12px; }
+.apply-note { margin: 0; color: var(--dim); font-size: 12px; }
+.apply-error { margin: 0; color: #ffb4ab; white-space: pre-wrap; }
+.apply-result { display: flex; flex-direction: column; gap: 6px; overflow: auto; min-height: 0; }
+.apply-summary { font-weight: 600; }
+.apply-group ul { margin: 2px 0 0; padding-left: 18px; }
+.apply-group-title { color: var(--dim); }
+.apply-why { color: var(--dim); }
+dialog.apply-dialog.busy { cursor: progress; }
 /* 保存の状態の文言が変わっても、ヘッダの高さ（＝プレビューの位置）が動かないようにする */
 #saveState, #exportState { flex: none; white-space: nowrap; }
 #saveState { min-width: 11.5em; text-align: right; }

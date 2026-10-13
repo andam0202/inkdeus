@@ -9,9 +9,10 @@ import { createStyleUI, customOf } from './styles.js';
 import { layerTarget, isTarget, unionRect } from './paint.js';
 import { createNotices, packTiles, choose } from './safety.js';
 import { MaskEdits, bitmapToMask, PERSON as MASK_PERSON } from './maskedit.js';
+import { openApplyDialog } from './apply.js';
 import {
   SCHEMA, normalize, defaultParams, applyStyle, effectiveUnit, effectiveWatermark, STYLES,
-  withoutIds, withoutParts, inheritIds, layerIds, regionLabel, isPartName,
+  withoutIds, withoutParts, inheritIds, layerIds, regionLabel, isPartName, partKeys,
 } from './schema.js';
 
 const $ = (id) => document.getElementById(id);
@@ -1276,7 +1277,12 @@ function connectEvents() {
     else if (batch.running && (ev.type === 'open' || ev.type === 'export')) return;   // 一括書き出しの最中は受けない
     else if (ev.type === 'open') openByName(ev.name, ev.version, ev.folder).catch((e) => console.warn(e));
     else if (ev.type === 'export') openByName(ev.name, ev.version, ev.folder).then(() => exportNow()).catch((e) => console.warn(e));
-    else if (ev.type === 'export-all') exportAll({ force: !!ev.force, defaultOnly: !!ev.defaultOnly, allFolders: !!ev.allFolders }).catch((e) => console.warn(e));
+    else if (ev.type === 'export-all') exportAll({ force: !!ev.force, defaultOnly: !!ev.defaultOnly, allFolders: !!ev.allFolders, only: Array.isArray(ev.only) ? ev.only : null }).catch((e) => console.warn(e));
+    else if (ev.type === 'apply') {
+      // 設定の一括適用（と、その取り消し）が、ほかの画面・ctl から行われた。一覧の印を新しくする
+      // （この画面が頼んだ分は、頼んだ側で読み直してある。一括書き出しの最中は、古い一覧で印を上書きしないよう読み直さない）
+      if (ev.source !== CLIENT_ID && folderOf(ev) === state.folder && !batch.running) refreshImages().catch((e) => console.warn(e));
+    }
     else if (ev.type === 'export-all-abort') abortExportAll();
   };
 }
@@ -2531,7 +2537,7 @@ function abortExportAll() {
  * （その設定をその画像の設定として保存する）。
  * 書き出し済みで、設定・元画像がその後変わっていない物は飛ばす（force で作り直す）
  */
-async function exportAll({ force = false, defaultOnly = false, allFolders = false } = {}) {
+async function exportAll({ force = false, defaultOnly = false, allFolders = false, only = null } = {}) {
   if (batch.running) return batchReport();
   if (!state.server) {
     showMessage('全画像の書き出しはサーバありのときだけ使えます', 'error');
@@ -2547,14 +2553,19 @@ async function exportAll({ force = false, defaultOnly = false, allFolders = fals
   const startFolder = state.folder;
   const startName = state.remote ? state.name : null;
   const startVersion = state.version;
+  // only = [{folder, name, version}]: 書き出す対象を絞る（設定の一括適用のあとの書き出し。その画像・バージョンだけ）
+  const keyOf = (folder, name, version) => `${folder || DEFAULT_FOLDER}\n${name}\n${version || ''}`;
+  const wanted = Array.isArray(only) ? new Set(only.map((o) => keyOf(o.folder || state.folder, o.name, o.version))) : null;
   // 対象の画像フォルダ（既定は、いまのフォルダだけ）。全体の件数を先に数える
-  const folders = allFolders && multiFolder() ? state.folders.map((f) => f.name) : [state.folder];
-  const targetsOf = (images) => {
+  const folders = wanted
+    ? [...new Set(only.map((o) => o.folder || state.folder))].filter((f) => f === state.folder || state.folders.some((x) => x.name === f))
+    : allFolders && multiFolder() ? state.folders.map((f) => f.name) : [state.folder];
+  const targetsOf = (images, folder) => {
     const out = [];
     images.forEach((item, i) => {
       verOf(item);
       for (const rec of item.versions) {
-        if (!defaultOnly || rec.name === '') out.push({ i, item, rec });
+        if (wanted ? wanted.has(keyOf(folder, item.name, rec.name)) : (!defaultOnly || rec.name === '')) out.push({ i, item, rec });
       }
     });
     return out;
@@ -2562,7 +2573,7 @@ async function exportAll({ force = false, defaultOnly = false, allFolders = fals
   let total = 0;
   for (const f of folders) {
     const list = f === state.folder ? { images: state.images } : await getJSON(`api/images${queryOf('', f)}`);
-    total += targetsOf(list && Array.isArray(list.images) ? list.images : []).length;
+    total += targetsOf(list && Array.isArray(list.images) ? list.images : [], f).length;
   }
   Object.assign(batch, { running: true, abort: false, total, done: 0, exported: 0, skipped: 0,
     failed: 0, current: null, startedAt: performance.now(), force: !!force, defaultOnly: !!defaultOnly,
@@ -2575,7 +2586,7 @@ async function exportAll({ force = false, defaultOnly = false, allFolders = fals
     for (const folder of folders) {
       if (batch.abort) break;
       if (folder !== state.folder) await switchFolder(folder, null, '', { open: false });
-      const targets = targetsOf(state.images);
+      const targets = targetsOf(state.images, folder);
       for (let t = 0; t < targets.length && !batch.abort; t++) {
         const { i, item, rec } = targets[t];
         const version = rec.name;
@@ -2595,6 +2606,9 @@ async function exportAll({ force = false, defaultOnly = false, allFolders = fals
             renderNow();
             const blob = await encodeCurrent();
             if (!blob) throw new Error('書き出しの途中で描き直しが入りました');
+            // いま出ている絵を、そのまま書き出す。未反映の変更は無い（開いたときに付けた「書き出しの対象」の印を下ろす。
+            // 下ろさないと、次の画像へ移る前に届いた「書き出された」の知らせで、一覧の印が「古い」に戻ることがある）
+            autoExport.dirty = false;
             await uploadExport(item.name, blob, version, folder);
             batch.exported += 1;
           } catch (e) {
@@ -2635,6 +2649,52 @@ async function exportAll({ force = false, defaultOnly = false, allFolders = fals
   return batchReport();
 }
 
+// ---- 設定の一括適用（いまの画像の設定を、画像一覧で選んだ画像へ写す）----
+
+async function applyRequest(path, body) {
+  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Inkdeus-Client': CLIENT_ID },
+    body: JSON.stringify(body) });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `適用できませんでした (HTTP ${r.status})`);
+  return data;
+}
+
+/** サーバに適用を頼む（ダイアログを通さない入口。body は POST api/apply-params と同じ形） */
+async function applyParams(body) {
+  if (!(await flushSave())) throw new Error('保存できていない変更があるため、適用をやめました（サーバにつながり次第、自動で保存されます）');
+  const result = await applyRequest('api/apply-params', body);
+  await refreshImages();
+  return result;
+}
+
+async function undoApply(id = null) {
+  const result = await applyRequest('api/apply-params/undo', { id });
+  await refreshImages();
+  return result;
+}
+
+/** 画像一覧で選んだ画像へ、いまの画像の設定を適用するダイアログを開く */
+async function openApply(names) {
+  if (!state.applyOK || !state.remote || !state.name || batch.running) return null;
+  if (state.broken) {
+    showMessage('この画像の設定ファイルは壊れています。先に「最新のバックアップから戻す / 既定値で始める」を選んでください', 'error');
+    return null;
+  }
+  const targets = (names || []).filter((n) => state.images.some((i) => i.name === n));
+  if (!targets.length) return null;
+  const item = currentItem();
+  // 適用元の「部分」: この画像にマスクのある部分と、設定に書いてある部分
+  const parts = [...new Set([...(item && Array.isArray(item.parts) ? item.parts : []), ...partKeys(state.params)])];
+  return openApplyDialog({
+    source: { name: state.name, version: state.version, folder: state.folder },
+    targets, parts, canExport: true,
+    apply: (body) => applyParams(body),
+    undo: (id) => undoApply(id),
+    exportApplied: (rows) => exportAll({ only: rows.map((r) => ({ folder: r.folder, name: r.name, version: r.version })) })
+      .catch((e) => showMessage(e.message, 'error')),
+  });
+}
+
 // ---- 起動 ----
 
 async function init() {
@@ -2666,6 +2726,7 @@ async function init() {
   state.paintTilesOK = features.includes('paintTiles');
   state.backupOK = features.includes('backup') && !(config.backup && config.backup.enabled === false);
   state.maskEditOK = features.includes('maskEdit');
+  state.applyOK = features.includes('applyParams');           // 設定の一括適用（古いサーバには無い）
   checkBuild(state.server && config ? config.build : null);
   showMissing(config && config.missingFolders);
   // 部分（regions.<部分名>）と solid.lineKnockout。サーバなしのときは、画面だけで使える（部分マスクはサーバから読む）
@@ -2730,6 +2791,9 @@ async function init() {
       folder: () => state.folder,
       setFolder: (name) => switchFolder(name).catch((e) => showMessage(e.message, 'error')),
       assetSource: (kind) => (state.folder === DEFAULT_FOLDER ? kind : `${kind}@${state.folder}`),
+      // 複数選択と、選択した画像への設定の一括適用
+      canSelect: () => !!state.applyOK,
+      applyTo: (names) => openApply(names).catch((e) => showMessage(e.message, 'error')),
     });
     await refreshImages();
     // /?image=<画像名>[&version=<バージョン>] で、その画像（のバージョン）を開いた状態で始める
@@ -2874,6 +2938,15 @@ const hooks = {
   saveStatus: () => ({ ...saveStatus(), unsaved: hasUnsaved(), failing: failing(),
     retryMs: saveFail.delay, tileSaves: paintSync.tileSaves, tiles: state.paintTilesOK }),
   flushSave: (opts) => flushSave(opts || {}),
+  /** 設定の一括適用（画像一覧の複数選択と、選んだ画像への適用） */
+  apply: {
+    ok: () => !!state.applyOK,
+    selection: () => (gallery ? gallery.selection() : []),
+    select: (names) => { gallery.setSelection(names); return gallery.selection(); },
+    open: (names) => openApply(names || gallery.selection()),
+    run: (body) => applyParams(body),
+    undo: (id) => undoApply(id),
+  },
   /** 以前の状態に戻す（世代バックアップ） */
   backups: {
     ok: () => state.backupOK,

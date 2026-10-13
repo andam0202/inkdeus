@@ -154,6 +154,33 @@ uv run inkdeus ctl version delete bg-white               # 設定と PNG を消�
 - `/manga/` では各バージョンが別の素材として並ぶ。名前を変える・削除すると、漫画のページで使っている絵に影響する
   （削除 → 既定へ切り替わる。名前の変更 → 開いているページだけ追従）ので、利用者に確かめてから行う。
 
+### 「この設定をフォルダ全体に」（設定の一括適用）
+
+1 枚で決めた設定を、ほかの画像へまとめて写す。書き換えはサーバが設定ファイルに行う（各画像を開かない。ブラウザは要らない）。
+
+```bash
+uv run inkdeus ctl get --name <元の画像>                           # 1. 適用前に、元の設定を確かめる（意図した値か）
+uv run inkdeus ctl apply --from <元の画像> --to all                 # 2. フォルダの全画像へ（結果は applied / skipped / failed）
+uv run inkdeus ctl apply --from <元の画像> --to unconfigured        #    設定のまだ無い画像だけへ
+uv run inkdeus ctl apply --from <元の画像> --to 'p0*.png' b.png --scope person,background   # 範囲と適用先を絞る
+uv run inkdeus ctl open <適用先の 1 枚> && uv run inkdeus ctl stats --wait   # 3. 数枚を開いて、統計で確かめる
+uv run inkdeus ctl apply --undo                                     # やり直すとき: 直前の適用を、まとめて取り消す
+```
+
+- `--scope`（カンマ区切り）: `input` / `lines` / `person` / `background` / `parts`（元の画像にある部分の全部）/ `parts:<部分名>` / `watermark` /
+  `output` / `unit`。省くと `unit` 以外の全部（`unit` は画像の大きさで自動なので、頼まれたときだけ）。
+- `--to-version`: `default`（既定）/ `same`（元と同じ名前のバージョン。無ければ作る）/ `new:<名前>`（元の設定を残したいとき）。
+  元のバージョンは `--from-version`（省くと、元をブラウザで開いていればそのバージョン、そうでなければ既定）。
+- 別のフォルダへは `--to-folder <名前>`（元が別のフォルダなら `--from-folder`）。
+- **消しゴム・ペン・部分マスクの手直しは写らない**。部分のトーンは、適用先にその部分のマスクがある画像にだけ写る（`skippedParts` に出る）。
+- `skipped` に「層の消しゴムがあり…」と出た画像は、利用者が手で消した所がある。**`--force` は、その層の消しゴムを捨てる**ので、
+  利用者に確かめてから（捨てた分もバックアップに残り、`--undo` で戻る）。
+- 適用先ごとに前の設定が退避される。`ctl apply --list` / `inkdeus backup list <プロジェクト> --kind apply` で記録、
+  `ctl apply --undo [番号|ID]` / `inkdeus backup restore <プロジェクト> --kind apply --at <番号>` で 1 回の適用をまとめて取り消せる。
+- 適用後、その画像の白黒版は「古い」になる。続けて書き出すなら `--export`（白黒化の画面を開いているブラウザが要る）か `ctl export-all --wait`。
+- 見た目の確認は利用者に頼む（統計で分かるのは黒率などの数値だけ）。利用者は画面でも同じことができる
+  （画像一覧で Ctrl+クリック / Shift+クリックで選んで「いまの画像の設定を、選択した N 枚へ適用…」）。
+
 ### 部分ごとの塗り分け（「髪はベタに」「肌は白く」など）
 
 髪・肌・服などの部分ごとに、別の層やベタを当てられる。前提は**部分マスク**で、これは inkdeus の外で作った物を登録する
@@ -307,6 +334,7 @@ uv run inkdeus ctl export                      # ブラウザに PNG 書き出�
 uv run inkdeus ctl export-all [--force] [--default-only] [--wait]   # 全画像・全バージョンの書き出し（--status / --abort）
 uv run inkdeus ctl versions / version new|rename|delete   # バージョン（上の節）
 uv run inkdeus ctl paint list / paint clear <対象|all-targets>   # 消しゴム・ペンの一覧と消去（上の節。描くのは利用者）
+uv run inkdeus ctl apply --from <画像名> --to <画像名…|all|unconfigured|glob> / apply --undo   # 設定の一括適用（上の節）
 ```
 
 値が範囲外・キーの打ち間違いなどは非0終了になり、何も変わらない（`problems` に理由）。

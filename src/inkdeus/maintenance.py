@@ -15,6 +15,7 @@ import json
 import time
 from pathlib import Path
 
+from . import applyparams as apply_mod
 from . import backup as backup_mod
 from . import folders as folders_mod
 from . import portable
@@ -28,6 +29,7 @@ MASKEDIT_SUFFIX = ".maskedit"
 KIND_LABELS = {"params": "設定", "paint": "消しゴム・ペン", "maskedit": "部分マスクの手直し", "manga": "漫画データ",
                "project": "プロジェクトの設定", "styles": "このプロジェクトのスタイル"}
 IMAGE_KINDS = ("params", "paint", "maskedit")
+APPLY_KIND = "apply"                # 設定の一括適用（1 回の適用が 1 つの単位）
 
 
 def store_of(project: Project) -> backup_mod.Store:
@@ -116,6 +118,8 @@ def cmd_backup(args) -> int:
         print(f"バックアップを間引きました（{project.name}）: {result['removed']} 個を削除 / "
               f"{result['bytesBefore'] / 1e6:.1f} MB → {result['bytesAfter'] / 1e6:.1f} MB")
         return 0
+    if args.kind == APPLY_KIND:
+        return _cmd_backup_apply(args, project, store)
     kinds = _kinds(args)
     version = args.version or ""
     if args.backup_command == "list" and not (args.name or args.kind in ("project", "styles")):
@@ -178,6 +182,38 @@ def cmd_backup(args) -> int:
         return 0
     print(f"{label} の変更の直前の状態へ戻しました（{project.name}）: {' / '.join(changed)}")
     print(f"  戻す前の状態も残してあります（取り消すには --at {backup_mod.stamp_name(now)}）")
+    print("  稼働中のサーバがあれば、開いている画面へ反映されます")
+    return 0
+
+
+def _cmd_backup_apply(args, project: Project, store: backup_mod.Store) -> int:
+    """設定の一括適用の記録の一覧と、取り消し（1 回の適用を、まとめて戻す）"""
+    rows = [apply_mod.summary(r) for r in apply_mod.journals(store)]
+    if args.backup_command == "list":
+        if args.json:
+            print(json.dumps({"project": project.name, "applies": rows}, ensure_ascii=False, indent=2))
+            return 0
+        print(f"設定の一括適用（{project.name}）— 新しい順。取り消すには inkdeus backup restore … --kind apply --at <番号>")
+        if not rows:
+            print("  まだありません")
+        for i, r in enumerate(rows, 1):
+            src = r.get("from") or {}
+            ver = f" @{src['version']}" if src.get("version") else ""
+            print(f"  {i:>3}  {r['label']}  {src.get('name')}{ver} → {r['count']} 枚"
+                  f"（{', '.join(r.get('scope') or [])}）{'  ［取り消し済み］' if r.get('undone') else ''}")
+        return 0
+    try:
+        record = apply_mod.pick_journal(store, args.at)
+    except apply_mod.ApplyError as e:
+        raise BackupError(str(e)) from e
+    done = [r for r in apply_mod.undo(store, project.out, record, reindex=write_paint_index_in) if r["restored"]]
+    if args.json:
+        print(json.dumps({"project": project.name, "id": record["id"],
+                          "undone": [{k: r[k] for k in ("folder", "name", "version", "created")} for r in done]},
+                         ensure_ascii=False, indent=2))
+        return 0
+    print(f"設定の一括適用（{record['id']}）を取り消しました（{project.name}）: {len(done)} 枚を、適用の直前の状態へ戻しました")
+    print("  戻す前の状態も残してあります（画像ごとに inkdeus backup list … --name <画像名> で見られます）")
     print("  稼働中のサーバがあれば、開いている画面へ反映されます")
     return 0
 
@@ -288,8 +324,9 @@ def add_parsers(sub) -> None:
         a.add_argument("--name", help="画像名（--kind manga のときは漫画データの保存名）")
         a.add_argument("--folder", help="画像フォルダ名（省略時は既定のフォルダ）")
         a.add_argument("--version", help="バージョン名（省略時は既定のバージョン）")
-        a.add_argument("--kind", choices=backup_mod.KINDS,
-                       help="種類（省略時: --name があれば設定と消しゴム・ペンをまとめて）")
+        a.add_argument("--kind", choices=(*backup_mod.KINDS, APPLY_KIND),
+                       help="種類（省略時: --name があれば設定と消しゴム・ペンをまとめて）。"
+                            "apply = 設定の一括適用（1 回の適用を、まとめて取り消す）")
         a.add_argument("--json", action="store_true", help="JSON で出力")
         if command == "restore":
             a.add_argument("--at", required=True, help="戻す時点（list の番号、または 2026-01-31T12:34 の形の時刻）")

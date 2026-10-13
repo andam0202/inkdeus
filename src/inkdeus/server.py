@@ -26,6 +26,7 @@ from urllib.parse import urlsplit
 from flask import Flask, Response, abort, jsonify, redirect, request, send_file, send_from_directory
 from PIL import Image
 
+from . import applyparams as apply_mod
 from . import assets as assets_mod
 from . import backup as backup_mod
 from . import folders as folders_mod
@@ -60,7 +61,7 @@ PAINT_ALL = "all-targets"                              # 削除でだけ使え�
 MAX_PAINT_BYTES = 1 << 28
 # 画面が、サーバにある機能を確かめるための名前
 FEATURES = ["layerIds", "paint", "parts", "userStyles", "mangaPdf", "mangaCommand",
-            "backup", "build", "paintTiles", "maskEdit"]
+            "backup", "build", "paintTiles", "maskEdit", "applyParams"]
 log = logging.getLogger("inkdeus")
 MANGA_COMMANDS = ("pdf", "pdf-abort", "layout")       # 漫画の構成の画面へ出せる指示
 MANGA_RESULT_KEEP = 32                                 # 覚えておく指示の結果の数
@@ -2157,6 +2158,166 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
         announce(folder, lib, entry, "delete", version)
         return jsonify({**version_listing(folder, lib, entry), "deleted": version})
 
+    # ---- 設定の一括適用（ある画像の設定を、選んだ複数の画像へ写す）----
+
+    def apply_source(body: dict) -> tuple[str, Library, Session, Entry, str]:
+        """適用元の (フォルダ, Library, Session, 画像, バージョン)"""
+        src = body.get("from")
+        if not isinstance(src, dict) or not isinstance(src.get("name"), str):
+            raise apply_mod.ApplyError("from に、適用元の画像（name / version / folder）を指定してください")
+        folder = src.get("folder") or folders_mod.DEFAULT
+        found = registry.pick(folder) if isinstance(folder, str) else None
+        if found is None:
+            raise apply_mod.ApplyError(f"適用元の画像フォルダがありません: {folder}", 404)
+        entry = found[0].entries().get(src["name"])
+        if entry is None:
+            raise apply_mod.ApplyError(f"適用元の画像がありません: {src['name']}", 404)
+        version = src.get("version") or ""
+        try:
+            found[0].check_version(entry, version)
+        except (VersionError, TypeError) as e:
+            raise apply_mod.ApplyError(f"適用元のバージョン: {e}") from e
+        if not found[0].has_version(entry, version):
+            raise apply_mod.ApplyError(f"適用元のバージョンがありません: {version}", 404)
+        if params_broken(found[1].read_params(entry, version)[0]):
+            raise apply_mod.ApplyError("適用元の設定ファイルが壊れています", 422)
+        return folder, found[0], found[1], entry, version
+
+    def apply_one(source: dict, src_key: tuple, src_parts: list[str], scope: apply_mod.Scope,
+                  folder: str, tlib: Library, tfs: Session, entry: Entry, version: str, force: bool) -> dict:
+        """1 枚へ適用する。戻り値の status は applied / skipped / failed"""
+        row = {"folder": folder, "name": entry.name, "version": version}
+        if (folder, entry.name, version) == src_key:
+            return {**row, "status": "skipped", "reason": "適用元の画像です"}
+        try:
+            tlib.check_version(entry, version)
+        except VersionError as e:
+            return {**row, "status": "failed", "error": str(e)}
+        with tfs.lock:
+            exists = tlib.has_version(entry, version)
+            base_version = version if exists else ""        # 無いバージョンは、その画像の既定のバージョンを複製して作る
+            data, _rev = tfs.read_params(entry, base_version)
+            if params_broken(data):
+                return {**row, "status": "skipped", "reason": "設定ファイルが壊れています（上書きしません）"}
+            base = tfs.resolved(entry, base_version, persist=False)["params"]
+            merged, skipped_parts = apply_mod.merge(source, base, scope, src_parts, set(tlib.parts_of(entry)))
+            try:
+                params, _ = schema.normalize(merged, strict=True, parts=known_parts(tlib, base))
+            except schema.ValidationError as e:
+                return {**row, "status": "failed", "error": " / ".join(e.problems)}
+            # 層の消しゴムは層の id で結び付いている。適用後の設定に同じ id の層が残らない消しゴムは、行き場が無くなる
+            erased = {r["target"][len("layer-"):] for r in tlib.paint_rows(entry, base_version)
+                      if r["target"].startswith("layer-")}
+            lost = sorted((erased & schema.layer_ids(base)) - schema.layer_ids(params))
+            if lost and not force:
+                return {**row, "status": "skipped", "erasers": [f"layer-{i}" for i in lost],
+                        "reason": "層の消しゴムがあり、適用後の層と対応づけられません（消しゴムを捨てて適用するなら force）"}
+            new_data = (json.dumps(params, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+            if exists and data == new_data:
+                return {**row, "status": "skipped", "reason": "すでに同じ設定です", "skippedParts": skipped_parts}
+            paint_dir = tlib.paint_dir(entry, version)
+            if not exists:
+                # 消しゴム・ペンも写す（バージョンを新しく作るときと同じ）
+                shutil.rmtree(paint_dir, ignore_errors=True)
+                if tlib.paint_dir(entry, "").is_dir():
+                    shutil.copytree(tlib.paint_dir(entry, ""), paint_dir)
+            paint_keys = [tlib.backup_key(paint_dir / f"layer-{i}.png") for i in lost]
+            # 退避してから書く。開いている画面へも知らせる。行き場の無くなった層の消しゴムは、ここで退避されて片付く
+            # （開いている画面へは、消しゴム・ペンの見張りが「外部からの変更」として知らせる）
+            rev = tfs.write_params(entry, params, None, version)
+        if not exists:
+            announce(folder, tlib, entry, "create", version, copyFrom="")
+        return {**row, "status": "applied", "rev": rev, "created": not exists, "skippedParts": skipped_parts,
+                "droppedErasers": [f"layer-{i}" for i in lost],
+                "key": tlib.backup_key(tlib.params_path(entry, version)), "paintKeys": [k for k in paint_keys if k]}
+
+    @app.route("/api/apply-params", methods=["GET", "POST"])
+    def api_apply_params():
+        """POST: 適用元（from）の設定を、適用先（to）の画像へ写す。GET: これまでの適用の記録（新しい順）"""
+        if request.method == "GET":
+            return jsonify({"enabled": backup_config.enabled,
+                            "applies": [apply_mod.summary(r) for r in apply_mod.journals(backups)[:20]]})
+        body = json_body()
+        try:
+            sfolder, slib, sfs, sentry, sversion = apply_source(body)
+            scope = apply_mod.parse_scope(body.get("scope"))
+            kind, to_version = apply_mod.parse_to_version(body.get("toVersion"), sversion)
+            tfolder = body.get("toFolder") or sfolder
+            found = registry.pick(tfolder) if isinstance(tfolder, str) else None
+            if found is None:
+                raise apply_mod.ApplyError(f"適用先の画像フォルダがありません: {tfolder}", 404)
+            tlib, tfs = found
+            entries = tlib.entries()
+            index = tlib.version_index(entries)
+            unconfigured = {n for n in entries if "params" not in index[n].get("", {})}
+            names = apply_mod.expand_targets(body.get("to"), list(entries), unconfigured)
+            if to_version and VERSION_RE.fullmatch(to_version) is None:
+                raise apply_mod.ApplyError("バージョン名に使えるのは英数字・かな漢字・_ - だけです（1〜32 文字）")
+        except apply_mod.ApplyError as e:
+            return jsonify({"error": str(e)}), e.status
+        force = body.get("force") is True
+        source = sfs.resolved(sentry, sversion, persist=False)["params"]
+        # 適用元の「部分」: その画像にマスクのある部分と、設定に書いてある部分
+        src_parts = list(dict.fromkeys([*slib.parts_of(sentry), *schema.part_keys(source)]))
+        began = backup_mod.parse_stamp(backup_mod.stamp_name(time.time()))
+        rows = [apply_one(source, (sfolder, sentry.name, sversion), src_parts, scope, tfolder, tlib, tfs,
+                          entries[name], to_version, force) for name in names]
+        applied = [r for r in rows if r["status"] == "applied"]
+        record = None
+        if applied and backup_config.enabled:
+            record = {"id": apply_mod.new_id(backups, began), "time": began,
+                      "from": {"folder": sfolder, "name": sentry.name, "version": sversion},
+                      "scope": scope.names(), "toVersion": {"kind": kind, "name": to_version}, "toFolder": tfolder,
+                      "force": force, "undone": None,
+                      "items": [{k: r[k] for k in ("folder", "name", "version", "created", "key", "paintKeys")}
+                                for r in applied]}
+            apply_mod.write_journal(backups, record)
+        public = lambda r: {k: v for k, v in r.items() if k not in ("status", "key", "paintKeys")}   # noqa: E731
+        result = {"id": record["id"] if record else None, "undoable": record is not None,
+                  "from": {"folder": sfolder, "name": sentry.name, "version": sversion},
+                  "scope": scope.names(), "toVersion": {"kind": kind, "name": to_version}, "toFolder": tfolder,
+                  "force": force,
+                  "applied": [public(r) for r in applied],
+                  "skipped": [public(r) for r in rows if r["status"] == "skipped"],
+                  "failed": [public(r) for r in rows if r["status"] == "failed"]}
+        session.hub.publish({"type": "apply", "action": "apply", "id": result["id"], "folder": tfolder,
+                             "names": [r["name"] for r in applied], "source": request.headers.get("X-Inkdeus-Client")})
+        return jsonify(result)
+
+    @app.post("/api/apply-params/undo")
+    def api_apply_undo():
+        """1 回の適用を、まとめて取り消す（id を省くと、まだ取り消していない、いちばん新しい適用）"""
+        try:
+            record = apply_mod.pick_journal(backups, json_body().get("id"))
+        except apply_mod.ApplyError as e:
+            return jsonify({"error": str(e)}), e.status
+        rows = apply_mod.undo(backups, lib.out_dir, record, reindex=write_paint_index_in)
+        for row in rows:
+            found = registry.pick(row["folder"]) if isinstance(row["folder"], str) else None
+            entry = found[0].entries().get(row["name"]) if found else None
+            if entry is None or not row["restored"]:
+                continue
+            tlib, tfs = found
+            if row["created"]:
+                with tfs.lock:
+                    tfs.remember(tlib.params_path(entry, row["version"]), entry, row["version"], None)
+                    for table in (tfs.stats, tfs.exports):
+                        table.pop((entry.name, row["version"]), None)
+                    if is_current(row["folder"], entry) and session.current_version == row["version"]:
+                        session.current_version = ""
+                announce(row["folder"], tlib, entry, "delete", row["version"])
+                continue
+            announce_params(tfs, tlib, entry, row["version"])
+            if row["paint"]:
+                session.note_paint(row["folder"], tlib, entry, row["version"])
+                paint_changed(row["folder"], entry, row["version"], "restore",
+                              [r["target"] for r in tlib.paint_rows(entry, row["version"])], external=True)
+        done = [{k: r[k] for k in ("folder", "name", "version", "created")} for r in rows if r["restored"]]
+        session.hub.publish({"type": "apply", "action": "undo", "id": record["id"], "folder": record.get("toFolder"),
+                             "names": [r["name"] for r in done], "source": request.headers.get("X-Inkdeus-Client")})
+        return jsonify({"id": record["id"], "undone": done,
+                        "unchanged": [{k: r[k] for k in ("folder", "name", "version")} for r in rows if not r["restored"]]})
+
     # ---- 外部からの操作（状態・イベント・統計・指示） ----
 
     @app.route("/api/state", methods=["GET", "POST"])
@@ -2254,6 +2415,14 @@ def create_app(input_path: Path | str, mask_dir: Path | str | None = None,
             # 一括書き出しの開始・中止（画像名は要らない）
             event = {"type": kind, "force": body.get("force") is True,
                      "defaultOnly": body.get("defaultOnly") is True, "allFolders": body.get("allFolders") is True}
+            only = body.get("only")
+            if kind == "export-all" and only is not None:
+                # only: 書き出す対象を絞る（{folder, name, version} の並び。設定の一括適用のあとの書き出し用）
+                if not isinstance(only, list) or not all(
+                        isinstance(o, dict) and isinstance(o.get("name"), str) for o in only):
+                    abort(400, description="only は {folder, name, version} の並びで指定してください")
+                event["only"] = [{"folder": o.get("folder") or folders_mod.DEFAULT, "name": o["name"],
+                                  "version": o.get("version") or ""} for o in only]
             return jsonify({**event, "clients": session.hub.publish(event), "batch": session.batch})
         if kind not in ("open", "export"):
             abort(400, description="type は open / export / export-all / export-all-abort のどれかです")
